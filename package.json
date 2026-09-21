@@ -10,11 +10,14 @@
   },
   "scripts": {
     "start": "node server/index.js",
-    "dev": "node server/index.js"
+    "dev": "node server/index.js",
+    "db:migrate": "node scripts/migrate-json-to-supabase.js",
+    "db:seed-defaults": "node scripts/seed-defaults.js"
   },
   "dependencies": {
     "exceljs": "^4.4.0",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "pg": "^8.23.0"
   },
   "overrides": {
     "uuid": "^11.1.1"

@@ -4,6 +4,7 @@ const db = require("../db");
 const jiraClient = require("../jiraClient");
 const { extractIssueKey } = require("../extractKey");
 const releaseNotesLogic = require("../releaseNotesLogic"); // this route's only AI-related import — see releaseNotesLogic.generateReleaseNotes() for the abstraction boundary; nothing here talks to an AI provider directly
+const { asyncHandler } = require("../asyncHandler");
 
 const router = express.Router();
 
@@ -55,49 +56,49 @@ function notFound(res) {
   return res.status(404).json({ error: "Release not found." });
 }
 
-router.get("/", (req, res) => {
-  res.json(db.releases.list());
-});
+router.get("/", asyncHandler(async (req, res) => {
+  res.json(await db.releases.list());
+}));
 
-router.post("/", (req, res) => {
+router.post("/", asyncHandler(async (req, res) => {
   const { name, version, date, qaOwner } = req.body || {};
   if (!name || !String(name).trim()) {
     return res.status(400).json({ error: "Release name is required." });
   }
   const id = crypto.randomUUID();
-  const masterModules = db.regressionModules.list();
+  const masterModules = await db.regressionModules.list();
   const doc = { ...newReleaseDoc(name.trim(), version, date, qaOwner, masterModules), _id: id };
-  db.releases.set(id, doc);
+  await db.releases.set(id, doc);
   res.status(201).json(doc);
-});
+}));
 
-router.get("/:id", (req, res) => {
-  const r = db.releases.get(req.params.id);
+router.get("/:id", asyncHandler(async (req, res) => {
+  const r = await db.releases.get(req.params.id);
   if (!r) return notFound(res);
   res.json(r);
-});
+}));
 
 // Full-document replace — the frontend mutates its local copy of a release
 // (adding a bug, editing a platform, etc.) and PUTs the whole thing back.
 // Kept deliberately simple and generic, matching every non-ticket section.
-router.put("/:id", (req, res) => {
-  const existing = db.releases.get(req.params.id);
+router.put("/:id", asyncHandler(async (req, res) => {
+  const existing = await db.releases.get(req.params.id);
   if (!existing) return notFound(res);
   const incoming = req.body || {};
   const merged = { ...incoming, _id: req.params.id, updatedAt: new Date().toISOString() };
-  db.releases.set(req.params.id, merged);
+  await db.releases.set(req.params.id, merged);
   res.json(merged);
-});
+}));
 
-router.delete("/:id", (req, res) => {
-  const existing = db.releases.get(req.params.id);
+router.delete("/:id", asyncHandler(async (req, res) => {
+  const existing = await db.releases.get(req.params.id);
   if (!existing) return notFound(res);
-  db.releases.delete(req.params.id);
+  await db.releases.delete(req.params.id);
   res.json({ ok: true });
-});
+}));
 
-router.post("/:id/duplicate", (req, res) => {
-  const existing = db.releases.get(req.params.id);
+router.post("/:id/duplicate", asyncHandler(async (req, res) => {
+  const existing = await db.releases.get(req.params.id);
   if (!existing) return notFound(res);
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -109,9 +110,9 @@ router.post("/:id/duplicate", (req, res) => {
   clone.jira = { lastSyncedAt: null };
   clone.createdAt = now;
   clone.updatedAt = now;
-  db.releases.set(id, clone);
+  await db.releases.set(id, clone);
   res.status(201).json(clone);
-});
+}));
 
 // ---- Tickets ---------------------------------------------------------
 
@@ -138,8 +139,8 @@ function upsertTicket(tickets, ticket, source) {
 // POST /api/releases/:id/tickets — add one ticket by Jira URL.
 // If Jira is connected, fields are auto-filled from a live lookup;
 // otherwise the caller supplies title/status/issueType/priority.
-router.post("/:id/tickets", async (req, res) => {
-  const release = db.releases.get(req.params.id);
+router.post("/:id/tickets", asyncHandler(async (req, res) => {
+  const release = await db.releases.get(req.params.id);
   if (!release) return notFound(res);
 
   const { url, title, status, issueType, priority } = req.body || {};
@@ -177,9 +178,9 @@ router.post("/:id/tickets", async (req, res) => {
 
   upsertTicket(release.tickets, ticket, "Manual");
   release.updatedAt = new Date().toISOString();
-  db.releases.set(req.params.id, release);
+  await db.releases.set(req.params.id, release);
   res.status(201).json({ ticket, lookupUsed: !lookupError, lookupError, release });
-});
+}));
 
 function bucketFromManualStatus(status) {
   const s = String(status || "").toLowerCase();
@@ -189,14 +190,14 @@ function bucketFromManualStatus(status) {
   return "Open / To Do";
 }
 
-router.delete("/:id/tickets/:key", (req, res) => {
-  const release = db.releases.get(req.params.id);
+router.delete("/:id/tickets/:key", asyncHandler(async (req, res) => {
+  const release = await db.releases.get(req.params.id);
   if (!release) return notFound(res);
   release.tickets = (release.tickets || []).filter((t) => t.key !== req.params.key);
   release.updatedAt = new Date().toISOString();
-  db.releases.set(req.params.id, release);
+  await db.releases.set(req.params.id, release);
   res.json({ ok: true, release });
-});
+}));
 
 // POST /api/releases/:id/jira-sync — pull every Jira issue whose Fix
 // Version/s matches this release's Version field: add new ones, update
@@ -206,8 +207,8 @@ router.delete("/:id/tickets/:key", (req, res) => {
 // A ticket that's only ever been added manually, and has never itself been
 // matched by a Fix Version search, keeps source "Manual" (see upsertTicket)
 // and is never touched by this removal — only Jira-confirmed tickets are.
-router.post("/:id/jira-sync", async (req, res) => {
-  const release = db.releases.get(req.params.id);
+router.post("/:id/jira-sync", asyncHandler(async (req, res) => {
+  const release = await db.releases.get(req.params.id);
   if (!release) return notFound(res);
 
   const fixVersion = (release.version || "").trim();
@@ -241,7 +242,7 @@ router.post("/:id/jira-sync", async (req, res) => {
   const now = new Date().toISOString();
   release.jira = { lastSyncedAt: now };
   release.updatedAt = now;
-  db.releases.set(req.params.id, release);
+  await db.releases.set(req.params.id, release);
 
   res.json({
     found: result.total,
@@ -252,7 +253,7 @@ router.post("/:id/jira-sync", async (req, res) => {
     lastSyncedAt: now,
     release,
   });
-});
+}));
 
 // ---- Release Notes generation ------------------------------------------
 //
@@ -274,8 +275,8 @@ router.post("/:id/jira-sync", async (req, res) => {
 // fall back to the rule-based summarizer" pipeline, and aiService.js for
 // the one place provider config (a single API key) actually lives.
 
-router.post("/:id/release-notes/generate", async (req, res) => {
-  const release = db.releases.get(req.params.id);
+router.post("/:id/release-notes/generate", asyncHandler(async (req, res) => {
+  const release = await db.releases.get(req.params.id);
   if (!release) return notFound(res);
 
   const fixVersion = (release.version || "").trim();
@@ -355,7 +356,7 @@ router.post("/:id/release-notes/generate", async (req, res) => {
   release.releaseNotes.items = allItems;
   release.releaseNotes.lastGeneratedAt = now;
   release.updatedAt = now;
-  db.releases.set(req.params.id, release);
+  await db.releases.set(req.params.id, release);
 
   res.json({
     release,
@@ -366,7 +367,7 @@ router.post("/:id/release-notes/generate", async (req, res) => {
     aiUsedCount: generated.aiUsedCount,
     warnings: generated.warnings,
   });
-});
+}));
 
 // ---- Regression module sync -------------------------------------------
 
@@ -384,11 +385,11 @@ router.post("/:id/release-notes/generate", async (req, res) => {
 // left alone either way. This lets a release created before an entity/
 // service existed pick it up later, and a release tracking one that's
 // since been deleted drop it, both on demand rather than automatically.
-router.post("/:id/regression-sync", (req, res) => {
-  const release = db.releases.get(req.params.id);
+router.post("/:id/regression-sync", asyncHandler(async (req, res) => {
+  const release = await db.releases.get(req.params.id);
   if (!release) return notFound(res);
 
-  const masterEntities = db.regressionModules.list();
+  const masterEntities = await db.regressionModules.list();
   release.regression = release.regression || [];
 
   let addedEntities = 0;
@@ -462,9 +463,9 @@ router.post("/:id/regression-sync", (req, res) => {
   }
 
   release.updatedAt = new Date().toISOString();
-  db.releases.set(req.params.id, release);
+  await db.releases.set(req.params.id, release);
 
   res.json({ addedEntities, addedServices, removedEntities, removedServices, removedNames, release });
-});
+}));
 
 module.exports = router;

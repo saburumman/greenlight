@@ -1,0 +1,58 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+#
+# Optional: lets Render create this service (with the right build/start
+# commands and the full list of required env vars) directly from this repo
+# via "New +" -> "Blueprint" in the Render dashboard, instead of clicking
+# through a manual "New Web Service" setup. You can just as easily ignore
+# this file and configure the service by hand — it changes nothing about
+# how the app itself runs.
+#
+# Values are read from the actual project: `npm install` / `npm start`
+# match package.json's own scripts (server/index.js as the entry point,
+# already listening on 0.0.0.0:process.env.PORT — see server/index.js).
+# Render sets PORT itself; nothing here overrides it.
+#
+# Every `sync: false` var is one Render will prompt you to fill in when you
+# create the service from this blueprint (or afterward, in the service's
+# Environment tab) — none of these secrets are ever written into this file.
+
+services:
+  - type: web
+    name: greenlight
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      # ---- Database — see README "Deploying to Render + Supabase" -------
+      # Your Supabase connection string. Required: without it, the app
+      # falls back to a local JSON file, and Render's filesystem doesn't
+      # survive a deploy/restart.
+      - key: DATABASE_URL
+        sync: false
+
+      # ---- Atlassian login (required — the server refuses to start
+      # without all 5 of these) ------------------------------------------
+      # Must exactly match this service's real Render URL (including
+      # https://), character-for-character, because it's also what you
+      # register as the OAuth callback in the Atlassian Developer Console
+      # (APP_BASE_URL + /auth/callback). You'll know the URL only after
+      # Render assigns it, so set this once and redeploy.
+      - key: APP_BASE_URL
+        sync: false
+      - key: JIRA_SITE_URL
+        sync: false
+      - key: ATLASSIAN_CLIENT_ID
+        sync: false
+      - key: ATLASSIAN_CLIENT_SECRET
+        sync: false
+      # Render can generate this one for you — a random value is exactly
+      # what it should be.
+      - key: SESSION_SECRET
+        generateValue: true
+
+      # ---- AI-assisted Release Notes (optional) --------------------------
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        sync: false

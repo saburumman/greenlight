@@ -9,6 +9,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const db = require("../db");
+const { asyncHandler } = require("../asyncHandler");
 
 const router = express.Router();
 
@@ -41,16 +42,16 @@ const VALID_ACTIONS = new Set([
 ]);
 
 // GET /api/audit — every audit record, newest first.
-router.get("/", (req, res) => {
-  res.json(db.auditLog.list());
-});
+router.get("/", asyncHandler(async (req, res) => {
+  res.json(await db.auditLog.list());
+}));
 
 // POST /api/audit — append one audit record. Called by the client's
 // logAudit() helper right after a meaningful, already-successful action.
 // Fields are trusted as display text only, and are length-capped rather
 // than validated strictly, since this is activity tracking, not a system
 // of record.
-router.post("/", (req, res) => {
+router.post("/", asyncHandler(async (req, res) => {
   const body = req.body || {};
   const action = String(body.action || "").trim();
   if (!VALID_ACTIONS.has(action)) {
@@ -77,8 +78,8 @@ router.post("/", (req, res) => {
     details: body.details ? String(body.details).slice(0, 500) : "",
     createdAt: new Date().toISOString(),
   };
-  const saved = db.auditLog.append(entry);
+  const saved = await db.auditLog.append(entry);
   res.status(201).json(saved);
-});
+}));
 
 module.exports = router;

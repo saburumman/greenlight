@@ -15,6 +15,7 @@ const express = require("express");
 const crypto = require("crypto");
 const ExcelJS = require("exceljs");
 const db = require("../db");
+const { asyncHandler } = require("../asyncHandler");
 
 const router = express.Router();
 
@@ -63,18 +64,19 @@ function validateAndClean(body) {
 // Existing record with the same National ID (trimmed, exact match) — used
 // to warn about accidental duplicates rather than silently creating one.
 // `excludeId` lets an update check without colliding with itself.
-function findDuplicate(nationalId, excludeId) {
-  return db.testData.list().find((t) => t.nationalId === nationalId && t.id !== excludeId) || null;
+async function findDuplicate(nationalId, excludeId) {
+  const all = await db.testData.list();
+  return all.find((t) => t.nationalId === nationalId && t.id !== excludeId) || null;
 }
 
-router.get("/", (req, res) => {
-  res.json(db.testData.list());
-});
+router.get("/", asyncHandler(async (req, res) => {
+  res.json(await db.testData.list());
+}));
 
-router.post("/", (req, res) => {
+router.post("/", asyncHandler(async (req, res) => {
   const result = validateAndClean(req.body);
   if (result.error) return res.status(400).json({ error: result.error });
-  const dup = findDuplicate(result.clean.nationalId, null);
+  const dup = await findDuplicate(result.clean.nationalId, null);
   if (dup) {
     return res.status(409).json({
       error: "A test data record with this National ID already exists.",
@@ -90,9 +92,9 @@ router.post("/", (req, res) => {
     createdAt: now,
     updatedAt: now,
   };
-  db.testData.set(id, record);
+  await db.testData.set(id, record);
   res.status(201).json(record);
-});
+}));
 
 // Bulk create — backs the "Import Test Data" flow (client parses a CSV
 // export, the user fills in whatever's required and missing — see
@@ -102,7 +104,7 @@ router.post("/", (req, res) => {
 // earlier in this same batch) is skipped rather than failing the whole
 // batch — the client already filters out IDs it knows about, but this is
 // the authoritative check, same duplicate rule as the single-record route.
-router.post("/bulk", (req, res) => {
+router.post("/bulk", asyncHandler(async (req, res) => {
   const records = Array.isArray(req.body && req.body.records) ? req.body.records : [];
   if (!records.length) return res.status(400).json({ error: "No records to import." });
   if (records.length > 2000) return res.status(400).json({ error: "Too many records in one import (max 2000)." });
@@ -119,7 +121,7 @@ router.post("/bulk", (req, res) => {
       continue;
     }
     const { clean } = result;
-    if (seenInBatch.has(clean.nationalId) || findDuplicate(clean.nationalId, null)) {
+    if (seenInBatch.has(clean.nationalId) || (await findDuplicate(clean.nationalId, null))) {
       skipped.push({ nationalId: clean.nationalId, reason: "A test data record with this National ID already exists." });
       continue;
     }
@@ -133,9 +135,11 @@ router.post("/bulk", (req, res) => {
     });
   }
 
-  created.forEach((record) => db.testData.set(record.id, record));
+  for (const record of created) {
+    await db.testData.set(record.id, record);
+  }
   res.status(201).json({ created, skipped });
-});
+}));
 
 // Same predicate as the client's filterTestData() in app.js, kept in sync
 // by hand — used only by the export route below, so export honors
@@ -153,12 +157,12 @@ function matchesExportFilters(t, q, entQ, tagQ) {
 }
 
 // Placed before GET /:id so "export" is never swallowed as an :id.
-router.get("/export", async (req, res, next) => {
-  try {
+router.get("/export", asyncHandler(async (req, res) => {
     const q = String(req.query.q || "").trim().toLowerCase();
     const entQ = String(req.query.entity || "").trim().toLowerCase();
     const tagQ = String(req.query.tag || "").trim().toLowerCase();
-    const records = db.testData.list().filter((t) => matchesExportFilters(t, q, entQ, tagQ));
+    const allRecords = await db.testData.list();
+    const records = allRecords.filter((t) => matchesExportFilters(t, q, entQ, tagQ));
 
     const workbook = new ExcelJS.Workbook();
     workbook.creator = "Release Monitor";
@@ -199,23 +203,20 @@ router.get("/export", async (req, res, next) => {
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     await workbook.xlsx.write(res);
     res.end();
-  } catch (err) {
-    next(err);
-  }
-});
+}));
 
-router.get("/:id", (req, res) => {
-  const t = db.testData.get(req.params.id);
+router.get("/:id", asyncHandler(async (req, res) => {
+  const t = await db.testData.get(req.params.id);
   if (!t) return notFound(res);
   res.json(t);
-});
+}));
 
-router.put("/:id", (req, res) => {
-  const existing = db.testData.get(req.params.id);
+router.put("/:id", asyncHandler(async (req, res) => {
+  const existing = await db.testData.get(req.params.id);
   if (!existing) return notFound(res);
   const result = validateAndClean(req.body);
   if (result.error) return res.status(400).json({ error: result.error });
-  const dup = findDuplicate(result.clean.nationalId, existing.id);
+  const dup = await findDuplicate(result.clean.nationalId, existing.id);
   if (dup) {
     return res.status(409).json({
       error: "Another test data record already uses this National ID.",
@@ -230,15 +231,15 @@ router.put("/:id", (req, res) => {
     createdAt: existing.createdAt,
     updatedAt: new Date().toISOString(),
   };
-  db.testData.set(existing.id, merged);
+  await db.testData.set(existing.id, merged);
   res.json(merged);
-});
+}));
 
-router.delete("/:id", (req, res) => {
-  const existing = db.testData.get(req.params.id);
+router.delete("/:id", asyncHandler(async (req, res) => {
+  const existing = await db.testData.get(req.params.id);
   if (!existing) return notFound(res);
-  db.testData.delete(req.params.id);
+  await db.testData.delete(req.params.id);
   res.json({ ok: true });
-});
+}));
 
 module.exports = router;

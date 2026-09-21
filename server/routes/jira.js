@@ -2,17 +2,18 @@ const express = require("express");
 const jiraConfig = require("../jiraConfig");
 const jiraClient = require("../jiraClient");
 const { extractIssueKey } = require("../extractKey");
+const { asyncHandler } = require("../asyncHandler");
 
 const router = express.Router();
 
 // GET /api/jira/status — never returns the token.
-router.get("/status", async (req, res) => {
-  res.json(jiraConfig.publicView());
-});
+router.get("/status", asyncHandler(async (req, res) => {
+  res.json(await jiraConfig.publicView());
+}));
 
 // POST /api/jira/connect — save connection details and verify them live.
 // Body: { baseUrl, authType: "cloud"|"token", email, apiToken, apiVersion }
-router.post("/connect", async (req, res) => {
+router.post("/connect", asyncHandler(async (req, res) => {
   const { baseUrl, authType, email, apiToken, apiVersion } = req.body || {};
 
   if (!baseUrl || !/^https?:\/\//i.test(baseUrl)) {
@@ -35,26 +36,26 @@ router.post("/connect", async (req, res) => {
 
   // Save first so testConnection (which reads the saved config) can use it,
   // but roll back if the test fails so we don't keep bad credentials.
-  const previous = jiraConfig.load();
-  jiraConfig.save(candidate);
+  const previous = await jiraConfig.load();
+  await jiraConfig.save(candidate);
   try {
     const result = await jiraClient.testConnection(candidate);
     res.json({ ok: true, displayName: result.displayName, baseUrl: candidate.baseUrl });
   } catch (e) {
-    if (previous) jiraConfig.save(previous);
-    else jiraConfig.clear();
+    if (previous) await jiraConfig.save(previous);
+    else await jiraConfig.clear();
     res.status(e.status || 502).json({ error: e.message });
   }
-});
+}));
 
-router.post("/disconnect", (req, res) => {
-  jiraConfig.clear();
+router.post("/disconnect", asyncHandler(async (req, res) => {
+  await jiraConfig.clear();
   res.json({ ok: true });
-});
+}));
 
 // POST /api/jira/lookup — { url } or { key }. Used by "Add Ticket" to
 // auto-fill fields from a pasted Jira URL when Jira is connected.
-router.post("/lookup", async (req, res) => {
+router.post("/lookup", asyncHandler(async (req, res) => {
   const { url, key: rawKey } = req.body || {};
   const key = extractIssueKey(rawKey || url);
   if (!key) {
@@ -66,6 +67,6 @@ router.post("/lookup", async (req, res) => {
   } catch (e) {
     res.status(e.status || 502).json({ error: e.message, key });
   }
-});
+}));
 
 module.exports = router;

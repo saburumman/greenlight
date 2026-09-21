@@ -11,6 +11,7 @@
 const express = require("express");
 const crypto = require("crypto");
 const db = require("../db");
+const { asyncHandler } = require("../asyncHandler");
 
 const router = express.Router();
 
@@ -66,11 +67,11 @@ function validateAndClean(body) {
   return { clean: { name, role, department, bio, specialties, tools, linkedin, github, photo } };
 }
 
-router.get("/", (req, res) => {
-  res.json(db.team.list());
-});
+router.get("/", asyncHandler(async (req, res) => {
+  res.json(await db.team.list());
+}));
 
-router.post("/", (req, res) => {
+router.post("/", asyncHandler(async (req, res) => {
   const result = validateAndClean(req.body);
   if (result.error) return res.status(400).json({ error: result.error });
   const now = new Date().toISOString();
@@ -83,18 +84,18 @@ router.post("/", (req, res) => {
     createdAt: now,
     updatedAt: now,
   };
-  db.team.set(id, member);
+  await db.team.set(id, member);
   res.status(201).json(member);
-});
+}));
 
-router.get("/:id", (req, res) => {
-  const m = db.team.get(req.params.id);
+router.get("/:id", asyncHandler(async (req, res) => {
+  const m = await db.team.get(req.params.id);
   if (!m) return notFound(res);
   res.json(m);
-});
+}));
 
-router.put("/:id", (req, res) => {
-  const existing = db.team.get(req.params.id);
+router.put("/:id", asyncHandler(async (req, res) => {
+  const existing = await db.team.get(req.params.id);
   if (!existing) return notFound(res);
   const result = validateAndClean(req.body);
   if (result.error) return res.status(400).json({ error: result.error });
@@ -109,15 +110,15 @@ router.put("/:id", (req, res) => {
     createdAt: existing.createdAt,
     updatedAt: new Date().toISOString(),
   };
-  db.team.set(existing.id, merged);
+  await db.team.set(existing.id, merged);
   res.json(merged);
-});
+}));
 
-router.delete("/:id", (req, res) => {
-  const existing = db.team.get(req.params.id);
+router.delete("/:id", asyncHandler(async (req, res) => {
+  const existing = await db.team.get(req.params.id);
   if (!existing) return notFound(res);
-  db.team.delete(req.params.id);
+  await db.team.delete(req.params.id);
   res.json({ ok: true });
-});
+}));
 
 module.exports = router;

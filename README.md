@@ -1,6 +1,6 @@
 # Greenlight
 
-A lightweight QA release-readiness dashboard. It runs happily on your own machine with zero setup, or on a shared company server (bare Node, or [Docker](#running-with-docker)) for a whole team — no cloud database either way. Your release data lives in a local JSON file, and your Jira API token (if you connect one) lives in a local config file that never leaves the machine it's running on except to talk to your Jira instance.
+A lightweight QA release-readiness dashboard. It runs happily on your own machine with zero setup, or on a shared company server (bare Node, or [Docker](#running-with-docker)) for a whole team — no cloud database required for either. Your release data lives in a local JSON file, and your Jira API token (if you connect one) lives in a local config file that never leaves the machine it's running on except to talk to your Jira instance. For a shared deployment on a host with no persistent disk (like Render), it can instead persist to Postgres/Supabase — see [Deploying to Render + Supabase](#deploying-to-render--supabase).
 
 ## What it does
 
@@ -34,7 +34,7 @@ Then open **http://localhost:3000** in your browser.
 
 To use a different port: `PORT=4000 npm start`.
 
-Your data is saved to `data/store.json` as you go — nothing to configure. Stopping and restarting the server keeps everything.
+Your data is saved to `data/store.json` as you go — nothing to configure. Stopping and restarting the server keeps everything. (Setting `DATABASE_URL` switches this to Postgres instead — see [Database: local file vs. Postgres](#database-local-file-vs-postgres).)
 
 ## Connecting Jira (optional)
 
@@ -231,8 +231,13 @@ greenlight-app/
   server/
     index.js          — Express app entry point
     loadEnv.js          — reads .env into process.env for local `npm start` (Docker reads it directly)
-    db.js              — release + audit log + test data storage (a JSON file, data/store.json)
-    jiraConfig.js       — Jira connection storage (data/jira-config.json)
+    db.js              — persistence backend selector — see "Database: local file vs. Postgres" below
+    db/
+      jsonStore.js         — the original JSON-file backend (data/store.json) — used whenever DATABASE_URL isn't set
+      pgStore.js            — the Postgres/Supabase backend — used whenever DATABASE_URL is set
+      pgPool.js               — the shared `pg` connection pool both pgStore.js and jiraConfig.js use
+    asyncHandler.js       — wraps async route handlers so a rejected Promise (e.g. a DB error) reaches the error middleware instead of hanging
+    jiraConfig.js       — Jira connection storage — file or Postgres, same rule as db.js above
     jiraClient.js        — the 3 Jira REST calls this app makes (read-only)
     statusBucket.js       — Jira status → bucket mapping (edit this to match your workflow)
     releaseNotesLogic.js   — Release Notes categorization + rule-based summarizer (server-side twin of the same logic in app.js)
@@ -251,12 +256,94 @@ greenlight-app/
       auth.js                  — /auth/login, /auth/callback, /auth/logout, /auth/me
   public/
     index.html, styles.css, app.js  — the dashboard itself (no build step, no framework)
-  data/                    — created automatically; your releases, audit log, and Jira config live here
+  data/                    — created automatically when running on the JSON-file backend; your releases, audit log, and Jira config live here
+  supabase/
+    schema.sql              — the Postgres table definitions (run once against a new database — see "Deploying to Render + Supabase" below)
+  scripts/
+    migrate-json-to-supabase.js  — one-time (safely re-runnable) import of an existing data/store.json into Postgres
+    seed-defaults.js               — seeds the starter regression modules / starter team into Postgres, only if those tables are still empty
+  render.yaml               — optional Render Blueprint (build/start commands + the env var list) — see "Deploying to Render + Supabase"
   Dockerfile, docker-compose.yml, .dockerignore, .env.example  — see "Running with Docker" above
 ```
 
-No build step, no bundler, no database server. Editing any file under `public/` takes effect on the next page reload; editing anything under `server/` needs a restart (`Ctrl+C`, then `npm start` again).
+No build step, no bundler. Editing any file under `public/` takes effect on the next page reload; editing anything under `server/` needs a restart (`Ctrl+C`, then `npm start` again).
+
+## Database: local file vs. Postgres
+
+Greenlight has two interchangeable persistence backends, selected by one environment variable — nothing else about the app changes, and every route works identically either way:
+
+- **No `DATABASE_URL` set** (the default): data lives in `data/store.json`, exactly as it always has — zero setup, nothing to run first. This is what local development and any existing non-Supabase deployment keep using.
+- **`DATABASE_URL` set**: data lives in Postgres (Supabase or any standard Postgres). This is what Render deployments should use — Render's filesystem doesn't survive a deploy or restart, so the JSON-file backend would silently lose everything on the next deploy.
+
+See "Deploying to Render + Supabase" below for the one-time setup (schema + migrating any existing data).
 
 ## Backing up or moving your data
 
-Everything is in the `data/` folder. Running without Docker: copy it to move your releases to another machine (or back it up with your usual file backup). Running with Docker: that folder lives in the `greenlight-data` named volume — back it up with `docker run --rm -v greenlight-data:/data -v "$PWD":/backup alpine tar czf /backup/greenlight-backup.tar.gz -C /data .`, and restore it the same way in reverse.
+**JSON-file backend:** everything is in the `data/` folder. Running without Docker: copy it to move your releases to another machine (or back it up with your usual file backup). Running with Docker: that folder lives in the `greenlight-data` named volume — back it up with `docker run --rm -v greenlight-data:/data -v "$PWD":/backup alpine tar czf /backup/greenlight-backup.tar.gz -C /data .`, and restore it the same way in reverse.
+
+**Postgres/Supabase backend:** your data is in Supabase, so it's covered by Supabase's own backups (Project Settings → Database → Backups on paid plans) — or take a manual one any time with `pg_dump "$DATABASE_URL" > backup.sql`, restorable with `psql "$DATABASE_URL" < backup.sql`.
+
+## Deploying to Render + Supabase
+
+This is the path to a real shared deployment on Render, backed by Supabase Postgres instead of a local file (Render's disk doesn't persist across deploys, so the JSON-file backend isn't an option there — see "Database: local file vs. Postgres" above).
+
+### 1. Create the Supabase project and schema
+
+1. Create a project at [supabase.com](https://supabase.com).
+2. Open the SQL Editor and run the contents of `supabase/schema.sql` (or `psql "$DATABASE_URL" -f supabase/schema.sql` from your machine) — this only creates tables/indexes, it never touches data, and it's safe to re-run.
+3. Grab your connection string: Project Settings → Database → Connection string. Use the **Transaction pooler** connection (port 6543) — it's the one meant for a server like this that opens a normal connection pool, rather than the direct connection (port 5432), which Supabase reserves a limited number of.
+
+### 2. Bring in any existing data
+
+If you already have a `data/store.json` from running Greenlight locally or elsewhere, migrate it in **before** pointing production at this database:
+
+```bash
+DATABASE_URL="<your Supabase connection string>" npm run db:migrate
+```
+
+This reads your local `data/store.json` (and `data/jira-config.json`, if present) and upserts everything into Supabase — it's safe to run more than once (re-running never duplicates rows or overwrites audit log entries), and it never modifies or deletes your local `data/store.json`, so keep that around as a backup until you've verified the migrated data in the app.
+
+Starting fresh instead, with no existing data to bring in? Seed the same starter Regression Module list and starter team Greenlight would normally create automatically:
+
+```bash
+DATABASE_URL="<your Supabase connection string>" npm run db:seed-defaults
+```
+
+Both scripts only ever insert into empty tables/rows — neither one runs automatically when the server starts, specifically so a Render restart or redeploy can never reset or overwrite real production data.
+
+### 3. Push to GitHub, then create the Render service
+
+The project is already set up for this — `package.json`'s `start` script (`node server/index.js`) is the correct start command, and there's no build step beyond installing dependencies.
+
+- **New +** → **Web Service**, connect this GitHub repo.
+- **Build Command:** `npm install`
+- **Start Command:** `npm start`
+- Render sets `PORT` itself — don't set it yourself, and don't hard-code a port anywhere (the app already reads `process.env.PORT` and listens on `0.0.0.0`, which is what Render's health checks need).
+
+Or use the included `render.yaml` Blueprint (**New +** → **Blueprint**) to get the service, build/start commands, and the full env var list pre-filled from this repo.
+
+### 4. Set environment variables on Render
+
+In the service's **Environment** tab:
+
+| Variable | Required | Notes |
+|---|---|---|
+| `DATABASE_URL` | Yes | Your Supabase connection string from step 1. |
+| `APP_BASE_URL` | Yes | Your Render service's URL, e.g. `https://greenlight.onrender.com` — must match **exactly**, since it's also used to build the OAuth callback URL. You'll only know this after the first deploy assigns it; set it once you do, and redeploy. |
+| `JIRA_SITE_URL` | Yes | Your Jira Cloud site — see "Authentication" above. |
+| `ATLASSIAN_CLIENT_ID` / `ATLASSIAN_CLIENT_SECRET` | Yes | From your Atlassian OAuth app — and update its callback URL registration to match the `APP_BASE_URL` above. |
+| `SESSION_SECRET` | Yes | Generate with `openssl rand -hex 32` (or let Render generate it — `render.yaml` does this for you). |
+| `GEMINI_API_KEY` / `GEMINI_MODEL` | No | Optional AI-assisted Release Notes — see "Release notes" above. |
+
+`DATABASE_SSL` doesn't need to be set on Render — the app connects to Supabase over TLS by default.
+
+### 5. Deploy, then verify
+
+After the first successful deploy, check the Render logs for:
+
+```
+Persistence: Postgres (DATABASE_URL set)
+Database connection: OK
+```
+
+Sign in, confirm your migrated releases/test data/team/regression modules are all there, and reconnect Jira if `jira-config.json` wasn't migrated (the migration script brings it across automatically if it existed on the machine you ran it from).

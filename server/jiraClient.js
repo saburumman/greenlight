@@ -13,8 +13,8 @@ class JiraError extends Error {
   }
 }
 
-function requireConfig() {
-  const cfg = jiraConfig.load();
+async function requireConfig() {
+  const cfg = await jiraConfig.load();
   if (!cfg || !cfg.baseUrl || !cfg.apiToken) {
     throw new JiraError("Jira isn't connected yet. Add your connection details first.", 409);
   }
@@ -128,7 +128,7 @@ function fieldsToTicket(key, baseUrl, fields) {
 }
 
 async function getIssue(key) {
-  const cfg = requireConfig();
+  const cfg = await requireConfig();
   const data = await jiraFetch(
     cfg,
     `/issue/${encodeURIComponent(key)}?fields=${TICKET_FIELDS.join(",")}`
@@ -145,7 +145,7 @@ async function getIssue(key) {
 // the following request, and `isLast` (or an absent/empty issues page) to
 // signal the end. There's no more up-front `total` count from this endpoint.
 async function searchByFixVersion(fixVersion) {
-  const cfg = requireConfig();
+  const cfg = await requireConfig();
   const jql = `fixVersion = ${JSON.stringify(fixVersion)} ORDER BY key ASC`;
   const pageSize = 100;
   const tickets = [];

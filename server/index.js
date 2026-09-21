@@ -12,6 +12,7 @@ const teamRouter = require("./routes/team");
 const authRouter = require("./routes/auth");
 const oauth = require("./auth/atlassianOAuth");
 const { requireAuth } = require("./auth/middleware");
+const pgPool = require("./db/pgPool");
 
 // Authentication is mandatory — there is no guest fallback. Refuse to start
 // at all unless every Atlassian login variable is set, rather than silently
@@ -28,6 +29,11 @@ if (!oauth.isConfigured()) {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+// Render (and most PaaS hosts) health-check the container from outside
+// localhost, so the server must listen on every interface, not just
+// 127.0.0.1 — binding to "localhost" alone is a common reason a Render
+// deploy passes the build but the service never comes up healthy.
+const HOST = "0.0.0.0";
 
 app.use(express.json({ limit: "2mb" }));
 
@@ -57,6 +63,20 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Something went wrong on the server." });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, HOST, () => {
   console.log(`\n  Greenlight is running: http://localhost:${PORT}\n`);
+  if (pgPool.isConfigured()) {
+    console.log(`  Persistence: Postgres (DATABASE_URL set)`);
+    // Non-fatal — a slow-to-wake Supabase instance or a transient network
+    // blip shouldn't prevent the process from starting (Render would just
+    // restart-loop it); every route already surfaces a real error if the
+    // database genuinely can't be reached when a request comes in. This is
+    // just an early, visible signal in the logs.
+    pgPool
+      .query("select 1")
+      .then(() => console.log("  Database connection: OK\n"))
+      .catch((e) => console.error(`  Database connection check failed (will keep retrying per-request): ${e.message}\n`));
+  } else {
+    console.log(`  Persistence: local JSON file (data/store.json) — set DATABASE_URL to use Postgres/Supabase instead\n`);
+  }
 });

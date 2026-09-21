@@ -6,18 +6,19 @@
 const express = require("express");
 const crypto = require("crypto");
 const db = require("../db");
+const { asyncHandler } = require("../asyncHandler");
 
 const router = express.Router();
 
-router.get("/", (req, res) => {
-  res.json(db.regressionModules.list());
-});
+router.get("/", asyncHandler(async (req, res) => {
+  res.json(await db.regressionModules.list());
+}));
 
 // PUT replaces the whole list — simplest match for the "Manage Regression
 // Modules" modal, which lets the user add/rename/reorder/delete entities
 // and services freely and then saves once. Array order is display order,
 // both for entities and for each entity's services.
-router.put("/", (req, res) => {
+router.put("/", asyncHandler(async (req, res) => {
   const incoming = req.body;
   if (!Array.isArray(incoming)) {
     return res.status(400).json({ error: "Expected a list of entities." });
@@ -45,8 +46,8 @@ router.put("/", (req, res) => {
 
     cleaned.push({ id: entityId, name: entityName, services });
   }
-  const saved = db.regressionModules.set(cleaned);
+  const saved = await db.regressionModules.set(cleaned);
   res.json(saved);
-});
+}));
 
 module.exports = router;
