@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Greenlight</title>
+<link rel="icon" type="image/png" href="/logo.png">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="topbar">
+  <div class="topbar-inner">
+    <button type="button" class="btn btn-ghost btn-sm sidenav-toggle" id="sidenav-toggle" data-action="toggle-sidenav" aria-label="Open menu">☰</button>
+    <div class="brand" data-action="nav-home" tabindex="0" role="button" aria-label="Greenlight home">
+      <div class="brand-mark">
+        <img src="/logo.png" alt="Sanad QA Team logo">
+      </div>
+      <div>
+        <div class="brand-name">Greenlight</div>
+        <div class="brand-sub">QA readiness</div>
+      </div>
+    </div>
+    <div class="topbar-right">
+      <div class="topbar-user" id="topbar-user"></div>
+    </div>
+  </div>
+</div>
+
+<div class="app-body">
+  <nav class="sidenav" id="sidenav" aria-label="Main navigation"></nav>
+  <div class="sidenav-backdrop" data-action="close-sidenav"></div>
+  <div class="shell" id="app"></div>
+</div>
+<div id="modal-root"></div>
+<div id="toast-root"></div>
+<!-- Built fresh from a release's data right before printing (see
+     buildPdfReportHtml() / the "download-release-pdf" action in app.js) —
+     a standalone report, not a styled copy of the page above. Hidden on
+     screen; shown only for @media print, see styles.css. -->
+<div id="pdf-report" class="pdf-report"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

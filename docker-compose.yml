@@ -1,0 +1,18 @@
+services:
+  greenlight:
+    build: .
+    image: greenlight:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      # All persisted data — releases, regression modules, the audit log,
+      # and the (separately-configured) Jira ticket-sync connection — lives
+      # here. Named volume so `docker compose down` / rebuilds never lose it;
+      # only `docker compose down -v` would.
+      - greenlight-data:/app/data
+
+volumes:
+  greenlight-data:

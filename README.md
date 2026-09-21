@@ -1,0 +1,262 @@
+# Greenlight
+
+A lightweight QA release-readiness dashboard. It runs happily on your own machine with zero setup, or on a shared company server (bare Node, or [Docker](#running-with-docker)) for a whole team — no cloud database either way. Your release data lives in a local JSON file, and your Jira API token (if you connect one) lives in a local config file that never leaves the machine it's running on except to talk to your Jira instance.
+
+## What it does
+
+- A **landing page** (the home screen, at `/`) welcomes you into the workspace with quick-access cards to every section, an at-a-glance summary of real release data, and a short recent-activity feed — see [Home / Landing page](#home--landing-page) below.
+- A persistent **left sidebar** (a collapsible drawer on small screens) is how you get around — Release Monitor, Test Data, Audit, and Know the Team — with the current section always highlighted.
+- Tracks releases: tickets, regression (by module, against a reusable module list), known bugs, platform status (Web/Android/iOS), release blockers, and optional Performance/Security testing.
+- Gives an AI-style **GO / CONDITIONAL GO / NO-GO** recommendation, built from simple rules over exactly what you've entered (it never invents data).
+- Tickets can be added manually by pasting a Jira URL, or synced automatically from Jira by Fix Version.
+- Generates editable release notes from your Jira tickets and QA data — see **Release notes** below.
+- **Publish Release** records that a release shipped, with a timestamped snapshot of the recommendation at the time — shown as a badge on the release both on its own page and in the main list. Publishing never locks the release from further edits.
+- Once a release is published, a **Download PDF** button appears — see [Download PDF](#download-pdf) below.
+- An instant search bar on the main page finds a release, ticket, bug, blocker, or regression entity/service as you type, and jumps straight to it.
+- The main list always shows newest-created releases first, and that order doesn't shuffle as you edit a release afterward.
+- An **Audit Log** (sidebar → Audit) records who did what and when — releases created, tickets added/updated, Jira syncs, regression/bug/blocker/platform/performance/security updates, release notes generated or saved, and Test Data added/updated/copied/deleted. See [Identity & the Audit Log](#identity--the-audit-log) for how "who" is determined.
+- **Test Data** (sidebar → Test Data) is a reusable QA data library, independent of any release — see [Test Data](#test-data) below.
+- **Know the Team** (sidebar → Know the Team) is a purely informational page introducing the people behind the QA work — see [Know the Team](#know-the-team) below.
+
+## Requirements
+
+- [Node.js](https://nodejs.org) 18 or newer (check with `node -v`)
+
+## Setup
+
+```bash
+cd greenlight-app
+npm install
+npm start
+```
+
+Then open **http://localhost:3000** in your browser.
+
+To use a different port: `PORT=4000 npm start`.
+
+Your data is saved to `data/store.json` as you go — nothing to configure. Stopping and restarting the server keeps everything.
+
+## Connecting Jira (optional)
+
+Tickets can be tracked manually with no setup at all. To turn on automatic sync:
+
+1. Open a release, go to the **Tickets** section, and click **Connect Jira**.
+2. Fill in:
+   - **Jira Base URL** — e.g. `https://yourcompany.atlassian.net`
+   - **Auth type** — "Cloud (API token)" for Jira Cloud, or "Server / Data Center (PAT)" for a self-hosted instance
+   - **Email** (Cloud only) — the email address tied to your API token
+   - **API Token / Personal Access Token**
+     - Jira Cloud: create one at https://id.atlassian.com/manage-profile/security/api-tokens
+     - Server/Data Center: create a Personal Access Token from your Jira profile settings
+3. Click **Save & Test Connection**. It verifies the credentials against Jira immediately and tells you if something's wrong.
+
+The token is written to `data/jira-config.json` on this machine only, with restricted file permissions. It is never sent anywhere except directly to the Jira base URL you configured, and the browser never receives it back.
+
+**Fix Version matching:** a release's **Version** field (set when you create it, or via "Edit info") is used as the Jira Fix Version to match on — so tickets need that exact text (e.g. `v2.8.0`) set in their **Fix Version/s** field in Jira, not a Label. Click **Re-sync Jira** any time to pull in tickets whose Fix Version matches exactly. Syncing adds new tickets and updates existing ones — and it also removes a ticket that Jira has previously confirmed for this release (synced in, or manually added and later matched by a sync) if this search no longer returns it, most commonly because its Fix Version/s was changed or cleared in Jira. A ticket that's only ever been added manually, and has never itself matched this release's Fix Version, is left alone — sync never touches it either way. You can always remove any ticket by hand regardless.
+
+**Ticket → status bucket mapping:** Jira status names vary a lot between teams, so Greenlight maps them into 4 buckets (Open/To Do, In QA, Blocked, Completed) using Jira's own "done" classification plus simple keyword matching (anything with "block" in the name → Blocked, anything with "qa"/"test"/"review" → In QA). If your team's workflow uses different naming and the buckets look wrong, this is a one-function edit: `server/statusBucket.js`.
+
+## Identity & the Audit Log
+
+Nobody can use the app — view or edit anything — without signing in with an Atlassian account that has access to your configured Jira site (see the next section for setup; the server refuses to even start without it). The Audit Log records your real Atlassian name, and a signed-in session can't spoof another person's identity — the server stamps every audit record from the verified session, ignoring anything the browser sends.
+
+The Audit Log itself (`data/store.json`) is append-only — nobody edits or deletes existing entries from the UI, past entries keep whatever name was active when they were written, and switching identity (signing out and back in as someone else) only changes the name on *future* entries.
+
+## Authentication (Sign in with Atlassian)
+
+Signing in with Atlassian is **required** — Greenlight won't start at all until it's configured (see below). Everyone who uses it signs in with an Atlassian account that has access to your Jira site, which is also what gives the Audit Log real identity instead of a self-reported guest name.
+
+This only works with **Jira Cloud** (`yoursite.atlassian.net`) — Atlassian's "Login with Atlassian" OAuth flow isn't available for self-hosted Jira Server/Data Center. (Ticket sync above is separate and still supports Server/Data Center via a Personal Access Token — this section is only about who's allowed into the app.)
+
+### 1. Register an OAuth 2.0 app with Atlassian
+
+1. Go to **[developer.atlassian.com/console/myapps](https://developer.atlassian.com/console/myapps/)** (sign in with an account that's an admin on your Atlassian org, or can create apps) and click **Create** → **OAuth 2.0 integration**.
+2. Under **Permissions**, add:
+   - **User identity API** → scope `read:me`
+   - **Jira API** → scope `read:jira-user`
+   
+   (Nothing else — this app never reads or writes your Jira data as the signed-in user; ticket sync uses its own separate connection.)
+3. Under **Authorization**, add a callback URL: `https://<wherever-this-app-is-reachable>/auth/callback` — this has to match `APP_BASE_URL` below **exactly**, protocol included.
+4. Under **Settings**, copy the **Client ID** and **Client secret**.
+
+### 2. Configure the app
+
+Copy `.env.example` to `.env` in the project root and fill in:
+
+| Variable | Value |
+|---|---|
+| `ATLASSIAN_CLIENT_ID` | from step 1.4 |
+| `ATLASSIAN_CLIENT_SECRET` | from step 1.4 |
+| `APP_BASE_URL` | exactly where this app is reachable, e.g. `https://greenlight.yourcompany.com` — must match the callback URL in step 1.3 |
+| `JIRA_SITE_URL` | your Jira Cloud site, e.g. `https://yourcompany.atlassian.net` — only Atlassian accounts with access to this site can sign in |
+| `SESSION_SECRET` | a random string, e.g. `openssl rand -hex 32` — signs session cookies; changing it signs everyone out |
+
+`.env` is read automatically whether you run this with Docker or with a bare `npm start`/`npm run dev` (those two are the same command — see `package.json`; it doesn't matter which you type). All five variables must be set — if even one is missing or misspelled, the app refuses to start and tells you exactly which ones are missing, rather than silently coming up unauthenticated. If it won't start: double-check all five keys are spelled exactly as above with no typos, that `.env` is in the project root (next to `package.json`, not inside `server/`), and restart the app after any change to it — it's only read once, at startup.
+
+Sessions last 12 hours, after which you're asked to sign in again.
+
+## Regression modules
+
+Regression is module-based, not test-case-based, and organized as **Entity → Services** (e.g. "CSPD" containing "Passport services", "Digital Certificates"...) — matching how a real service catalog is usually grouped. You maintain one reusable Entity/Service list, and every release just needs its service statuses set — no re-adding entities or services release after release.
+
+- Click **⚙ Manage Modules** in a release's Regression section to add, rename, reorder, or delete entities and their services in the shared master list. It ships with a starter catalog (CSPD, DVLD, MOE, MOJ, GAM, DLS, JAF, MODEE, PSD, SSC, MOLA, GID, CRIF, CCD, MOHE, Jordan Post, EMRC, each with its services) — edit it freely to match your organization.
+- Every **new** release takes its own snapshot of the master list at creation time, with every service starting as **NOT TESTED**. Each service row shows its status as inline buttons — **PASS / WARNING / FAIL / NOT TESTED / SKIP** — clicking one saves that service's status immediately, no popup needed.
+- **SKIP** is for a service that genuinely doesn't apply to this release. Skipped services are left out of the overall regression status and out of the AI assessment's regression risk checks entirely (if every tracked service on a release ends up skipped, the assessment notes that transparently rather than reading it as untested or as a pass).
+- Click the note icon on a service row to add or edit that service's notes in a small popup — separate from status, so a click to change status never requires typing anything.
+- Each **entity** can be assigned an **Owner** — click the "Assign owner" button next to its name and type in whoever's covering it. This is free text (not tied to Know the Team), and it's set per release, not on the shared master list — the same entity can have a different owner from one release to the next, and clearing it is just saving the field blank.
+- Use the **Group by** control in the Regression section to switch the list between **Entity** (the default order) and **Owner** — grouping every entity under whoever it's assigned to, alphabetically, with any entities that don't have an owner yet collected under one **Unassigned** group at the end. Each entity still shows (and lets you edit) its own owner within either view; this only changes how they're arranged on the page.
+- Editing the master list later — adding, renaming, or deleting an entity or a service — only affects releases created **after** that change. Releases that already exist keep exactly the entity/service list (and statuses) they had, so historical release reports never shift under you.
+- Added or deleted an entity or service on the master list and want an **existing** release to catch up? Click **🔄 Sync Modules** in that release's Regression section. It adds what's missing (a new entity, or a new service under one you already track — never touching the status, notes, or owner you've already set on anything that stays) **and** removes any entity or service this release is still tracking that's since been deleted from the master list, taking its recorded status/notes/owner with it. The toast after syncing spells out exactly what was added and removed. A release's older, pre-Entities/Services flat regression rows (from before this feature existed) were never tied to the master list and are left alone either way.
+- Some releases don't need regression at all. Flip **Skip regression** in the Regression section header to exclude the whole section from that release's AI assessment (a small "marked as not required" note still appears in the assessment for transparency) — this is different from marking individual services as SKIP, which excludes just those services while the rest of regression is still tracked. Leave it off and the assessment will call out regression explicitly if it hasn't been started yet, or if services are still NOT TESTED, FAIL, or WARNING — it never quietly assumes a release is ready just because tickets and everything else look fine.
+
+## Release notes
+
+Click **Generate Release Notes** in a release's Release Notes section and it drafts notes from what's already tracked on the release — the template and its sections are unchanged:
+
+- **What's New** — your manually-typed highlights, plus any ticket Greenlight determined is a new feature.
+- **Improvements & Changes** — tickets read as improvements or general changes.
+- **Tickets in This Release** — every tracked ticket, grouped by status bucket.
+- **Bug Fixes** — resolved entries from Known Bugs, plus tickets read as bug fixes.
+- **Known Issues** — open/deferred entries from Known Bugs, plus any platform or regression result flagged FAIL/WARNING. This is never auto-populated from "any open Jira ticket" — only the app's own known-issue tracking (Known Bugs, platform status, regression results) ever lands here. If none of that applies, the section stays empty rather than guessing.
+- **Regression** — the current pass/fail/warning/skip counts.
+- **Platform Status** — Web/Android/iOS status and notes.
+- **Performance / Security** — only included when you've enabled either for the release.
+- **Release Blockers** — anything still open or in progress.
+- **QA Status** — the current GO / CONDITIONAL GO / NO-GO recommendation and its summary.
+
+### How each item is generated
+
+**Generate Release Notes** re-fetches the latest Jira issues for the release's Fix Version (the same lookup as **🔄 Re-sync Jira** — it also adds/updates `Tickets in This Release` as a side effect), then for every issue:
+
+1. Decides its section — New Feature, Improvement, Bug Fix, or Other — from the same rule-based logic this app has always used (issue type first, then the ticket's own wording as a fallback). **This step never involves AI**, so a ticket's section can't drift based on model output.
+2. Writes the item's short title/description. With `GEMINI_API_KEY` set (see `.env.example`), Google Gemini writes this part — summarizing (never copying) the ticket's description/recent comments in plain business language, never inventing functionality or impact that isn't in the ticket data it was given. Without an API key, it falls back to the same local rule-based summarizer this app always used — extracting a sentence already in the ticket, or a short neutral line if there isn't enough to work with.
+
+Every factual field on an item — issue key, type, status, priority, and the Jira link — always comes straight from Jira, never from AI, and every response Gemini returns is checked before use: any issue key it didn't actually send back gets dropped, and any ticket whose AI content is missing or malformed falls back to the rule-based summary for just that one ticket rather than failing the whole batch. If the AI call fails outright (bad key, network error, unparseable response), every item falls back to the rule-based summary and you'll see a toast saying so — it never shows made-up content silently.
+
+A ticket that's on the release but genuinely isn't in Jira (added by hand, or a Jira lookup that failed) is never sent to or validated against AI — there'd be nothing real to check it against — and keeps the same rule-based summary it always got.
+
+### Regenerating, and manual edits
+
+Generating never overwrites notes you've already edited by hand without asking first ("Regenerate release notes? Your current edits will be replaced."), and a Jira re-sync never rewrites existing notes on its own — new tickets are only picked up the next time you explicitly click Generate/Regenerate. Once you're happy with a draft, edit it freely and click **Save Release Notes**; you can keep editing and re-saving after that.
+
+Behind the editable notes, each generated item is tracked with where it came from — `AI_GENERATED` (from this generation step, whether Gemini or the rule-based fallback wrote it), `MANUALLY_ADDED` (a ticket that was never in the Jira data this ran against), or `MANUALLY_EDITED` (marked once you've hand-edited and saved the notes, so a later Regenerate's confirmation prompt is warning you about real edits, not a stale flag) — along with a reference back to its source Jira issue. This is bookkeeping behind the single notes editor, not a new UI — the editor itself is unchanged.
+
+## Download PDF
+
+Once a release has been published, a **Download PDF** button appears next to Edit info / Duplicate on its detail page. It opens your browser's native print dialog — choose "Save as PDF" as the destination to get a file, or print it directly. There's no server-side PDF generation and no new dependency.
+
+This isn't a screenshot of the release page — it's a separate, purpose-built report, generated fresh from the release's data right before the print dialog opens:
+
+- **Summary** — the AI GO / CONDITIONAL GO / NO-GO recommendation and its risk factors, the same read you'd get from the top of the release page.
+- **Statistics** — ticket counts (total, completed, in QA, blocked, open/to-do), regression counts (passed, warning, failed, not tested, skipped), and bug counts by severity.
+- **Tickets** — every ticket in the release as a table: key, title, status, type, priority.
+- **Release Notes** — whatever's currently saved in the release's Release Notes section.
+
+The browser's Save-as-PDF dialog also suggests the file's name for you, from the release's own name and version (e.g. "Checkout Revamp v2.4.1"), so you don't have to rename it after saving.
+
+## Test Data
+
+**Test Data** is a reusable QA data library — click **🗂 Test Data** (top-right of every page). It is deliberately *not* a test-management system: no test cases, no executions, no relationship to releases. It's a flat, searchable list of records you build up once and reuse across any release, instead of re-typing the same National IDs every time you need "a divorced female head of family" or "an account with Electronic Payment enabled."
+
+- Each record has a required **National ID** (stored as text, so leading zeros are kept), at least one required **Supported Scenario** (e.g. "Female Head of Family", "Divorced", "Electronic Payment" — type your own or pick from suggestions), and at least one required **Entity** (e.g. "Family Book", "Payments" — a record can belong to more than one entity; used to group and filter records). **Tags** and **Notes** are optional and freeform.
+- **Search** matches across National ID, Supported Scenarios, Entities, Tags, and Notes as you type; the **Entities** and **Tags** filters narrow the list further (matching a record that has the typed text in *any* of its entities/tags), and search + filters combine.
+- Each record's **⋮** menu has **View**, **Edit**, **Copy**, and **Delete**. **Copy** opens a pre-filled form for a new record (National ID left blank, since reusing the same one would immediately collide) — nothing is saved until you edit it and click Save. **Delete** always asks for confirmation first.
+- Saving a National ID that's already in use doesn't silently create a duplicate — you're warned, with a link to open the existing record instead.
+- Test Data is stored independently of releases (same `data/store.json`, its own top-level collection) and survives refreshes, browser restarts, and signing in as someone else. Create/update/copy/delete actions are recorded in the Audit Log the same way every other action in this app is.
+- The list is paginated 25 records per page, with **Showing X–Y of Z** and **Prev/Next** controls below the table. Searching or changing the Entities/Tags filter always jumps back to page 1.
+
+### Exporting to Excel
+
+Click **⬇ Export** (next to Import) to download the list as an `.xlsx` file, generated server-side with `exceljs`. It exports whatever's currently on screen — if search or the Entities/Tags filters are active, only the matching records are included (across all pages, not just the one you're looking at); with no search or filters, it's the whole table. The file name reflects that: `test-data-<date>.xlsx` for the full list, `test-data-filtered-<date>.xlsx` when a search/filter was applied. Columns: National ID, Supported Scenarios, Entities, Tags, Notes, Created By, Created At.
+
+### Importing from a spreadsheet
+
+Click **⬆ Import** (next to Add Test Data) and pick a **CSV** file — export an Excel or Google Sheets file as CSV first if that's where your list lives (File → Download/Export → CSV). The app reads three columns positionally, header row optional: **A** = National ID, **B** = Feature (goes into Supported Scenarios), **C** = Notes; anything past column C is ignored.
+
+- If the same National ID appears on more than one row, they're merged into a single record — their Feature values become that record's list of Supported Scenarios (deduplicated), and their Notes are combined.
+- A National ID already in your Test Data table is left out of the import entirely — re-uploading the same sheet later only ever offers you what's still new.
+- Every new record shows up in a review table, with **Scenario**, **Notes**, and **Entity** all editable right there before it's saved — fix up whatever the sheet got wrong, or add to it, without leaving the dialog. The sheet has no column for **Entity** at all, and it's required, so that one starts blank on every row: type one per row (comma-separate for more than one), or type an Entity once at the top and click **Apply to empty rows** to fill every row that doesn't have one yet. A row's status flips to **Ready** as soon as it has both a Scenario and an Entity.
+- You don't have to finish the whole sheet in one sitting — **Import N ready rows** only commits the rows that are complete; whatever's left stays in the table so you can keep going, or close the dialog and pick it up later (re-uploading the same file will skip everything you've already imported).
+
+Import support is CSV-only for now — not raw `.xlsx` — since parsing real Excel binaries needs a third-party library, and the option on npm currently carries an unpatched high-severity vulnerability. CSV covers the same data with no new dependency.
+
+## Home / Landing page
+
+The root URL (`/`) is now a landing page instead of the releases list (which moved to its own explicit `/#/releases` route — every existing "back to releases" link and the sidebar's **Release Monitor** item still take you there). It's intentionally lightweight — an orientation and jumping-off point, not another full dashboard:
+
+- A short welcome section, four quick-access cards straight to Release Monitor, Test Data, Audit, and Know the Team.
+- **At a Glance** — Active Releases, Open Blockers, Releases with GO, and Releases with NO-GO, computed live from your existing release data (the same `computeAssessment()` engine used everywhere else) — never invented or hardcoded numbers.
+- **Recent Releases** — the 5 most recently updated releases with their current status, linking straight to each release's page, plus a "View all releases" link.
+- **Recent Activity** — the 5 most recent Audit Log entries, shown only when the Audit Log already has data. Viewing the landing page itself never writes a new audit entry.
+
+## Know the Team
+
+**Know the Team** (sidebar) introduces the people behind the QA work — name, role, a short bio, QA specialties, tools, and an optional LinkedIn/GitHub link. It is purely informational: no login roles, no permissions, and no connection to guest sessions or accounts. Team members live in one small array at the top of the "KNOW THE TEAM" section in `public/app.js` (`TEAM_MEMBERS`) — edit that array to add, update, or remove a person; a `placeholder: true` entry is shown with a "Placeholder" badge until it's replaced with a real profile.
+
+## Running with Docker
+
+```bash
+cd greenlight-app
+cp .env.example .env
+# edit .env — fill in the 5 Atlassian variables above (required — the
+# container won't start without them) plus GEMINI_API_KEY if you want
+# AI-assisted release notes
+docker compose up -d --build
+```
+
+That's it — `docker compose up` builds the image, starts the container, and creates a named volume (`greenlight-data`) for the `data/` folder so releases, regression modules, the audit log, and the Jira connection all survive rebuilds and restarts.
+
+Useful commands:
+
+```bash
+docker compose logs -f          # follow the app's logs
+docker compose down             # stop and remove the container (data volume is kept)
+docker compose down -v          # stop AND delete the data volume — this deletes your data
+docker compose up -d --build    # rebuild after pulling code changes
+```
+
+The container serves plain HTTP on the port you set (`3000` by default) — put it behind your company's usual reverse proxy or load balancer (nginx, Traefik, an internal ALB, etc.) for HTTPS and a real domain name. That's also almost always what `APP_BASE_URL` above should point at — the public HTTPS URL, not the container's internal port.
+
+Prefer to build/run without Compose? The `Dockerfile` alone works too:
+
+```bash
+docker build -t greenlight .
+docker run -d -p 3000:3000 --env-file .env -v greenlight-data:/app/data greenlight
+```
+
+## Project layout
+
+```
+greenlight-app/
+  server/
+    index.js          — Express app entry point
+    loadEnv.js          — reads .env into process.env for local `npm start` (Docker reads it directly)
+    db.js              — release + audit log + test data storage (a JSON file, data/store.json)
+    jiraConfig.js       — Jira connection storage (data/jira-config.json)
+    jiraClient.js        — the 3 Jira REST calls this app makes (read-only)
+    statusBucket.js       — Jira status → bucket mapping (edit this to match your workflow)
+    releaseNotesLogic.js   — Release Notes categorization + rule-based summarizer (server-side twin of the same logic in app.js)
+    aiService.js             — thin Google Gemini API client used only for Release Notes item text (see "Release notes" above)
+    auth/
+      atlassianOAuth.js    — "Sign in with Atlassian" OAuth client
+      session.js            — signed session-cookie tokens (no server-side session store)
+      cookies.js              — small hand-rolled cookie helpers
+      middleware.js            — gates /api/* on a valid session, only when configured
+    routes/
+      releases.js         — release CRUD + ticket endpoints
+      jira.js               — connect/status/lookup endpoints
+      regressionModules.js  — the reusable Regression Module master list
+      audit.js                — audit log read/append endpoints
+      testData.js               — the reusable Test Data library CRUD endpoints
+      auth.js                  — /auth/login, /auth/callback, /auth/logout, /auth/me
+  public/
+    index.html, styles.css, app.js  — the dashboard itself (no build step, no framework)
+  data/                    — created automatically; your releases, audit log, and Jira config live here
+  Dockerfile, docker-compose.yml, .dockerignore, .env.example  — see "Running with Docker" above
+```
+
+No build step, no bundler, no database server. Editing any file under `public/` takes effect on the next page reload; editing anything under `server/` needs a restart (`Ctrl+C`, then `npm start` again).
+
+## Backing up or moving your data
+
+Everything is in the `data/` folder. Running without Docker: copy it to move your releases to another machine (or back it up with your usual file backup). Running with Docker: that folder lives in the `greenlight-data` named volume — back it up with `docker run --rm -v greenlight-data:/data -v "$PWD":/backup alpine tar czf /backup/greenlight-backup.tar.gz -C /data .`, and restore it the same way in reverse.
