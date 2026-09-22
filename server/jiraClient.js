@@ -1,8 +1,24 @@
-// A thin, deliberately small client for Jira's REST API — just the 3 calls
-// Greenlight needs: verify credentials, look up one issue, and search
-// issues by Label. No writes to Jira are ever made.
+// A thin, deliberately small client for Jira's REST API — just the 2 calls
+// Greenlight needs: look up one issue, and search issues by Fix Version. No
+// writes to Jira are ever made.
+//
+// Every call goes out as a specific signed-in Greenlight user, using that
+// user's own Atlassian OAuth access token (see auth/atlassianTokens.js) —
+// there is no shared/global Jira credential anywhere in this app. Callers
+// never construct a client directly; they get one scoped to the
+// authenticated request via forUser(req.authUser), e.g.:
+//
+//   const jira = jiraClient.forUser(req.authUser);
+//   const ticket = await jira.getIssue("MOJ-1234");
+//
+// Jira Cloud OAuth 2.0 (3LO) tokens can only call the Jira REST API through
+// https://api.atlassian.com/ex/jira/{cloudId}/rest/api/3/... (the site's
+// own https://yourcompany.atlassian.net/rest/api/3/... URL only accepts
+// Basic-auth/PAT requests, which this app no longer makes) — see
+// auth/atlassianOAuth.js#getCloudId.
 
-const jiraConfig = require("./jiraConfig");
+const oauth = require("./auth/atlassianOAuth");
+const atlassianTokens = require("./auth/atlassianTokens");
 const { categorizeStatus } = require("./statusBucket");
 
 class JiraError extends Error {
@@ -13,50 +29,29 @@ class JiraError extends Error {
   }
 }
 
-async function requireConfig() {
-  const cfg = await jiraConfig.load();
-  if (!cfg || !cfg.baseUrl || !cfg.apiToken) {
-    throw new JiraError("Jira isn't connected yet. Add your connection details first.", 409);
-  }
-  return cfg;
+function apiBase(cloudId) {
+  return `https://api.atlassian.com/ex/jira/${cloudId}/rest/api/3`;
 }
 
-function authHeader(cfg) {
-  if (cfg.authType === "token") {
-    return "Bearer " + cfg.apiToken;
-  }
-  // Cloud: email + API token, HTTP Basic auth
-  const raw = `${cfg.email || ""}:${cfg.apiToken}`;
-  return "Basic " + Buffer.from(raw, "utf8").toString("base64");
-}
-
-function apiBase(cfg) {
-  const version = cfg.apiVersion || "3";
-  return `${cfg.baseUrl.replace(/\/+$/, "")}/rest/api/${version}`;
-}
-
-async function jiraFetch(cfg, urlPath, options) {
-  const url = `${apiBase(cfg)}${urlPath}`;
+async function jiraFetch(accessToken, cloudId, urlPath, options) {
+  const url = `${apiBase(cloudId)}${urlPath}`;
   let res;
   try {
     res = await fetch(url, {
       ...options,
       headers: {
-        Authorization: authHeader(cfg),
+        Authorization: `Bearer ${accessToken}`,
         Accept: "application/json",
         "Content-Type": "application/json",
         ...(options && options.headers),
       },
     });
   } catch (e) {
-    throw new JiraError(
-      `Couldn't reach ${cfg.baseUrl} (${e.message}). Check the base URL and your network connection.`,
-      502
-    );
+    throw new JiraError(`Couldn't reach Jira (${e.message}). Check your network connection.`, 502);
   }
 
   if (res.status === 401 || res.status === 403) {
-    throw new JiraError("Jira rejected the credentials (401/403). Check the email/token or PAT.", res.status);
+    throw new JiraError("Jira rejected the request (401/403) — your Atlassian authorization may no longer have access to this issue.", res.status);
   }
   if (res.status === 404) {
     throw new JiraError("Not found in Jira (404).", 404);
@@ -71,11 +66,6 @@ async function jiraFetch(cfg, urlPath, options) {
     throw new JiraError(`Jira returned an error (${res.status})${detail ? ": " + detail : "."}`, res.status);
   }
   return res.json();
-}
-
-async function testConnection(cfg) {
-  const me = await jiraFetch(cfg, "/myself");
-  return { displayName: me.displayName || me.name || me.accountId || "Connected" };
 }
 
 // Jira Cloud (API v3) returns rich-text fields (description, comment bodies)
@@ -127,52 +117,80 @@ function fieldsToTicket(key, baseUrl, fields) {
   };
 }
 
-async function getIssue(key) {
-  const cfg = await requireConfig();
-  const data = await jiraFetch(
-    cfg,
-    `/issue/${encodeURIComponent(key)}?fields=${TICKET_FIELDS.join(",")}`
-  );
-  return fieldsToTicket(data.key || key, cfg.baseUrl, data.fields);
-}
-
-// Searches for every issue whose Fix Version/s matches the given version
-// name, paginating through results.
-//
-// Jira retired the classic POST /search endpoint (offset-based startAt/total
-// pagination) in favor of POST /search/jql, which uses cursor/token-based
-// pagination instead: each response carries a `nextPageToken` to pass into
-// the following request, and `isLast` (or an absent/empty issues page) to
-// signal the end. There's no more up-front `total` count from this endpoint.
-async function searchByFixVersion(fixVersion) {
-  const cfg = await requireConfig();
-  const jql = `fixVersion = ${JSON.stringify(fixVersion)} ORDER BY key ASC`;
-  const pageSize = 100;
-  const tickets = [];
-  let nextPageToken;
-
-  for (;;) {
-    const body = {
-      jql,
-      maxResults: pageSize,
-      fields: TICKET_FIELDS,
-    };
-    if (nextPageToken) body.nextPageToken = nextPageToken;
-
-    const page = await jiraFetch(cfg, "/search/jql", {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-    const issues = page.issues || [];
-    for (const issue of issues) {
-      tickets.push(fieldsToTicket(issue.key, cfg.baseUrl, issue.fields));
-    }
-
-    if (!issues.length || page.isLast || !page.nextPageToken) break;
-    nextPageToken = page.nextPageToken;
+// Resolves the two things every request below needs: this user's current
+// access token (refreshing it first if needed — throws ReauthRequiredError
+// if that's not possible, see auth/atlassianTokens.js) and this
+// deployment's Jira Cloud id (cached in-memory — see
+// auth/atlassianOAuth.js#getCloudId). authUser is req.authUser, the
+// verified session payload set by auth/middleware.js — always
+// { accountId, name, email, avatarUrl }.
+async function resolveAuth(authUser) {
+  if (!authUser || !authUser.accountId) {
+    throw new atlassianTokens.ReauthRequiredError("Sign in with Atlassian to use Jira features.");
   }
-
-  return { tickets, total: tickets.length };
+  const accessToken = await atlassianTokens.getAccessToken(authUser.accountId);
+  const cloudId = await oauth.getCloudId(accessToken);
+  return { accessToken, cloudId };
 }
 
-module.exports = { JiraError, testConnection, getIssue, searchByFixVersion };
+// Returns a Jira client scoped to one authenticated Greenlight user — every
+// call it makes goes out under that user's own Atlassian OAuth
+// authorization, so it only ever sees what that user's own Jira
+// permissions allow.
+function forUser(authUser) {
+  return {
+    async getIssue(key) {
+      const { accessToken, cloudId } = await resolveAuth(authUser);
+      const cfg = oauth.getConfig();
+      const data = await jiraFetch(
+        accessToken,
+        cloudId,
+        `/issue/${encodeURIComponent(key)}?fields=${TICKET_FIELDS.join(",")}`
+      );
+      return fieldsToTicket(data.key || key, cfg.jiraSiteUrl, data.fields);
+    },
+
+    // Searches for every issue whose Fix Version/s matches the given version
+    // name, paginating through results.
+    //
+    // Jira retired the classic POST /search endpoint (offset-based
+    // startAt/total pagination) in favor of POST /search/jql, which uses
+    // cursor/token-based pagination instead: each response carries a
+    // `nextPageToken` to pass into the following request, and `isLast` (or
+    // an absent/empty issues page) to signal the end. There's no more
+    // up-front `total` count from this endpoint.
+    async searchByFixVersion(fixVersion) {
+      const { accessToken, cloudId } = await resolveAuth(authUser);
+      const cfg = oauth.getConfig();
+      const jql = `fixVersion = ${JSON.stringify(fixVersion)} ORDER BY key ASC`;
+      const pageSize = 100;
+      const tickets = [];
+      let nextPageToken;
+
+      for (;;) {
+        const body = {
+          jql,
+          maxResults: pageSize,
+          fields: TICKET_FIELDS,
+        };
+        if (nextPageToken) body.nextPageToken = nextPageToken;
+
+        const page = await jiraFetch(accessToken, cloudId, "/search/jql", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        const issues = page.issues || [];
+        for (const issue of issues) {
+          tickets.push(fieldsToTicket(issue.key, cfg.jiraSiteUrl, issue.fields));
+        }
+
+        if (!issues.length || page.isLast || !page.nextPageToken) break;
+        nextPageToken = page.nextPageToken;
+      }
+
+      return { tickets, total: tickets.length };
+    },
+  };
+}
+
+module.exports = { JiraError, forUser };

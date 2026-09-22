@@ -157,8 +157,6 @@ var api = {
   generateReleaseNotes: function(id){ return apiCall("POST","/releases/"+id+"/release-notes/generate"); },
   syncRegressionModules: function(id){ return apiCall("POST","/releases/"+id+"/regression-sync"); },
   jiraStatus: function(){ return apiCall("GET","/jira/status"); },
-  jiraConnect: function(data){ return apiCall("POST","/jira/connect", data); },
-  jiraDisconnect: function(){ return apiCall("POST","/jira/disconnect"); },
   listRegressionModules: function(){ return apiCall("GET","/regression-modules"); },
   saveRegressionModules: function(list){ return apiCall("PUT","/regression-modules", list); },
   listAudit: function(){ return apiCall("GET","/audit"); },
@@ -245,7 +243,7 @@ var state = {
   releaseOrder: [],
   listReady: false,
   loadError: null,
-  jiraStatus: {configured:false},
+  jiraStatus: {connected:false},
   notesDirty: false,
   ticketGroupBy: "None",
   ticketCollapsed: {}, // groupKey -> true if collapsed
@@ -835,7 +833,7 @@ function loadOne(id){
   });
 }
 function loadJiraStatus(){
-  return api.jiraStatus().then(function(s){ state.jiraStatus = s; }).catch(function(){ state.jiraStatus = {configured:false}; });
+  return api.jiraStatus().then(function(s){ state.jiraStatus = s; }).catch(function(){ state.jiraStatus = {connected:false}; });
 }
 function loadAuditLog(){
   return api.listAudit().then(function(list){
@@ -2280,7 +2278,7 @@ function groupTickets(tickets, mode){
 function sectionTickets(r){
   var tickets = r.tickets || [];
   var summary = ticketSummary(r);
-  var js = state.jiraStatus || {configured:false};
+  var js = state.jiraStatus || {connected:false};
   var lastSynced = r.jira && r.jira.lastSyncedAt ? fmtDateTime(r.jira.lastSyncedAt) : null;
 
   var groups = groupTickets(tickets, state.ticketGroupBy);
@@ -2317,8 +2315,8 @@ function sectionTickets(r){
   return '<section class="card section-card" id="sec-tickets">'+
     '<div class="section-head"><div class="section-title"><span class="emoji">🎫</span> Tickets Within the Release</div>'+
       '<div class="section-actions">'+
-        '<button class="btn btn-sm" data-action="open-jira-connect">'+iconJira()+' '+(js.configured?"Jira Connected":"Connect Jira")+'</button>'+
-        '<button class="btn btn-sm" data-action="resync-jira" '+(js.configured? "":"disabled title=\"Connect Jira first\"")+'>'+iconRefresh()+' Re-sync Jira</button>'+
+        (js.connected? "" : '<a class="btn btn-sm" href="/auth/login">'+iconJira()+' Reconnect Jira</a>')+
+        '<button class="btn btn-sm" data-action="resync-jira" '+(js.connected? "":"disabled title=\"Sign in with Atlassian first\"")+'>'+iconRefresh()+' Re-sync Jira</button>'+
         '<button class="btn btn-sm btn-primary" data-action="add-ticket">'+iconPlus()+' Add Ticket</button>'+
       '</div></div>'+
     '<div class="section-body">'+
@@ -2326,7 +2324,7 @@ function sectionTickets(r){
         statTile(summary.total,"Total")+statTile(summary.completed,"Completed")+statTile(summary.inQA,"In QA")+statTile(summary.blocked,"Blocked")+statTile(summary.open,"Open / To Do")+
       '</div>'+
       '<div class="ticket-meta-row">'+
-        '<span class="jira-status-line"><span class="jira-dot '+(js.configured?"on":"off")+'"></span>'+(js.configured? "Jira connected"+(js.baseUrl? " — "+esc(js.baseUrl):"") : "Jira not connected")+'</span>'+
+        '<span class="jira-status-line"><span class="jira-dot '+(js.connected?"on":"off")+'"></span>'+(js.connected? "Jira connected" : "Jira not connected — sign in with Atlassian")+'</span>'+
         '<span>Fix Version match: <b class="mono">'+esc(r.version || "not set")+'</b></span>'+
         (lastSynced ? '<span>Last synced: <b>'+esc(lastSynced)+'</b></span>' : '<span class="helper-text">Never synced</span>')+
       '</div>'+
@@ -2802,8 +2800,8 @@ function persistRelease(r, onSuccess){
 
 /* ---- Tickets: Add / Edit ---- */
 function openAddTicketModal(r){
-  var js = state.jiraStatus || {configured:false};
-  var manualFields = js.configured ? "" :
+  var js = state.jiraStatus || {connected:false};
+  var manualFields = js.connected ? "" :
     '<div class="field"><label for="f-title">Title</label><input type="text" id="f-title" placeholder="Ticket summary"></div>'+
     '<div class="field-row">'+
       '<div class="field"><label for="f-status">Status</label><select id="f-status">'+TICKET_STATUS_OPTIONS.map(function(s){return '<option value="'+s+'">'+s+'</option>';}).join("")+'</select></div>'+
@@ -2812,7 +2810,7 @@ function openAddTicketModal(r){
     '<div class="field"><label for="f-priority">Priority</label><input type="text" id="f-priority" placeholder="e.g. High" list="priority-options"><datalist id="priority-options"><option value="Highest"><option value="High"><option value="Medium"><option value="Low"><option value="Lowest"></datalist></div>';
   var body =
     '<div class="field"><label for="f-url">Jira Ticket URL</label><input type="url" id="f-url" placeholder="https://jira.example.com/browse/MOJ-1234" required></div>'+
-    (js.configured ? '<p class="helper-text">Jira is connected — title, status, issue type and priority will be pulled in automatically.</p>' : '<p class="helper-text">Jira isn’t connected, so fill these in yourself.</p>')+
+    (js.connected ? '<p class="helper-text">Jira is connected — title, status, issue type and priority will be pulled in automatically.</p>' : '<p class="helper-text">Jira isn’t connected, so fill these in yourself.</p>')+
     manualFields+
     '<div id="add-ticket-error"></div>';
   var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">Add ticket</button>';
@@ -2822,7 +2820,7 @@ function openAddTicketModal(r){
     var url = qs("#f-url").value.trim();
     if(!url){ qs("#f-url").focus(); return; }
     var payload = {url:url};
-    if(!js.configured){
+    if(!js.connected){
       payload.title = qs("#f-title") ? qs("#f-title").value.trim() : "";
       payload.status = qs("#f-status") ? qs("#f-status").value : "";
       payload.issueType = qs("#f-type") ? qs("#f-type").value.trim() : "";
@@ -2883,67 +2881,6 @@ function openEditTicketModal(r, ticket){
     closeModal();
     persistRelease(r, function(){
       logAudit({action:"TICKET_UPDATED", entityType:"Ticket", entityId: ticket.key, details: ticket.title || "Untitled"});
-    });
-  });
-}
-
-/* ---- Connect Jira ---- */
-function openJiraConnectModal(){
-  var js = state.jiraStatus || {configured:false};
-  var connectedBlock = js.configured ? (
-    '<div class="modal-success">Connected to <b>'+esc(js.baseUrl)+'</b>'+(js.email? " as "+esc(js.email):"")+'</div>'+
-    '<button type="button" class="btn btn-danger btn-sm" id="jira-disconnect" style="align-self:flex-start;">Disconnect</button>'+
-    '<p class="helper-text">To change the connection, fill in the form below and save — it will replace the current one.</p>'
-  ) : "";
-  var body = connectedBlock +
-    '<div class="field"><label for="f-baseurl">Jira Base URL</label><input type="text" id="f-baseurl" placeholder="https://yourcompany.atlassian.net" value="'+escAttr(js.baseUrl||"")+'"></div>'+
-    '<div class="field"><label>Auth type</label>'+statusChoiceGroup("authtype", ["Cloud (API token)","Server / Data Center (PAT)"], js.authType==="token" ? "Server / Data Center (PAT)" : "Cloud (API token)", true)+'</div>'+
-    '<div class="field" id="email-field"><label for="f-email">Email <span class="hint">(Jira Cloud)</span></label><input type="email" id="f-email" placeholder="you@company.com" value="'+escAttr(js.email||"")+'"></div>'+
-    '<div class="field"><label for="f-token">API Token / Personal Access Token</label><input type="password" id="f-token" placeholder="Paste your Jira API token"></div>'+
-    '<p class="helper-text">Stored only in a local file on this machine (<code>data/jira-config.json</code>) — never sent anywhere except directly to your Jira instance.</p>'+
-    '<div id="jira-connect-result"></div>';
-  var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">Save &amp; Test Connection</button>';
-  openModal(modalShell("Connect Jira", body, foot), {wide:true});
-
-  var authRadios = qsa('input[name="authtype"]');
-  function syncEmailVisibility(){
-    var cloud = (qs('input[name="authtype"]:checked')||{}).value !== "Server / Data Center (PAT)";
-    qs("#email-field").style.display = cloud ? "" : "none";
-  }
-  authRadios.forEach(function(r){ r.addEventListener("change", syncEmailVisibility); });
-  syncEmailVisibility();
-
-  var disconnectBtn = qs("#jira-disconnect");
-  if(disconnectBtn) disconnectBtn.addEventListener("click", function(){
-    api.jiraDisconnect().then(function(){
-      state.jiraStatus = {configured:false};
-      closeModal();
-      showToast("Jira disconnected");
-      render();
-    });
-  });
-
-  qs("#modal-form").addEventListener("submit", function(e){
-    e.preventDefault();
-    var baseUrl = qs("#f-baseurl").value.trim();
-    var isToken = (qs('input[name="authtype"]:checked')||{}).value === "Server / Data Center (PAT)";
-    var payload = {
-      baseUrl: baseUrl,
-      authType: isToken ? "token" : "cloud",
-      email: qs("#f-email").value.trim(),
-      apiToken: qs("#f-token").value.trim(),
-      apiVersion: isToken ? "2" : "3"
-    };
-    var submitBtn = qs('.modal button[type=submit]');
-    submitBtn.disabled = true; submitBtn.textContent = "Testing connection…";
-    api.jiraConnect(payload).then(function(result){
-      state.jiraStatus = {configured:true, baseUrl: result.baseUrl, authType: payload.authType, email: payload.email};
-      qs("#jira-connect-result").innerHTML = '<div class="modal-success">Connected as '+esc(result.displayName)+'.</div>';
-      showToast("Jira connected");
-      setTimeout(function(){ closeModal(); render(); }, 700);
-    }).catch(function(e){
-      qs("#jira-connect-result").innerHTML = '<div class="modal-error">'+esc(e.message)+'</div>';
-      submitBtn.disabled = false; submitBtn.textContent = "Save & Test Connection";
     });
   });
 }
@@ -3549,8 +3486,7 @@ document.addEventListener("click", function(e){
     case "add-ticket": if(r) openAddTicketModal(r); break;
     case "edit-ticket": if(r){ var t=(r.tickets||[]).find(function(x){return x.key===key;}); if(t) openEditTicketModal(r,t); } break;
     case "delete-ticket": if(r){ r.tickets=(r.tickets||[]).filter(function(x){return x.key!==key;}); persistRelease(r); } break;
-    case "open-jira-connect": openJiraConnectModal(); break;
-    case "resync-jira": if(r && state.jiraStatus.configured) handleResyncJira(r); break;
+    case "resync-jira": if(r && state.jiraStatus.connected) handleResyncJira(r); break;
     case "toggle-ticket-group":
       var gkey = el2.getAttribute("data-key");
       var wasCollapsed = (gkey in state.ticketCollapsed) ? state.ticketCollapsed[gkey] : true;

@@ -7,16 +7,12 @@ const express = require("express");
 const crypto = require("crypto");
 const oauth = require("../auth/atlassianOAuth");
 const session = require("../auth/session");
+const atlassianTokens = require("../auth/atlassianTokens");
 const { parseCookies, serializeCookie, appendSetCookie, clearCookie } = require("../auth/cookies");
+const { asyncHandler } = require("../asyncHandler");
 
 const router = express.Router();
 const STATE_COOKIE = "rm_oauth_state";
-
-function isSecure(req) {
-  const cfg = oauth.getConfig();
-  if (cfg && cfg.appBaseUrl.startsWith("https://")) return true;
-  return req.secure || req.headers["x-forwarded-proto"] === "https";
-}
 
 // GET /auth/me — tells the frontend whether OAuth login is enabled on this
 // deployment at all, and if so, whether the current visitor is signed in.
@@ -40,7 +36,7 @@ router.get("/login", (req, res) => {
   const state = crypto.randomBytes(16).toString("hex");
   appendSetCookie(
     res,
-    serializeCookie(STATE_COOKIE, state, { maxAgeSeconds: 600, secure: isSecure(req) })
+    serializeCookie(STATE_COOKIE, state, { maxAgeSeconds: 600, secure: oauth.isSecure(req) })
   );
   res.redirect(oauth.buildAuthorizeUrl(state));
 });
@@ -64,21 +60,31 @@ router.get("/callback", async (req, res) => {
   try {
     const tokenResult = await oauth.exchangeCodeForToken(code);
     const accessToken = tokenResult.access_token;
-    const [identity, hasAccess] = await Promise.all([
-      oauth.fetchIdentity(accessToken),
-      oauth.hasAccessToConfiguredJiraSite(accessToken),
-    ]);
-    if (!hasAccess) {
+    // Confirms this Atlassian account can see the configured Jira site AND
+    // gives us its cloudId, before we ask Jira for the account's identity
+    // fields (name/email/avatar) — see fetchJiraIdentity's comment for why
+    // identity comes from Jira's own /myself endpoint (read:jira-user)
+    // rather than a separate identity-API scope.
+    const resource = await oauth.findConfiguredJiraResource(accessToken);
+    if (!resource) {
       return res.redirect(
         "/?authError=" + encodeURIComponent("Your Atlassian account doesn't have access to this company's Jira — contact your admin.")
       );
     }
+    const identity = await oauth.fetchJiraIdentity(accessToken, resource.id);
+    // Persist THIS user's own Jira OAuth tokens, server-side, keyed by their
+    // stable Atlassian accountId — this is the only place Greenlight ever
+    // gets Jira access, and every Jira API call this user's session makes
+    // from here on uses exactly this record (see auth/atlassianTokens.js).
+    // The access token itself is never put in the session cookie or sent to
+    // the browser.
+    await atlassianTokens.saveTokens(identity.accountId, tokenResult);
     const sessionToken = session.createSessionToken(identity);
     appendSetCookie(
       res,
       serializeCookie(session.SESSION_COOKIE, sessionToken, {
         maxAgeSeconds: session.SESSION_TTL_SECONDS,
-        secure: isSecure(req),
+        secure: oauth.isSecure(req),
       })
     );
     res.redirect("/");
@@ -88,9 +94,17 @@ router.get("/callback", async (req, res) => {
   }
 });
 
-router.post("/logout", (req, res) => {
-  clearCookie(res, session.SESSION_COOKIE, { secure: isSecure(req) });
+router.post("/logout", asyncHandler(async (req, res) => {
+  // Clear this user's stored Jira tokens too, not just their Greenlight
+  // session — signing out should fully end their Jira access, not just log
+  // them out of the app while leaving a usable token on file.
+  const cookies = parseCookies(req);
+  const payload = session.verify(cookies[session.SESSION_COOKIE]);
+  if (payload && payload.accountId) {
+    await atlassianTokens.clearTokens(payload.accountId);
+  }
+  clearCookie(res, session.SESSION_COOKIE, { secure: oauth.isSecure(req) });
   res.json({ ok: true });
-});
+}));
 
 module.exports = router;

@@ -22,10 +22,13 @@
 -- app's own UUID `id` (generated in the route, not by Postgres) — this
 -- preserves the existing nested structure (tickets, regression entities/
 -- services, bugs, platforms, etc.) instead of flattening it into tables it
--- was never designed for. `regression_modules` and `jira_config` are each a
--- single reusable value (not a per-id collection), so they're a one-row
--- "singleton" table. `audit_log` records were already flat, so that one is
--- a normal relational table with typed columns.
+-- was never designed for. `regression_modules` is a single reusable value
+-- (not a per-id collection), so it's a one-row "singleton" table.
+-- `audit_log` records were already flat, so that one is a normal relational
+-- table with typed columns. `atlassian_tokens` is per-USER (one row per
+-- signed-in Atlassian account, keyed by that account's stable accountId —
+-- see server/auth/atlassianTokens.js), which is the opposite of the old
+-- single shared `jira_config` connection this replaces.
 
 create extension if not exists pgcrypto; -- for gen_random_uuid(), used only as a defensive default
 
@@ -97,23 +100,32 @@ comment on table team is '"Know the Team" roster entries, stored whole as JSONB 
 create index if not exists idx_team_created_at on team (created_at desc);
 
 -- ---------------------------------------------------------------------
--- jira_config — the (single) configured Jira ticket-sync connection.
--- Not part of the original migration brief's collection list, but it was
--- the other thing server/db.js's neighbor (server/jiraConfig.js) persisted
--- to a local file (data/jira-config.json) — which would be silently wiped
--- on every Render deploy/restart (ephemeral filesystem) exactly like the
--- collections above, if left unmigrated. One row, id is always 1. The API
--- token lives here in plaintext, same trust model as the JSON-file version
--- (never sent back to the browser — see server/jiraConfig.js#publicView) —
--- protect this table the same way you'd protect the old jira-config.json:
--- Supabase's default Postgres role/RLS setup already keeps it off any
--- public/anon API surface as long as you don't expose this table through
--- Supabase's auto-generated REST API.
+-- jira_config — RETIRED. Greenlight no longer has any shared/global Jira
+-- credential: every user authorizes Jira access themselves via "Sign in
+-- with Atlassian" (see atlassian_tokens below). Dropped rather than left
+-- behind so no shared API token can linger in the database after the
+-- architecture that used it is gone. Safe to run even if this table was
+-- never created in your project.
 -- ---------------------------------------------------------------------
-create table if not exists jira_config (
-  id smallint primary key default 1,
-  data jsonb not null,
-  updated_at timestamptz not null default now(),
-  constraint jira_config_singleton check (id = 1)
+drop table if exists jira_config;
+
+-- ---------------------------------------------------------------------
+-- atlassian_tokens — each signed-in user's own Jira OAuth 2.0 (3LO) tokens.
+-- One row per Atlassian account (keyed by that account's stable accountId,
+-- never email — see server/auth/atlassianTokens.js), so every Jira API
+-- call the app makes goes out under that specific user's own Atlassian
+-- authorization and respects their own Jira permissions. Tokens here are
+-- never sent to the browser — protect this table the same way you would
+-- any other credential store: Supabase's default Postgres role/RLS setup
+-- already keeps it off any public/anon API surface as long as you don't
+-- expose this table through Supabase's auto-generated REST API.
+-- ---------------------------------------------------------------------
+create table if not exists atlassian_tokens (
+  account_id text primary key,
+  access_token text not null,
+  refresh_token text,
+  expires_at timestamptz not null,
+  scope text not null default '',
+  updated_at timestamptz not null default now()
 );
-comment on table jira_config is 'The single configured Jira ticket-sync connection (base URL, auth type, API token). Always at most one row (id = 1).';
+comment on table atlassian_tokens is 'Per-user Atlassian OAuth 2.0 (3LO) access/refresh tokens, one row per Atlassian accountId. The only Jira credential store in the app — there is no shared/global Jira connection anymore.';

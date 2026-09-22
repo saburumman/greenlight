@@ -2,6 +2,7 @@ const express = require("express");
 const crypto = require("crypto");
 const db = require("../db");
 const jiraClient = require("../jiraClient");
+const atlassianTokens = require("../auth/atlassianTokens");
 const { extractIssueKey } = require("../extractKey");
 const releaseNotesLogic = require("../releaseNotesLogic"); // this route's only AI-related import — see releaseNotesLogic.generateReleaseNotes() for the abstraction boundary; nothing here talks to an AI provider directly
 const { asyncHandler } = require("../asyncHandler");
@@ -158,8 +159,11 @@ router.post("/:id/tickets", asyncHandler(async (req, res) => {
   let ticket = null;
   let lookupError = null;
   try {
-    ticket = await jiraClient.getIssue(key);
+    ticket = await jiraClient.forUser(req.authUser).getIssue(key);
   } catch (e) {
+    if (e instanceof atlassianTokens.ReauthRequiredError) {
+      return atlassianTokens.respondReauthRequired(req, res, e);
+    }
     lookupError = e.message;
   }
 
@@ -218,8 +222,11 @@ router.post("/:id/jira-sync", asyncHandler(async (req, res) => {
 
   let result;
   try {
-    result = await jiraClient.searchByFixVersion(fixVersion);
+    result = await jiraClient.forUser(req.authUser).searchByFixVersion(fixVersion);
   } catch (e) {
+    if (e instanceof atlassianTokens.ReauthRequiredError) {
+      return atlassianTokens.respondReauthRequired(req, res, e);
+    }
     return res.status(e.status || 502).json({ error: e.message });
   }
 
@@ -291,8 +298,11 @@ router.post("/:id/release-notes/generate", asyncHandler(async (req, res) => {
   // the latest Jira data rather than reusing a stale snapshot. -------------
   let result;
   try {
-    result = await jiraClient.searchByFixVersion(fixVersion);
+    result = await jiraClient.forUser(req.authUser).searchByFixVersion(fixVersion);
   } catch (e) {
+    if (e instanceof atlassianTokens.ReauthRequiredError) {
+      return atlassianTokens.respondReauthRequired(req, res, e);
+    }
     return res.status(e.status || 502).json({ error: e.message });
   }
 

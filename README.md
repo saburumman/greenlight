@@ -1,6 +1,6 @@
 # Greenlight
 
-A lightweight QA release-readiness dashboard. It runs happily on your own machine with zero setup, or on a shared company server (bare Node, or [Docker](#running-with-docker)) for a whole team — no cloud database required for either. Your release data lives in a local JSON file, and your Jira API token (if you connect one) lives in a local config file that never leaves the machine it's running on except to talk to your Jira instance. For a shared deployment on a host with no persistent disk (like Render), it can instead persist to Postgres/Supabase — see [Deploying to Render + Supabase](#deploying-to-render--supabase).
+A lightweight QA release-readiness dashboard. It runs happily on your own machine with zero setup, or on a shared company server (bare Node, or [Docker](#running-with-docker)) for a whole team — no cloud database required for either. Your release data lives in a local JSON file. Jira access is per-user: everyone signs in with their own Atlassian account (no shared Jira credential exists anywhere in this app), and each person's own Jira OAuth tokens are kept server-side, never sent to any browser — see [Authentication (Sign in with Atlassian)](#authentication-sign-in-with-atlassian). For a shared deployment on a host with no persistent disk (like Render), it can instead persist to Postgres/Supabase — see [Deploying to Render + Supabase](#deploying-to-render--supabase).
 
 ## What it does
 
@@ -36,21 +36,11 @@ To use a different port: `PORT=4000 npm start`.
 
 Your data is saved to `data/store.json` as you go — nothing to configure. Stopping and restarting the server keeps everything. (Setting `DATABASE_URL` switches this to Postgres instead — see [Database: local file vs. Postgres](#database-local-file-vs-postgres).)
 
-## Connecting Jira (optional)
+## Connecting Jira
 
-Tickets can be tracked manually with no setup at all. To turn on automatic sync:
+There is no separate "connect Jira" step, and no shared Jira credential anywhere in this app. Jira access comes from the same **Sign in with Atlassian** everyone already uses to get into Greenlight (see the next section) — the moment you sign in, Greenlight has your own Jira authorization and every ticket lookup or sync you do runs as you, under your own Jira permissions. If your Atlassian account can't see a ticket in Jira, Greenlight can't either.
 
-1. Open a release, go to the **Tickets** section, and click **Connect Jira**.
-2. Fill in:
-   - **Jira Base URL** — e.g. `https://yourcompany.atlassian.net`
-   - **Auth type** — "Cloud (API token)" for Jira Cloud, or "Server / Data Center (PAT)" for a self-hosted instance
-   - **Email** (Cloud only) — the email address tied to your API token
-   - **API Token / Personal Access Token**
-     - Jira Cloud: create one at https://id.atlassian.com/manage-profile/security/api-tokens
-     - Server/Data Center: create a Personal Access Token from your Jira profile settings
-3. Click **Save & Test Connection**. It verifies the credentials against Jira immediately and tells you if something's wrong.
-
-The token is written to `data/jira-config.json` on this machine only, with restricted file permissions. It is never sent anywhere except directly to the Jira base URL you configured, and the browser never receives it back.
+If a ticket lookup fails for any reason (Jira unreachable, a mistyped URL, or your authorization needing a refresh — see below), **Add Ticket** falls back to letting you fill in the fields by hand rather than blocking you.
 
 **Fix Version matching:** a release's **Version** field (set when you create it, or via "Edit info") is used as the Jira Fix Version to match on — so tickets need that exact text (e.g. `v2.8.0`) set in their **Fix Version/s** field in Jira, not a Label. Click **Re-sync Jira** any time to pull in tickets whose Fix Version matches exactly. Syncing adds new tickets and updates existing ones — and it also removes a ticket that Jira has previously confirmed for this release (synced in, or manually added and later matched by a sync) if this search no longer returns it, most commonly because its Fix Version/s was changed or cleared in Jira. A ticket that's only ever been added manually, and has never itself matched this release's Fix Version, is left alone — sync never touches it either way. You can always remove any ticket by hand regardless.
 
@@ -60,22 +50,24 @@ The token is written to `data/jira-config.json` on this machine only, with restr
 
 Nobody can use the app — view or edit anything — without signing in with an Atlassian account that has access to your configured Jira site (see the next section for setup; the server refuses to even start without it). The Audit Log records your real Atlassian name, and a signed-in session can't spoof another person's identity — the server stamps every audit record from the verified session, ignoring anything the browser sends.
 
-The Audit Log itself (`data/store.json`) is append-only — nobody edits or deletes existing entries from the UI, past entries keep whatever name was active when they were written, and switching identity (signing out and back in as someone else) only changes the name on *future* entries.
+The Audit Log itself (`data/store.json`, or the `audit_log` table on Postgres) is append-only — nobody edits or deletes existing entries from the UI, past entries keep whatever name was active when they were written, and switching identity (signing out and back in as someone else) only changes the name on *future* entries.
 
 ## Authentication (Sign in with Atlassian)
 
-Signing in with Atlassian is **required** — Greenlight won't start at all until it's configured (see below). Everyone who uses it signs in with an Atlassian account that has access to your Jira site, which is also what gives the Audit Log real identity instead of a self-reported guest name.
+Signing in with Atlassian is **required** — Greenlight won't start at all until it's configured (see below). It's also the *only* path to Jira: there is no shared/global Jira connection anywhere in this app. Everyone who uses Greenlight signs in with their own Atlassian account, and from that point on every Jira API call they make — ticket lookups, Fix Version sync, Release Notes generation — goes out as that person, under their own Jira permissions. One person's session can never use another person's Jira access; each signed-in user's authorization is stored and looked up independently, keyed by their Atlassian account (never by email, since Atlassian's own account id is the stable identifier — an email address can change or be reused).
 
-This only works with **Jira Cloud** (`yoursite.atlassian.net`) — Atlassian's "Login with Atlassian" OAuth flow isn't available for self-hosted Jira Server/Data Center. (Ticket sync above is separate and still supports Server/Data Center via a Personal Access Token — this section is only about who's allowed into the app.)
+This only works with **Jira Cloud** (`yoursite.atlassian.net`) — Atlassian's "Login with Atlassian" OAuth 2.0 flow isn't available for self-hosted Jira Server/Data Center, so Server/Data Center is no longer supported at all (an earlier version of this app supported it via a shared Personal Access Token; that path is gone along with the shared-credential model it depended on).
 
 ### 1. Register an OAuth 2.0 app with Atlassian
 
 1. Go to **[developer.atlassian.com/console/myapps](https://developer.atlassian.com/console/myapps/)** (sign in with an account that's an admin on your Atlassian org, or can create apps) and click **Create** → **OAuth 2.0 integration**.
-2. Under **Permissions**, add:
-   - **User identity API** → scope `read:me`
-   - **Jira API** → scope `read:jira-user`
-   
-   (Nothing else — this app never reads or writes your Jira data as the signed-in user; ticket sync uses its own separate connection.)
+2. Under **Permissions**, add the **Jira API** product with these two scopes — nothing else:
+   - `read:jira-user` — lets Greenlight read the signed-in user's own Jira profile (accountId, name, email, avatar) via Jira's `GET /myself` endpoint. This is also what Greenlight uses for identity — there's no separate "User identity API"/`read:me` scope requested. `read:me` covers information Greenlight can already get from `read:jira-user`, so requesting it too would just be asking for access it doesn't use.
+   - `read:jira-work` — lets Greenlight read issues/search on the signed-in user's behalf (ticket lookups, Fix Version sync, Release Notes generation). Greenlight never writes to Jira, so no write scope is ever requested.
+
+   There's nothing to enable for `offline_access` (the scope that gets Greenlight a refresh token) — it isn't a Permissions checkbox, it's just included in the authorization request Greenlight already sends (see `server/auth/atlassianOAuth.js`'s `SCOPES`), and Atlassian issues a refresh token automatically whenever that scope is present. Nothing to configure here for it.
+
+   (Confirming Jira site access and resolving the Jira Cloud id — see `accessible-resources` in `server/auth/atlassianOAuth.js` — needs no scope of its own; any valid 3LO token can call it.)
 3. Under **Authorization**, add a callback URL: `https://<wherever-this-app-is-reachable>/auth/callback` — this has to match `APP_BASE_URL` below **exactly**, protocol included.
 4. Under **Settings**, copy the **Client ID** and **Client secret**.
 
@@ -88,12 +80,21 @@ Copy `.env.example` to `.env` in the project root and fill in:
 | `ATLASSIAN_CLIENT_ID` | from step 1.4 |
 | `ATLASSIAN_CLIENT_SECRET` | from step 1.4 |
 | `APP_BASE_URL` | exactly where this app is reachable, e.g. `https://greenlight.yourcompany.com` — must match the callback URL in step 1.3 |
-| `JIRA_SITE_URL` | your Jira Cloud site, e.g. `https://yourcompany.atlassian.net` — only Atlassian accounts with access to this site can sign in |
+| `JIRA_SITE_URL` | your Jira Cloud site, e.g. `https://yourcompany.atlassian.net` — only Atlassian accounts with access to this site can sign in, and it's the one Jira site every user's Jira API calls are scoped to |
 | `SESSION_SECRET` | a random string, e.g. `openssl rand -hex 32` — signs session cookies; changing it signs everyone out |
 
 `.env` is read automatically whether you run this with Docker or with a bare `npm start`/`npm run dev` (those two are the same command — see `package.json`; it doesn't matter which you type). All five variables must be set — if even one is missing or misspelled, the app refuses to start and tells you exactly which ones are missing, rather than silently coming up unauthenticated. If it won't start: double-check all five keys are spelled exactly as above with no typos, that `.env` is in the project root (next to `package.json`, not inside `server/`), and restart the app after any change to it — it's only read once, at startup.
 
-Sessions last 12 hours, after which you're asked to sign in again.
+### How it works, and how tokens are handled
+
+1. You click **Sign in with Atlassian**, which sends you to `/auth/login`. It generates a random `state` value, stores it in a short-lived cookie, and redirects you to Atlassian's own authorization page — carrying that `state` along.
+2. You authenticate with your own Atlassian account (Greenlight never sees your Atlassian password) and approve access.
+3. Atlassian redirects back to `/auth/callback` with an authorization code and the same `state` value. Greenlight rejects the callback outright if `state` is missing or doesn't match the cookie it set in step 1 — this is what stops a CSRF attack from forging a sign-in.
+4. Greenlight exchanges the code for an access token and a refresh token (server-to-server, never visible to your browser), confirms your account actually has access to the configured `JIRA_SITE_URL` (and gets that site's Jira Cloud id from the same check), then asks Jira itself — as you — who you are (`accountId`, name, email, avatar) via `GET /myself`, using the `read:jira-user` scope it already has rather than a separate identity-API scope.
+5. Your access and refresh tokens are saved **server-side only**, keyed by your Atlassian `accountId` (see `server/auth/atlassianTokens.js`) — never in a cookie, never in the page, never reachable from the browser's JavaScript. What your browser gets is an `HttpOnly` Greenlight session cookie (`Secure` whenever the app is served over HTTPS, and never readable by client-side JS) that only asserts who you are — it carries no Jira credential at all.
+6. From then on, every Jira API call your session makes looks up your stored access token, using it directly if it's still valid. If it's expired, Greenlight transparently uses your refresh token to get a new one, saves it, and continues the request — you never see this happen. If the refresh itself fails (your authorization was revoked, or the refresh token itself expired), Greenlight ends your Greenlight session right there and sends you back to sign in again, rather than leaving you in a half-signed-in state where the app still shows you as logged in but Jira actions silently fail.
+
+Sessions last 12 hours, after which you're asked to sign in again (independent of Jira token refresh, which can keep your Jira access alive for longer without a full re-login, as long as the session itself hasn't expired).
 
 ## Regression modules
 
@@ -235,28 +236,28 @@ greenlight-app/
     db/
       jsonStore.js         — the original JSON-file backend (data/store.json) — used whenever DATABASE_URL isn't set
       pgStore.js            — the Postgres/Supabase backend — used whenever DATABASE_URL is set
-      pgPool.js               — the shared `pg` connection pool both pgStore.js and jiraConfig.js use
+      pgPool.js               — the shared `pg` connection pool pgStore.js uses
     asyncHandler.js       — wraps async route handlers so a rejected Promise (e.g. a DB error) reaches the error middleware instead of hanging
-    jiraConfig.js       — Jira connection storage — file or Postgres, same rule as db.js above
-    jiraClient.js        — the 3 Jira REST calls this app makes (read-only)
+    jiraClient.js        — the 2 Jira REST calls this app makes (read-only), scoped per-user via jiraClient.forUser(req.authUser)
     statusBucket.js       — Jira status → bucket mapping (edit this to match your workflow)
     releaseNotesLogic.js   — Release Notes categorization + rule-based summarizer (server-side twin of the same logic in app.js)
     aiService.js             — thin Google Gemini API client used only for Release Notes item text (see "Release notes" above)
     auth/
-      atlassianOAuth.js    — "Sign in with Atlassian" OAuth client
+      atlassianOAuth.js    — "Sign in with Atlassian" OAuth client — identity AND the only path to Jira access (token refresh, cloudId lookup)
+      atlassianTokens.js     — per-user Jira OAuth token storage/refresh, keyed by Atlassian accountId (never email) — see db.atlassianTokens below
       session.js            — signed session-cookie tokens (no server-side session store)
       cookies.js              — small hand-rolled cookie helpers
       middleware.js            — gates /api/* on a valid session, only when configured
     routes/
       releases.js         — release CRUD + ticket endpoints
-      jira.js               — connect/status/lookup endpoints
+      jira.js               — per-user Jira status/lookup endpoints
       regressionModules.js  — the reusable Regression Module master list
       audit.js                — audit log read/append endpoints
       testData.js               — the reusable Test Data library CRUD endpoints
       auth.js                  — /auth/login, /auth/callback, /auth/logout, /auth/me
   public/
     index.html, styles.css, app.js  — the dashboard itself (no build step, no framework)
-  data/                    — created automatically when running on the JSON-file backend; your releases, audit log, and Jira config live here
+  data/                    — created automatically when running on the JSON-file backend; your releases, audit log, and every signed-in user's own Jira OAuth tokens live here
   supabase/
     schema.sql              — the Postgres table definitions (run once against a new database — see "Deploying to Render + Supabase" below)
   scripts/
@@ -301,7 +302,7 @@ If you already have a `data/store.json` from running Greenlight locally or elsew
 DATABASE_URL="<your Supabase connection string>" npm run db:migrate
 ```
 
-This reads your local `data/store.json` (and `data/jira-config.json`, if present) and upserts everything into Supabase — it's safe to run more than once (re-running never duplicates rows or overwrites audit log entries), and it never modifies or deletes your local `data/store.json`, so keep that around as a backup until you've verified the migrated data in the app.
+This reads your local `data/store.json` and upserts everything into Supabase — it's safe to run more than once (re-running never duplicates rows or overwrites audit log entries), and it never modifies or deletes your local `data/store.json`, so keep that around as a backup until you've verified the migrated data in the app. It does not (and doesn't need to) migrate any Jira token — there is no shared Jira credential to carry over, and every user's own Jira access is re-established automatically, with zero setup, the next time they sign in with Atlassian.
 
 Starting fresh instead, with no existing data to bring in? Seed the same starter Regression Module list and starter team Greenlight would normally create automatically:
 
@@ -346,4 +347,4 @@ Persistence: Postgres (DATABASE_URL set)
 Database connection: OK
 ```
 
-Sign in, confirm your migrated releases/test data/team/regression modules are all there, and reconnect Jira if `jira-config.json` wasn't migrated (the migration script brings it across automatically if it existed on the machine you ran it from).
+Sign in with Atlassian and confirm your migrated releases/test data/team/regression modules are all there. Jira access itself needs no migration or reconnection step — it's tied to your Atlassian sign-in, so it's already working the moment you're signed in.

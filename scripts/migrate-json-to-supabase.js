@@ -2,17 +2,21 @@
 // One-time (but safely re-runnable) import of your existing
 // data/store.json into Postgres/Supabase — releases, the regression
 // modules master list, the audit log, test data, and the team roster.
-// Also picks up data/jira-config.json if it exists, so your configured
-// Jira connection survives the move too (see server/jiraConfig.js).
 //
-// This script NEVER deletes or modifies data/store.json (or
-// data/jira-config.json) — it only reads them. Run it as many times as you
-// want; it's an upsert (ON CONFLICT DO UPDATE) for releases/regression
-// modules/test data/team/jira config, keyed by their existing id, and an
-// ON CONFLICT DO NOTHING for the audit log (append-only — a record that's
-// already there is left exactly as it was, never overwritten). Running it
-// twice against unchanged data reports everything as "already up to date /
-// already present" — nothing gets duplicated.
+// Greenlight has no shared/global Jira connection to migrate anymore —
+// every user's own Jira access comes from their own "Sign in with
+// Atlassian" (see server/auth/atlassianTokens.js), created fresh the next
+// time each person signs in, so there's nothing to carry over from
+// data/store.json for that.
+//
+// This script NEVER deletes or modifies data/store.json — it only reads
+// it. Run it as many times as you want; it's an upsert (ON CONFLICT DO
+// UPDATE) for releases/regression modules/test data/team, keyed by their
+// existing id, and an ON CONFLICT DO NOTHING for the audit log
+// (append-only — a record that's already there is left exactly as it was,
+// never overwritten). Running it twice against unchanged data reports
+// everything as "already up to date / already present" — nothing gets
+// duplicated.
 //
 // Usage (run once locally, pointed at your Supabase project — this reads
 // data/store.json off THIS machine, so run it from wherever that file
@@ -31,7 +35,6 @@ const path = require("path");
 const pgPool = require("../server/db/pgPool");
 
 const STORE_PATH = path.join(__dirname, "..", "data", "store.json");
-const JIRA_CONFIG_PATH = path.join(__dirname, "..", "data", "jira-config.json");
 
 function isoOrNow(value) {
   return value ? new Date(value).toISOString() : new Date().toISOString();
@@ -129,23 +132,6 @@ async function migrateAuditLog(auditLogArr) {
   return { total: entries.length, inserted, alreadyPresent };
 }
 
-async function migrateJiraConfig() {
-  if (!fs.existsSync(JIRA_CONFIG_PATH)) return { found: false };
-  let config;
-  try {
-    config = JSON.parse(fs.readFileSync(JIRA_CONFIG_PATH, "utf8"));
-  } catch (e) {
-    return { found: true, error: `Couldn't parse data/jira-config.json: ${e.message}` };
-  }
-  const existing = await pgPool.query(`SELECT 1 FROM jira_config WHERE id = 1`);
-  await pgPool.query(
-    `INSERT INTO jira_config (id, data, updated_at) VALUES (1, $1::jsonb, now())
-     ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = now()`,
-    [JSON.stringify(config)]
-  );
-  return { found: true, migrated: true, wasUpdate: existing.rows.length > 0, baseUrl: config.baseUrl };
-}
-
 async function main() {
   if (!pgPool.isConfigured()) {
     console.error("DATABASE_URL is not set — nothing to migrate into. Set it and re-run.");
@@ -174,7 +160,6 @@ async function main() {
   const auditResult = await migrateAuditLog(store.auditLog);
   const testDataResult = await migrateTestData(store.testData);
   const teamResult = await migrateTeam(store.team);
-  const jiraConfigResult = await migrateJiraConfig();
 
   console.log("==================== Migration summary ====================");
   console.log(`releases            : ${releasesResult.total} in file  ->  ${releasesResult.inserted} inserted, ${releasesResult.updated} updated`);
@@ -186,15 +171,6 @@ async function main() {
   console.log(`audit_log           : ${auditResult.total} in file  ->  ${auditResult.inserted} inserted, ${auditResult.alreadyPresent} already present`);
   console.log(`test_data           : ${testDataResult.total} in file  ->  ${testDataResult.inserted} inserted, ${testDataResult.updated} updated`);
   console.log(`team                : ${teamResult.total} in file  ->  ${teamResult.inserted} inserted, ${teamResult.updated} updated`);
-  if (jiraConfigResult.found) {
-    if (jiraConfigResult.error) {
-      console.log(`jira_config         : found data/jira-config.json but ${jiraConfigResult.error}`);
-    } else {
-      console.log(`jira_config         : ${jiraConfigResult.wasUpdate ? "replaced existing row" : "inserted new row"} (${jiraConfigResult.baseUrl || "no baseUrl"})`);
-    }
-  } else {
-    console.log(`jira_config         : no data/jira-config.json on this machine — skipped (nothing was configured, or it's configured on a different machine)`);
-  }
   console.log("=============================================================");
   console.log("\ndata/store.json was not modified or deleted — keep it as a backup until you've verified the app against Postgres.");
   console.log("Done.");

@@ -156,4 +156,55 @@ function rowToAuditEntry(row) {
   };
 }
 
-module.exports = { releases, regressionModules, auditLog, testData, team };
+// Per-user Atlassian OAuth token storage — keyed by accountId, never email
+// (see server/auth/atlassianTokens.js, the only other module that touches
+// this collection). Real typed columns rather than a JSONB blob, since the
+// shape is small, fixed, and never grows nested structure the way
+// releases/testData/team do.
+const atlassianTokens = {
+  async get(accountId) {
+    const { rows } = await pgPool.query(
+      `SELECT account_id, access_token, refresh_token, expires_at, scope, updated_at
+       FROM atlassian_tokens WHERE account_id = $1`,
+      [accountId]
+    );
+    return rows.length ? rowToTokenRecord(rows[0]) : null;
+  },
+  async set(accountId, record) {
+    await pgPool.query(
+      `INSERT INTO atlassian_tokens (account_id, access_token, refresh_token, expires_at, scope, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (account_id) DO UPDATE SET
+         access_token = EXCLUDED.access_token,
+         refresh_token = EXCLUDED.refresh_token,
+         expires_at = EXCLUDED.expires_at,
+         scope = EXCLUDED.scope,
+         updated_at = EXCLUDED.updated_at`,
+      [
+        accountId,
+        record.accessToken,
+        record.refreshToken || null,
+        isoOrNow(record.expiresAt),
+        record.scope || "",
+        isoOrNow(record.updatedAt),
+      ]
+    );
+    return record;
+  },
+  async delete(accountId) {
+    await pgPool.query(`DELETE FROM atlassian_tokens WHERE account_id = $1`, [accountId]);
+  },
+};
+
+function rowToTokenRecord(row) {
+  return {
+    accountId: row.account_id,
+    accessToken: row.access_token,
+    refreshToken: row.refresh_token,
+    expiresAt: row.expires_at instanceof Date ? row.expires_at.toISOString() : row.expires_at,
+    scope: row.scope || "",
+    updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
+  };
+}
+
+module.exports = { releases, regressionModules, auditLog, testData, team, atlassianTokens };

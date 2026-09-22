@@ -11,12 +11,19 @@
 //
 // Shape on disk: { releases: { <id>: {...} }, regressionModules: [{id,name,services:[{id,name}]}],
 //                   auditLog: [{id,sessionId,userName,action,entityType,entityId,details,createdAt}],
-//                   testData: { <id>: {...} }, team: { <id>: {...} } }
+//                   testData: { <id>: {...} }, team: { <id>: {...} },
+//                   atlassianTokens: { <accountId>: {accountId,accessToken,refreshToken,expiresAt,scope,updatedAt} } }
 //
 // testData is a reusable QA data library — see routes/testData.js. It is
 // deliberately its own top-level collection (same shape/pattern as
 // `releases`), not nested inside any release, so one record can be reused
 // across many releases without duplication.
+//
+// atlassianTokens holds each signed-in user's own Jira OAuth tokens, keyed
+// by their stable Atlassian accountId (never email) — see
+// server/auth/atlassianTokens.js. This is the only place any Jira
+// access/refresh token is ever persisted; nothing here is ever sent to the
+// browser.
 
 const fs = require("fs");
 const path = require("path");
@@ -97,7 +104,14 @@ function ensureStore() {
     fs.writeFileSync(
       STORE_PATH,
       JSON.stringify(
-        { releases: {}, regressionModules: DEFAULT_REGRESSION_MODULES, auditLog: [], testData: {}, team: buildDefaultTeam() },
+        {
+          releases: {},
+          regressionModules: DEFAULT_REGRESSION_MODULES,
+          auditLog: [],
+          testData: {},
+          team: buildDefaultTeam(),
+          atlassianTokens: {},
+        },
         null,
         2
       )
@@ -162,6 +176,12 @@ function readAll() {
       parsed.team = buildDefaultTeam();
       dirty = true;
     }
+    // Additive: stores created before per-user Atlassian OAuth existed just
+    // get an empty token collection — nothing else about them changes.
+    if (!parsed.atlassianTokens || typeof parsed.atlassianTokens !== "object" || Array.isArray(parsed.atlassianTokens)) {
+      parsed.atlassianTokens = {};
+      dirty = true;
+    }
     // Additive: regression entities saved before the per-release "Owner"
     // field existed just get an empty owner — nothing else about them
     // changes. A legacy flat regression row (no `services` array) counts
@@ -182,7 +202,14 @@ function readAll() {
     try {
       fs.copyFileSync(STORE_PATH, backupPath);
     } catch (_) {}
-    const fresh = { releases: {}, regressionModules: DEFAULT_REGRESSION_MODULES, auditLog: [], testData: {}, team: buildDefaultTeam() };
+    const fresh = {
+      releases: {},
+      regressionModules: DEFAULT_REGRESSION_MODULES,
+      auditLog: [],
+      testData: {},
+      team: buildDefaultTeam(),
+      atlassianTokens: {},
+    };
     fs.writeFileSync(STORE_PATH, JSON.stringify(fresh, null, 2));
     return fresh;
   }
@@ -320,4 +347,35 @@ const team = {
   },
 };
 
-module.exports = { releases, regressionModules, auditLog, testData, team, DEFAULT_REGRESSION_MODULES, buildDefaultTeam };
+// Per-user Atlassian OAuth token storage — keyed by accountId, never email
+// (see server/auth/atlassianTokens.js, which is the only other module that
+// touches this collection). Same get/set/delete shape as the collections
+// above, minus list() — nothing needs "all stored tokens" as a set.
+const atlassianTokens = {
+  async get(accountId) {
+    const data = readAll();
+    return data.atlassianTokens[accountId] || null;
+  },
+  async set(accountId, record) {
+    const data = readAll();
+    data.atlassianTokens[accountId] = record;
+    writeAll(data);
+    return record;
+  },
+  async delete(accountId) {
+    const data = readAll();
+    delete data.atlassianTokens[accountId];
+    writeAll(data);
+  },
+};
+
+module.exports = {
+  releases,
+  regressionModules,
+  auditLog,
+  testData,
+  team,
+  atlassianTokens,
+  DEFAULT_REGRESSION_MODULES,
+  buildDefaultTeam,
+};

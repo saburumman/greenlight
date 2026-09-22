@@ -1,7 +1,7 @@
-// Single shared `pg` connection pool, used by both server/db/pgStore.js
-// (releases/regressionModules/auditLog/testData/team) and jiraConfig.js
-// (the Jira connection settings) whenever DATABASE_URL is set — see
-// server/db.js for how the JSON-file vs. Postgres backend is chosen.
+// Single shared `pg` connection pool, used by server/db/pgStore.js
+// (releases/regressionModules/auditLog/testData/team/atlassianTokens)
+// whenever DATABASE_URL is set — see server/db.js for how the JSON-file vs.
+// Postgres backend is chosen.
 //
 // Kept deliberately tiny: one pool, one ssl rule, one query helper. No ORM,
 // no query builder — the rest of this app's near-zero-dependency style.
