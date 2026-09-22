@@ -197,6 +197,19 @@ async function findConfiguredJiraResource(accessToken) {
   // right after login (e.g. this callback fetching Jira identity) doesn't
   // pay for a second, redundant accessible-resources round trip.
   if (resource) cachedCloudId = resource.id;
+  // Diagnostic only (no PII beyond site names/URLs — this app no longer
+  // requests read:me, so there's no name/email to log here even if we
+  // wanted to): when a login gets rejected for "no access", print what
+  // this token COULD see, so a mismatch (wrong org, wrong account, or
+  // truly nothing) is visible in the server logs instead of guessed at.
+  if (!resource) {
+    console.error(
+      "[atlassianOAuth] Jira site access check failed — configured JIRA_SITE_URL:",
+      cfg.jiraSiteUrl,
+      "| sites this Atlassian token can see:",
+      (resources || []).length ? resources.map((r) => r.url).join(", ") : "(none — this account has no accessible Atlassian sites at all)"
+    );
+  }
   return resource;
 }
 
