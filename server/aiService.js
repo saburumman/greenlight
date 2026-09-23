@@ -193,6 +193,7 @@ For EVERY item in the array, return one object with exactly these two fields:
 Strict rules:
 - Never invent functionality, behavior, or user impact beyond what the supplied title/description already say.
 - A bug fix can be phrased as an improvement ("Improved X") if that reads more naturally for end users, as long as it doesn't overstate what changed.
+- The supplied title/description may be written in Arabic, English, or a mix of both (this QA tool's tickets are often titled in Arabic). Regardless of the source language, ALWAYS write the "bullet" in English only — translate any Arabic content into natural, plain English rather than leaving it untranslated, transliterating it, or copying it as-is.
 - Return content only for items actually present in the input. Do not add items, and do not skip any.
 - Output ONLY a raw JSON array of objects with exactly the fields "key", "bullet" — no surrounding prose, no markdown code fences, no extra fields.`;
 

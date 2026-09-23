@@ -34,8 +34,10 @@ const releaseNotesLogic = require("./releaseNotesLogic");
 // person already expects to wait a moment for.
 const FREE_TRANSLATE_URL = "https://api.mymemory.translated.net/get";
 
-async function translateLineFree(line) {
-  const url = `${FREE_TRANSLATE_URL}?${new URLSearchParams({ q: line, langpair: "en|ar" }).toString()}`;
+// langpair defaults to "en|ar" (the Arabic-box translation direction);
+// pass "ar|en" for the opposite direction (see ensureEnglishBullets below).
+async function translateLineFree(line, langpair) {
+  const url = `${FREE_TRANSLATE_URL}?${new URLSearchParams({ q: line, langpair: langpair || "en|ar" }).toString()}`;
   let res;
   try {
     res = await fetch(url);
@@ -57,6 +59,14 @@ async function translateLinesFree(lines) {
     out.push(await translateLineFree(line));
   }
   return out;
+}
+
+// Arabic script ranges (main block + presentation forms/ligatures) — used
+// only to decide whether a bullet needs the English cleanup pass below, not
+// as a language-detection tool in general.
+const ARABIC_RE = /[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿]/;
+function containsArabic(s) {
+  return ARABIC_RE.test(String(s || ""));
 }
 
 const MAX_BULLET_LEN = 110;
@@ -122,6 +132,43 @@ function bulletFallbackLine(item) {
   else if (category === "Improvement") text = "Improved: " + title + ".";
   else text = title + ".";
   return truncate(text, MAX_BULLET_LEN);
+}
+
+// Ensures every bullet in the English box is actually English. This app's
+// Jira tickets are often titled in Arabic (or a mix of Arabic and English),
+// and bulletFallbackLine above just echoes the ticket's own title verbatim
+// — so without this, a ticket titled in Arabic would land in the English
+// textarea untranslated. Gemini is separately instructed to translate any
+// Arabic in its own prompt (see MOBILE_BULLET_SYSTEM_PROMPT in
+// aiService.js), so in practice this mainly catches the non-AI fallback
+// path and anything Gemini missed — but it's applied uniformly, after
+// either path, so the English box is guaranteed Arabic-free regardless of
+// how a bullet was produced. Uses the same free, keyless MyMemory
+// translator as the Arabic box's own fallback (never blocks on AI, never
+// makes a second Gemini call just for this cleanup); a bullet that can't be
+// translated for any reason is left as-is rather than dropping its content.
+// Returns { bullets, translatedCount }.
+async function ensureEnglishBullets(bullets) {
+  const out = [];
+  let translatedCount = 0;
+  for (const b of bullets) {
+    if (!containsArabic(b)) {
+      out.push(b);
+      continue;
+    }
+    try {
+      const translated = await translateLineFree(b, "ar|en");
+      if (translated) {
+        out.push(truncate(translated, MAX_BULLET_LEN));
+        translatedCount++;
+      } else {
+        out.push(b);
+      }
+    } catch (e) {
+      out.push(b); // couldn't translate — keep the original rather than losing the content
+    }
+  }
+  return { bullets: out, translatedCount };
 }
 
 // Where the draft's source items come from: prefer the already-generated
@@ -196,7 +243,16 @@ async function draftEnglishBullets(release) {
     }
   }
 
-  const { kept, droppedCount } = keepWithinBlockLimit(bullets, MAX_BLOCK_LEN);
+  const englishResult = await ensureEnglishBullets(bullets);
+  if (englishResult.translatedCount) {
+    const n = englishResult.translatedCount;
+    warning = combineWarnings(
+      warning,
+      `${n} bullet${n === 1 ? "" : "s"} came from an Arabic ticket title and ${n === 1 ? "was" : "were"} auto-translated to English — double-check the wording.`
+    );
+  }
+
+  const { kept, droppedCount } = keepWithinBlockLimit(englishResult.bullets, MAX_BLOCK_LEN);
   return { bullets: kept, aiUsed, warning: combineWarnings(warning, blockLimitWarning(droppedCount)), empty: false };
 }
 
@@ -253,6 +309,8 @@ module.exports = {
   MAX_BULLET_LEN,
   MAX_BLOCK_LEN,
   keepWithinBlockLimit,
+  containsArabic,
+  ensureEnglishBullets,
   bulletFallbackLine,
   buildDraftItems,
   mapBulletResponse,
