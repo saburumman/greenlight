@@ -420,6 +420,11 @@ a{color:inherit;}
 .mrn-counter.mrn-counter-max{color:var(--danger-fg);font-weight:700;}
 #sec-mobile textarea{min-height:220px;font-size:13.5px;line-height:1.6;}
 #sec-mobile textarea[dir="rtl"]{text-align:right;font-family:var(--font-body);}
+.mrn-validation{margin-top:8px;font-size:12.5px;line-height:1.5;border-radius:8px;padding:9px 11px;border:1px solid var(--warn-border);background:var(--warn-bg);color:var(--warn-fg);}
+.mrn-validation.mrn-validation-danger{border-color:var(--danger-border);background:var(--danger-bg);color:var(--danger-fg);}
+.mrn-validation-title{font-weight:600;}
+.mrn-validation ul{margin:6px 0 0;padding-left:18px;}
+.mrn-validation li{margin:2px 0;word-break:break-word;}
 
 /* ================= TOAST ================= */
 #toast-root{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:200;display:flex;flex-direction:column;gap:8px;align-items:center;}

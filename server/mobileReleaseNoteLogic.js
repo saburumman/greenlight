@@ -26,21 +26,32 @@ const releaseNotesLogic = require("./releaseNotesLogic");
 
 // MyMemory (https://mymemory.translated.net) — a free, keyless machine
 // translation API used only as the Arabic-translation fallback when Gemini
-// isn't configured (or fails). No account/API key required; the anonymous
-// tier is rate-limited (a few thousand words/day per IP) but more than
-// enough for a handful of release-note bullets. One request per line —
-// there's no batch endpoint — done sequentially since these bullet lists
-// are always short (a handful of lines) and this is a background action the
-// person already expects to wait a moment for.
+// isn't configured (or fails). No account/API key required. The anonymous
+// tier is capped at ~5,000 words/day per IP, which a day of testing can
+// burn through on its own; MyMemory raises that cap for a request that
+// includes a contact email (`de=`, used only so they can reach someone in
+// case of abuse — never shown to end users or stored by this app beyond
+// the request itself). MYMEMORY_CONTACT_EMAIL sets that email; unset,
+// requests go out anonymous-tier as before, still perfectly usable, just
+// with a lower daily ceiling. One request per line — there's no batch
+// endpoint — done sequentially since these bullet lists are always short
+// (a handful of lines) and this is a background action the person already
+// expects to wait a moment for.
 const FREE_TRANSLATE_URL = "https://api.mymemory.translated.net/get";
+const FREE_TRANSLATE_CONTACT_EMAIL = process.env.MYMEMORY_CONTACT_EMAIL || "";
 
 async function translateLineFree(line) {
-  const url = `${FREE_TRANSLATE_URL}?${new URLSearchParams({ q: line, langpair: "en|ar" }).toString()}`;
+  const params = { q: line, langpair: "en|ar" };
+  if (FREE_TRANSLATE_CONTACT_EMAIL) params.de = FREE_TRANSLATE_CONTACT_EMAIL;
+  const url = `${FREE_TRANSLATE_URL}?${new URLSearchParams(params).toString()}`;
   let res;
   try {
     res = await fetch(url);
   } catch (e) {
     throw new Error(`couldn't reach the free translation service (${e.message})`);
+  }
+  if (res.status === 429) {
+    throw new Error("free translation service's daily quota is used up for now — try again later, or enter the Arabic text manually");
   }
   if (!res.ok) throw new Error(`free translation service returned an error (${res.status})`);
   const data = await res.json();
@@ -91,18 +102,31 @@ function truncate(s, max) {
 // as complete sentences. A skip doesn't stop the scan — a single unusually
 // long bullet (most often a longer Arabic translation of a short English
 // line) is passed over rather than cutting off every bullet after it, so
-// one outlier costs at most itself, not the rest of the list. Returns
-// { kept, droppedCount }.
-function keepWithinBlockLimit(bullets, limit) {
+// one outlier costs at most itself, not the rest of the list.
+//
+// `metas`, if given, is a same-length array carried alongside `bullets`
+// (e.g. the source item behind each English bullet) — whatever's dropped
+// gets its matching entry returned in `droppedMetas`, so a caller can show
+// exactly *what* was left out, not just how many. Returns
+// { kept, dropped, droppedCount, droppedMetas }.
+function keepWithinBlockLimit(bullets, limit, metas) {
   const kept = [];
+  const dropped = [];
+  const droppedMetas = [];
   let total = 0;
-  for (const b of bullets) {
+  for (let i = 0; i < bullets.length; i++) {
+    const b = bullets[i];
     const addLen = b.length + (kept.length ? 1 : 0); // +1 for the joining "\n"
-    if (total + addLen > limit) continue; // doesn't fit — skip it, keep checking the rest
+    if (total + addLen > limit) {
+      // doesn't fit — skip it, keep checking the rest
+      dropped.push(b);
+      if (metas) droppedMetas.push(metas[i]);
+      continue;
+    }
     kept.push(b);
     total += addLen;
   }
-  return { kept, droppedCount: bullets.length - kept.length };
+  return { kept, dropped, droppedCount: dropped.length, droppedMetas };
 }
 
 function blockLimitWarning(droppedCount) {
@@ -234,7 +258,7 @@ function linesToBullets(text) {
 async function draftEnglishBullets(release) {
   const items = buildDraftItems(release);
   if (!items.length) {
-    return { bullets: [], aiUsed: false, warning: null, empty: true };
+    return { bullets: [], aiUsed: false, warning: null, droppedItems: [], empty: true };
   }
 
   let bullets, aiUsed, warning;
@@ -264,8 +288,22 @@ async function draftEnglishBullets(release) {
     );
   }
 
-  const { kept, droppedCount } = keepWithinBlockLimit(englishResult.bullets, MAX_BLOCK_LEN);
-  return { bullets: kept, aiUsed, warning: combineWarnings(warning, blockLimitWarning(droppedCount)), empty: false };
+  // items stays index-aligned with englishResult.bullets the whole way
+  // through (bulletFallbackLine/mapBulletResponse and ensureEnglishBullets
+  // both preserve order and produce exactly one bullet per item), so it can
+  // be passed straight through as keepWithinBlockLimit's `metas` — whatever
+  // gets dropped for length comes back paired with the ticket it came from,
+  // for the caller (routes/releases.js, then the UI) to name explicitly
+  // rather than just saying "N bullets left out".
+  const { kept, droppedMetas } = keepWithinBlockLimit(englishResult.bullets, MAX_BLOCK_LEN, items);
+  const droppedItems = droppedMetas.map((it) => ({ key: it && it.key, title: it && it.title }));
+  return {
+    bullets: kept,
+    aiUsed,
+    warning: combineWarnings(warning, blockLimitWarning(droppedItems.length)),
+    droppedItems,
+    empty: false,
+  };
 }
 
 // The single seam for Arabic translation. Tries Gemini first when
@@ -283,16 +321,39 @@ async function draftEnglishBullets(release) {
 // is set when the translated block had to be trimmed to fit MAX_BLOCK_LEN
 // (see keepWithinBlockLimit) — translated text can run longer or shorter
 // than the English it came from, so this is checked independently of the
-// English side's own limit.
+// English side's own limit. `droppedLines` (part of the same trim) carries
+// the original English text of whatever got left out, so the caller can
+// say exactly which bullet has no Arabic yet rather than just a count.
+
+// Pairs each translated line with the English source line it came from,
+// dropping only the (rare) case where a translator returned nothing for a
+// line — keeps the two arrays aligned even though a raw translator
+// response can come back shorter than what went in.
+function zipNonEmpty(sourceLines, rawTranslated) {
+  const lines = [];
+  const sources = [];
+  rawTranslated.forEach((t, i) => {
+    const trimmed = String(t || "").trim();
+    if (trimmed) {
+      lines.push(trimmed);
+      sources.push(sourceLines[i]);
+    }
+  });
+  return { lines, sources };
+}
+
 async function translateBulletsToArabic(lines) {
   let translatedLines = null;
+  let sourceLines = null;
   let engine = null;
 
   if (aiService.isConfigured()) {
     try {
       const translated = await aiService.translateToArabic(lines);
       if (Array.isArray(translated) && translated.length === lines.length) {
-        translatedLines = translated.map((t) => String(t || "").trim()).filter(Boolean);
+        const z = zipNonEmpty(lines, translated);
+        translatedLines = z.lines;
+        sourceLines = z.sources;
         engine = "gemini";
       }
       // else: malformed (wrong length) response — fall through to the free
@@ -304,7 +365,10 @@ async function translateBulletsToArabic(lines) {
 
   if (!translatedLines) {
     try {
-      translatedLines = (await translateLinesFree(lines)).map((t) => String(t || "").trim()).filter(Boolean);
+      const raw = await translateLinesFree(lines);
+      const z = zipNonEmpty(lines, raw);
+      translatedLines = z.lines;
+      sourceLines = z.sources;
       engine = "mymemory";
     } catch (e) {
       const err = new Error(`Couldn't translate automatically (${(e && e.message) || "unknown error"}) — enter the Arabic text manually.`);
@@ -313,8 +377,8 @@ async function translateBulletsToArabic(lines) {
     }
   }
 
-  const { kept, droppedCount } = keepWithinBlockLimit(translatedLines, MAX_BLOCK_LEN);
-  return { lines: kept, engine, warning: blockLimitWarning(droppedCount) };
+  const { kept, droppedMetas } = keepWithinBlockLimit(translatedLines, MAX_BLOCK_LEN, sourceLines);
+  return { lines: kept, engine, warning: blockLimitWarning(droppedMetas.length), droppedLines: droppedMetas };
 }
 
 module.exports = {

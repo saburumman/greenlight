@@ -2628,12 +2628,14 @@ function sectionMobileNote(r){
             '<button type="button" class="btn btn-sm" data-action="draft-mobile-note-en">'+iconSpark()+' Draft from tickets</button>'+
           '</div>'+
           '<textarea id="mrn-en" rows="10" maxlength="'+MOBILE_NOTE_MAX_LEN+'" placeholder="Improved payment status guidance.\nVehicles sorted by license expiry.">'+esc(mrn.enUS||"")+'</textarea>'+
+          '<div class="mrn-validation" id="mrn-en-validation" hidden></div>'+
         '</div>'+
         '<div class="field">'+
           '<div class="mrn-col-head"><span class="mrn-col-label-group"><label for="mrn-ar">Arabic (ar)</label><span class="mrn-counter" id="mrn-ar-counter"></span></span>'+
             '<button type="button" class="btn btn-sm" data-action="translate-mobile-note-ar">'+iconSpark()+' Translate from English</button>'+
           '</div>'+
           '<textarea id="mrn-ar" rows="10" maxlength="'+MOBILE_NOTE_MAX_LEN+'" dir="rtl" lang="ar" placeholder="تحسين عرض حالة الدفع في الطلبات.">'+esc(mrn.ar||"")+'</textarea>'+
+          '<div class="mrn-validation" id="mrn-ar-validation" hidden></div>'+
         '</div>'+
       '</div>'+
       '<div class="notes-status" id="mobile-note-status"></div>'+
@@ -2666,6 +2668,39 @@ function updateMobileNoteCounters(){
     counter.classList.toggle("mrn-counter-warn", len >= Math.floor(MOBILE_NOTE_MAX_LEN*0.9) && len < MOBILE_NOTE_MAX_LEN);
     counter.classList.toggle("mrn-counter-max", len >= MOBILE_NOTE_MAX_LEN);
   });
+}
+// A persistent validation box under each Mobile Release Note textarea, for
+// anything a Draft/Translate call needs the person to actually look at:
+// a server-side warning (AI fell back to something simpler, Arabic text had
+// to be stripped, some bullets got left out for length) or an outright
+// failure (network/translation error). A toast (showToast) fires alongside
+// these for a quick heads-up, but a toast fades in a few seconds — this box
+// stays in the page (even across a Save — it's still true afterward that a
+// ticket didn't make it in) until the next Draft/Translate re-evaluates it,
+// so a warning about exactly *what* didn't make it into the draft can't be
+// missed by arriving a moment too late to read it. `items`, if given, is a list of plain
+// strings rendered one per line — e.g. "MOJ-42: Payment status guidance"
+// for a ticket that got left out of the English draft, or the original
+// English bullet text for one that didn't get translated — so the person
+// knows exactly what to go add back by hand rather than just a count.
+function showMobileNoteValidation(boxId, message, items, isError){
+  var el = qs("#"+boxId);
+  if(!el) return;
+  if(!message && !(items && items.length)){ clearMobileNoteValidation(boxId); return; }
+  var html = '<div class="mrn-validation-title">'+(isError? "⛔ ":"⚠️ ")+esc(message||"Some of this draft needs a look.")+'</div>';
+  if(items && items.length){
+    html += '<ul>'+items.map(function(it){ return '<li>'+esc(it)+'</li>'; }).join("")+'</ul>';
+  }
+  el.innerHTML = html;
+  el.classList.toggle("mrn-validation-danger", !!isError);
+  el.hidden = false;
+}
+function clearMobileNoteValidation(boxId){
+  var el = qs("#"+boxId);
+  if(!el) return;
+  el.hidden = true;
+  el.innerHTML = "";
+  el.classList.remove("mrn-validation-danger");
 }
 // Splits a textarea's content into one trimmed, non-empty line per bullet —
 // the client-side twin of mobileReleaseNoteLogic.linesToBullets on the
@@ -3427,6 +3462,7 @@ function setMobileNoteButtonBusy(action, on, busyLabel, idleHtml){
 }
 function handleDraftMobileNoteEn(r){
   var run = function(){
+    clearMobileNoteValidation("mrn-en-validation");
     setMobileNoteButtonBusy("draft-mobile-note-en", true, "Drafting…", iconSpark()+' Draft from tickets');
     api.draftMobileNoteEn(r._id).then(function(result){
       setMobileNoteButtonBusy("draft-mobile-note-en", false, "", iconSpark()+' Draft from tickets');
@@ -3436,10 +3472,14 @@ function handleDraftMobileNoteEn(r){
       updateMobileNoteStatus(r);
       updateMobileNoteCounters();
       showToast(result.aiUsed ? "Drafted from this release's tickets — review before saving." : "Drafted simple bullets from ticket titles (AI drafting isn't configured) — review before saving.");
-      if(result.warning) showToast(result.warning);
+      var droppedLabels = (result.droppedItems||[]).map(function(it){
+        return (it.key? it.key+": ":"")+(it.title||"(untitled ticket)");
+      });
+      if(result.warning) showMobileNoteValidation("mrn-en-validation", result.warning, droppedLabels, false);
     }).catch(function(e){
       setMobileNoteButtonBusy("draft-mobile-note-en", false, "", iconSpark()+' Draft from tickets');
       showToast("Couldn't draft bullets: "+e.message);
+      showMobileNoteValidation("mrn-en-validation", "Couldn't draft bullets: "+e.message, null, true);
     });
   };
   var ta = qs("#mrn-en");
@@ -3455,6 +3495,7 @@ function handleTranslateMobileNoteAr(r){
     return;
   }
   var run = function(){
+    clearMobileNoteValidation("mrn-ar-validation");
     setMobileNoteButtonBusy("translate-mobile-note-ar", true, "Translating…", iconSpark()+' Translate from English');
     api.translateMobileNoteAr(r._id, enText).then(function(result){
       setMobileNoteButtonBusy("translate-mobile-note-ar", false, "", iconSpark()+' Translate from English');
@@ -3466,10 +3507,11 @@ function handleTranslateMobileNoteAr(r){
       showToast(result.engine==="gemini"
         ? "Translated with AI — review before saving."
         : "Translated with a free machine-translation service (no AI configured) — review carefully before saving, phrasing may be rougher than AI.");
-      if(result.warning) showToast(result.warning);
+      if(result.warning) showMobileNoteValidation("mrn-ar-validation", result.warning, result.droppedLines||[], false);
     }).catch(function(e){
       setMobileNoteButtonBusy("translate-mobile-note-ar", false, "", iconSpark()+' Translate from English');
       showToast("Couldn't translate: "+e.message);
+      showMobileNoteValidation("mrn-ar-validation", "Couldn't translate: "+e.message, null, true);
     });
   };
   var arTa = qs("#mrn-ar");

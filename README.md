@@ -357,6 +357,7 @@ In the service's **Environment** tab:
 | `ATLASSIAN_CLIENT_ID` / `ATLASSIAN_CLIENT_SECRET` | Yes | From your Atlassian OAuth app — and update its callback URL registration to match the `APP_BASE_URL` above. |
 | `SESSION_SECRET` | Yes | Generate with `openssl rand -hex 32` (or let Render generate it — `render.yaml` does this for you). |
 | `GEMINI_API_KEY` / `GEMINI_MODEL` | No | Optional AI-assisted Release Notes — see "Release notes" above. |
+| `MYMEMORY_CONTACT_EMAIL` | No | Raises the free Arabic-translation fallback's daily quota (see "Mobile Release Note" above) — MyMemory's anonymous tier is capped low enough that routine testing can hit a `429` error; including a contact email in the request raises that cap. Set to any address you're fine with MyMemory seeing (used only for their own abuse contact, never shown to end users). |
 
 `DATABASE_SSL` doesn't need to be set on Render — the app connects to Supabase over TLS by default.
 

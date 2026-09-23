@@ -406,7 +406,12 @@ router.post("/:id/mobile-release-note/draft-en", asyncHandler(async (req, res) =
       error: "This release has no tickets or release-note items yet to draft bullets from — add tickets (or generate Release Notes) first, or write the bullets manually.",
     });
   }
-  res.json({ enUS: result.bullets.join("\n"), aiUsed: result.aiUsed, warning: result.warning });
+  res.json({
+    enUS: result.bullets.join("\n"),
+    aiUsed: result.aiUsed,
+    warning: result.warning,
+    droppedItems: result.droppedItems || [],
+  });
 }));
 
 router.post("/:id/mobile-release-note/translate-ar", asyncHandler(async (req, res) => {
@@ -420,7 +425,12 @@ router.post("/:id/mobile-release-note/translate-ar", asyncHandler(async (req, re
 
   try {
     const result = await mobileReleaseNoteLogic.translateBulletsToArabic(lines);
-    res.json({ ar: result.lines.join("\n"), engine: result.engine, warning: result.warning });
+    res.json({
+      ar: result.lines.join("\n"),
+      engine: result.engine,
+      warning: result.warning,
+      droppedLines: result.droppedLines || [],
+    });
   } catch (e) {
     res.status(e.status || 502).json({ error: e.message });
   }
