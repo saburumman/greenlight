@@ -4,7 +4,8 @@ const db = require("../db");
 const jiraClient = require("../jiraClient");
 const atlassianTokens = require("../auth/atlassianTokens");
 const { extractIssueKey } = require("../extractKey");
-const releaseNotesLogic = require("../releaseNotesLogic"); // this route's only AI-related import — see releaseNotesLogic.generateReleaseNotes() for the abstraction boundary; nothing here talks to an AI provider directly
+const releaseNotesLogic = require("../releaseNotesLogic"); // this route's only AI-related import for Release Notes — see releaseNotesLogic.generateReleaseNotes() for the abstraction boundary; nothing here talks to an AI provider directly
+const mobileReleaseNoteLogic = require("../mobileReleaseNoteLogic"); // same pattern, for the Mobile Release Note section below — see draftEnglishBullets/translateBulletsToArabic
 const { asyncHandler } = require("../asyncHandler");
 
 const router = express.Router();
@@ -48,6 +49,11 @@ function newReleaseDoc(name, version, date, qaOwner, regressionModules) {
     performance: { enabled: false, status: "PASS", responseTime: "", concurrentUsers: "", errorRate: "", sla: "", notes: "" },
     security: { enabled: false, status: "PASS", critical: 0, high: 0, medium: 0, low: 0, notes: "" },
     releaseNotes: { html: "", edited: false, savedAt: null },
+    // Short, store-facing "What's New" bullets for the App Store / Play
+    // Store submission — deliberately separate from releaseNotes above
+    // (detailed, categorized, internal-audience notes). See
+    // mobileReleaseNoteLogic.js and the /mobile-release-note/* routes below.
+    mobileReleaseNote: { enUS: "", ar: "", savedAt: null },
     createdAt: now,
     updatedAt: now,
   };
@@ -108,6 +114,7 @@ router.post("/:id/duplicate", asyncHandler(async (req, res) => {
   clone.name = (existing.name || "Untitled release") + " (Copy)";
   clone.date = "";
   clone.releaseNotes = { html: "", edited: false, savedAt: null };
+  clone.mobileReleaseNote = { enUS: "", ar: "", savedAt: null };
   clone.jira = { lastSyncedAt: null };
   clone.createdAt = now;
   clone.updatedAt = now;
@@ -377,6 +384,46 @@ router.post("/:id/release-notes/generate", asyncHandler(async (req, res) => {
     aiUsedCount: generated.aiUsedCount,
     warnings: generated.warnings,
   });
+}));
+
+// ---- Mobile Release Note ------------------------------------------------
+//
+// The short, store-facing "What's New" bullets for the App Store / Play
+// Store submission — see server/mobileReleaseNoteLogic.js for the actual
+// drafting/translation logic and its AI-fallback rules. Neither route below
+// writes to the database: they only return drafted/translated text for the
+// two textareas in public/app.js (#mrn-en / #mrn-ar); saving it against
+// this release happens through the existing generic PUT /:id, exactly like
+// every other section on a release (see handleSaveMobileNote in app.js).
+
+router.post("/:id/mobile-release-note/draft-en", asyncHandler(async (req, res) => {
+  const release = await db.releases.get(req.params.id);
+  if (!release) return notFound(res);
+
+  const result = await mobileReleaseNoteLogic.draftEnglishBullets(release);
+  if (result.empty) {
+    return res.status(400).json({
+      error: "This release has no tickets or release-note items yet to draft bullets from — add tickets (or generate Release Notes) first, or write the bullets manually.",
+    });
+  }
+  res.json({ enUS: result.bullets.join("\n"), aiUsed: result.aiUsed, warning: result.warning });
+}));
+
+router.post("/:id/mobile-release-note/translate-ar", asyncHandler(async (req, res) => {
+  const release = await db.releases.get(req.params.id);
+  if (!release) return notFound(res);
+
+  const lines = mobileReleaseNoteLogic.linesToBullets(req.body && req.body.enUS);
+  if (!lines.length) {
+    return res.status(400).json({ error: "Write or draft the English bullets first — there's nothing to translate yet." });
+  }
+
+  try {
+    const translatedLines = await mobileReleaseNoteLogic.translateBulletsToArabic(lines);
+    res.json({ ar: translatedLines.join("\n") });
+  } catch (e) {
+    res.status(e.status || 502).json({ error: e.message });
+  }
 }));
 
 // ---- Regression module sync -------------------------------------------

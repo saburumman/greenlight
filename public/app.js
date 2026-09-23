@@ -155,6 +155,8 @@ var api = {
   deleteTicket: function(id, key){ return apiCall("DELETE","/releases/"+id+"/tickets/"+encodeURIComponent(key)); },
   jiraSync: function(id){ return apiCall("POST","/releases/"+id+"/jira-sync"); },
   generateReleaseNotes: function(id){ return apiCall("POST","/releases/"+id+"/release-notes/generate"); },
+  draftMobileNoteEn: function(id){ return apiCall("POST","/releases/"+id+"/mobile-release-note/draft-en"); },
+  translateMobileNoteAr: function(id, enUS){ return apiCall("POST","/releases/"+id+"/mobile-release-note/translate-ar", {enUS:enUS}); },
   syncRegressionModules: function(id){ return apiCall("POST","/releases/"+id+"/regression-sync"); },
   jiraStatus: function(){ return apiCall("GET","/jira/status"); },
   listRegressionModules: function(){ return apiCall("GET","/regression-modules"); },
@@ -245,6 +247,7 @@ var state = {
   loadError: null,
   jiraStatus: {connected:false},
   notesDirty: false,
+  mobileNoteDirty: false, // unsaved-edit flag for the Mobile Release Note textareas — same pattern as notesDirty above
   ticketGroupBy: "None",
   ticketCollapsed: {}, // groupKey -> true if collapsed
   regressionGroupBy: "Entity", // "Entity" (default list) or "Owner" (bucketed by assignee, see sectionRegression)
@@ -1149,6 +1152,7 @@ var AUDIT_ACTION_LABELS = {
   AI_ASSESSMENT_GENERATED: "Generated AI Assessment",
   RELEASE_NOTES_GENERATED: "Generated Release Notes",
   RELEASE_NOTES_UPDATED: "Updated Release Notes",
+  MOBILE_RELEASE_NOTE_UPDATED: "Updated Mobile Release Note",
   TEST_DATA_CREATED: "Added Test Data",
   TEST_DATA_IMPORTED: "Imported Test Data",
   TEST_DATA_UPDATED: "Updated Test Data",
@@ -2087,8 +2091,8 @@ function renderDetail(r){
   '</div>';
 
   html += '<nav class="quicknav">'+
-    ['tickets','regression','bugs','platforms','blockers','performance','security','notes','publish'].map(function(s){
-      var labels={tickets:"Tickets",regression:"Regression",bugs:"Bugs",platforms:"Platforms",blockers:"Blockers",performance:"Performance",security:"Security",notes:"Release Notes",publish:"Publish"};
+    ['tickets','regression','bugs','platforms','blockers','performance','security','notes','mobile','publish'].map(function(s){
+      var labels={tickets:"Tickets",regression:"Regression",bugs:"Bugs",platforms:"Platforms",blockers:"Blockers",performance:"Performance",security:"Security",notes:"Release Notes",mobile:"Mobile Release Note",publish:"Publish"};
       return '<a data-scroll="sec-'+s+'">'+labels[s]+'</a>';
     }).join("")+
   '</nav>';
@@ -2108,6 +2112,7 @@ function renderDetail(r){
   html += sectionPerformance(r);
   html += sectionSecurity(r);
   html += sectionReleaseNotes(r);
+  html += sectionMobileNote(r);
   html += sectionPublish(r, a);
 
   return html;
@@ -2217,6 +2222,10 @@ function afterDetailRender(r){
     editor.innerHTML = r.releaseNotes && r.releaseNotes.html ? r.releaseNotes.html : "";
     state.notesDirty = false;
     updateNotesStatus(r);
+  }
+  if(qs("#mrn-en")){
+    state.mobileNoteDirty = false;
+    updateMobileNoteStatus(r);
   }
   if(state.pendingScrollTo){
     var targetId = state.pendingScrollTo;
@@ -2581,6 +2590,70 @@ function updateNotesStatus(r){
   else if(savedAt) bits.push("Saved "+savedAt);
   else bits.push("Not saved yet");
   el.innerHTML = bits.join(" ");
+}
+
+/* ---- Mobile Release Note ----
+   The short, store-facing "What's New" bullets required by the App Store /
+   Play Store submission forms — deliberately separate from the detailed,
+   categorized Release Notes above (sectionReleaseNotes): this is a handful
+   of short plain-language lines, one per line, in English and Arabic, that
+   get copied out in the exact <en-US>/<ar> tagged format the store listing
+   tooling expects (see handleCopyMobileNote). "Draft from tickets" and
+   "Translate from English" are optional AI-assisted starting points (see
+   server/mobileReleaseNoteLogic.js) — every bullet stays freely editable in
+   the textareas below before you save or copy. */
+function sectionMobileNote(r){
+  var mrn = r.mobileReleaseNote || {enUS:"", ar:"", savedAt:null};
+  return '<section class="card section-card" id="sec-mobile">'+
+    '<div class="section-head"><div class="section-title">📱 Mobile Release Note</div>'+
+      '<div class="section-actions">'+
+        '<button class="btn btn-sm" data-action="copy-mobile-note">'+iconCopy()+' Copy formatted block</button>'+
+        '<button class="btn btn-sm btn-primary" data-action="save-mobile-note">'+iconSave()+' Save</button>'+
+      '</div></div>'+
+    '<div class="section-body">'+
+      '<p class="helper-text">The short "What’s New" bullets for this release’s app store submission — one line per bullet. Copy the formatted block below straight into the store listing form.</p>'+
+      '<div class="field-row">'+
+        '<div class="field">'+
+          '<div class="mrn-col-head"><label for="mrn-en">English (en-US)</label>'+
+            '<button type="button" class="btn btn-sm" data-action="draft-mobile-note-en">'+iconSpark()+' Draft from tickets</button>'+
+          '</div>'+
+          '<textarea id="mrn-en" rows="10" placeholder="Improved payment status guidance.\nVehicles sorted by license expiry.">'+esc(mrn.enUS||"")+'</textarea>'+
+        '</div>'+
+        '<div class="field">'+
+          '<div class="mrn-col-head"><label for="mrn-ar">Arabic (ar)</label>'+
+            '<button type="button" class="btn btn-sm" data-action="translate-mobile-note-ar">'+iconSpark()+' Translate from English</button>'+
+          '</div>'+
+          '<textarea id="mrn-ar" rows="10" dir="rtl" lang="ar" placeholder="تحسين عرض حالة الدفع في الطلبات.">'+esc(mrn.ar||"")+'</textarea>'+
+        '</div>'+
+      '</div>'+
+      '<div class="notes-status" id="mobile-note-status"></div>'+
+    '</div>'+
+  '</section>';
+}
+function updateMobileNoteStatus(r){
+  var el = qs("#mobile-note-status");
+  if(!el) return;
+  var mrn = r.mobileReleaseNote;
+  var savedAt = mrn && mrn.savedAt ? fmtDateTime(mrn.savedAt) : null;
+  var bits = [];
+  if(state.mobileNoteDirty) bits.push('<span class="dirty-dot"></span> Unsaved changes');
+  else if(savedAt) bits.push("Saved "+savedAt);
+  else bits.push("Not saved yet");
+  el.innerHTML = bits.join(" ");
+}
+// Splits a textarea's content into one trimmed, non-empty line per bullet —
+// the client-side twin of mobileReleaseNoteLogic.linesToBullets on the
+// server (see that file for why both exist: this one is used purely for
+// formatting the copy-to-clipboard block, never sent over the wire as-is).
+function mobileNoteLines(text){
+  return String(text||"").split(/\n+/).map(function(l){return l.trim();}).filter(Boolean);
+}
+// The exact block format required by the store submission tooling — each
+// locale's non-empty lines, bullet-prefixed, wrapped in its own tag.
+function formatMobileReleaseNoteBlock(enUS, ar){
+  var enLines = mobileNoteLines(enUS).map(function(l){ return /^[•\-*]\s*/.test(l) ? l.replace(/^[•\-*]\s*/, "• ") : "• "+l; });
+  var arLines = mobileNoteLines(ar).map(function(l){ return /^[•\-*]\s*/.test(l) ? l.replace(/^[•\-*]\s*/, "• ") : "• "+l; });
+  return "<en-US>\n"+enLines.join("\n")+"\n</en-US>\n<ar>\n"+arLines.join("\n")+"\n</ar>";
 }
 
 /* ---- Publish ---- */
@@ -3313,6 +3386,110 @@ function handleSaveNotes(r){
 }
 
 /* ============================================================
+   MOBILE RELEASE NOTE ACTIONS
+   ============================================================ */
+function setMobileNoteButtonBusy(action, on, busyLabel, idleHtml){
+  var btn = qs('[data-action="'+action+'"]');
+  if(!btn) return;
+  if(on){
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> '+busyLabel;
+  } else {
+    btn.disabled = false;
+    btn.innerHTML = idleHtml;
+  }
+}
+function handleDraftMobileNoteEn(r){
+  var run = function(){
+    setMobileNoteButtonBusy("draft-mobile-note-en", true, "Drafting…", iconSpark()+' Draft from tickets');
+    api.draftMobileNoteEn(r._id).then(function(result){
+      setMobileNoteButtonBusy("draft-mobile-note-en", false, "", iconSpark()+' Draft from tickets');
+      var ta = qs("#mrn-en");
+      if(ta) ta.value = result.enUS || "";
+      state.mobileNoteDirty = true;
+      updateMobileNoteStatus(r);
+      showToast(result.aiUsed ? "Drafted from this release's tickets — review before saving." : "Drafted simple bullets from ticket titles (AI drafting isn't configured) — review before saving.");
+      if(result.warning) showToast(result.warning);
+    }).catch(function(e){
+      setMobileNoteButtonBusy("draft-mobile-note-en", false, "", iconSpark()+' Draft from tickets');
+      showToast("Couldn't draft bullets: "+e.message);
+    });
+  };
+  var ta = qs("#mrn-en");
+  if(ta && ta.value.trim()){
+    openConfirm("Redraft English bullets?", "This replaces the current English text with a fresh draft from this release's tickets.", "Redraft", run, false);
+  } else run();
+}
+function handleTranslateMobileNoteAr(r){
+  var enTa = qs("#mrn-en");
+  var enText = enTa ? enTa.value : "";
+  if(!mobileNoteLines(enText).length){
+    showToast("Write or draft the English bullets first.");
+    return;
+  }
+  var run = function(){
+    setMobileNoteButtonBusy("translate-mobile-note-ar", true, "Translating…", iconSpark()+' Translate from English');
+    api.translateMobileNoteAr(r._id, enText).then(function(result){
+      setMobileNoteButtonBusy("translate-mobile-note-ar", false, "", iconSpark()+' Translate from English');
+      var arTa = qs("#mrn-ar");
+      if(arTa) arTa.value = result.ar || "";
+      state.mobileNoteDirty = true;
+      updateMobileNoteStatus(r);
+      showToast("Translated — review before saving (machine-translated Arabic).");
+    }).catch(function(e){
+      setMobileNoteButtonBusy("translate-mobile-note-ar", false, "", iconSpark()+' Translate from English');
+      showToast("Couldn't translate: "+e.message);
+    });
+  };
+  var arTa = qs("#mrn-ar");
+  if(arTa && arTa.value.trim()){
+    openConfirm("Retranslate Arabic bullets?", "This replaces the current Arabic text with a fresh translation of the English bullets above.", "Retranslate", run, false);
+  } else run();
+}
+function handleSaveMobileNote(r){
+  var enTa = qs("#mrn-en");
+  var arTa = qs("#mrn-ar");
+  r.mobileReleaseNote = {
+    enUS: enTa ? enTa.value : "",
+    ar: arTa ? arTa.value : "",
+    savedAt: new Date().toISOString()
+  };
+  state.mobileNoteDirty = false;
+  persistRelease(r, function(){
+    showToast("Mobile release note saved");
+    logAudit({action:"MOBILE_RELEASE_NOTE_UPDATED", entityType:"Release", entityId:r._id, details:"Release "+(r.version||r.name||"Untitled")});
+  });
+}
+function handleCopyMobileNote(r){
+  var enTa = qs("#mrn-en");
+  var arTa = qs("#mrn-ar");
+  var enText = enTa ? enTa.value : "";
+  var arText = arTa ? arTa.value : "";
+  if(!mobileNoteLines(enText).length && !mobileNoteLines(arText).length){
+    showToast("Nothing to copy yet — write or draft the bullets first.");
+    return;
+  }
+  var block = formatMobileReleaseNoteBlock(enText, arText);
+  var done = function(){ showToast("Copied — paste it into the store submission form."); };
+  var failed = function(){ showToast("Couldn't copy automatically — select the text and copy it manually."); };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(block).then(done).catch(failed);
+  } else {
+    try{
+      var tmp = document.createElement("textarea");
+      tmp.value = block;
+      tmp.style.position = "fixed";
+      tmp.style.opacity = "0";
+      document.body.appendChild(tmp);
+      tmp.focus(); tmp.select();
+      var ok = document.execCommand("copy");
+      document.body.removeChild(tmp);
+      ok ? done() : failed();
+    }catch(e){ failed(); }
+  }
+}
+
+/* ============================================================
    PUBLISH
    Marks a release as published with a timestamped snapshot of the current
    AI recommendation, for the record. Purely informational — it never locks
@@ -3461,6 +3638,10 @@ document.addEventListener("click", function(e){
     case "edit-security": if(r) openSecurityModal(r); break;
     case "generate-notes": if(r) handleGenerateNotes(r); break;
     case "save-notes": if(r) handleSaveNotes(r); break;
+    case "draft-mobile-note-en": if(r) handleDraftMobileNoteEn(r); break;
+    case "translate-mobile-note-ar": if(r) handleTranslateMobileNoteAr(r); break;
+    case "save-mobile-note": if(r) handleSaveMobileNote(r); break;
+    case "copy-mobile-note": if(r) handleCopyMobileNote(r); break;
     case "publish-release": if(r) handlePublishRelease(r); break;
     case "download-release-pdf":
       if(r){
@@ -3631,6 +3812,11 @@ document.addEventListener("input", function(e){
     state.notesDirty = true;
     var r = state.releases[state.route.id];
     if(r) updateNotesStatus(r);
+  }
+  if(e.target && (e.target.id==="mrn-en" || e.target.id==="mrn-ar")){
+    state.mobileNoteDirty = true;
+    var rMrn = state.releases[state.route.id];
+    if(rMrn) updateMobileNoteStatus(rMrn);
   }
   if(e.target && e.target.id==="global-search"){
     state.searchQuery = e.target.value;

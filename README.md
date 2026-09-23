@@ -142,6 +142,28 @@ Generating never overwrites notes you've already edited by hand without asking f
 
 Behind the editable notes, each generated item is tracked with where it came from — `AI_GENERATED` (from this generation step, whether Gemini or the rule-based fallback wrote it), `MANUALLY_ADDED` (a ticket that was never in the Jira data this ran against), or `MANUALLY_EDITED` (marked once you've hand-edited and saved the notes, so a later Regenerate's confirmation prompt is warning you about real edits, not a stale flag) — along with a reference back to its source Jira issue. This is bookkeeping behind the single notes editor, not a new UI — the editor itself is unchanged.
 
+## Mobile Release Note
+
+A separate section below Release Notes, for the short "What's New" text app store submissions require — one bullet per line, in English (**en-US**) and Arabic (**ar**). It's deliberately independent from the detailed Release Notes above: short, plain, customer-facing bullets rather than the categorized internal write-up.
+
+- **Draft from tickets** pre-fills the English box from this release's tickets (reusing already-generated Release Notes items when there are any, otherwise the same rule-based summaries Release Notes falls back to). With `GEMINI_API_KEY` set, Gemini writes each bullet in short, plain, store-listing style; without it (or if the AI call fails), each bullet falls back to a simple `New: <title>.` / `Improved: <title>.` / `Fixed: <title>.` line built from the ticket's own title — never invented content either way.
+- **Translate from English** sends whatever's currently in the English box (edited or not) to Gemini for an Arabic translation. This one has no non-AI fallback — a translation with no `GEMINI_API_KEY` configured isn't something the app can safely guess at, so you'll get a clear message to type the Arabic yourself instead.
+- Both boxes are always freely editable, whether they were drafted or typed from scratch — nothing here is ever auto-saved; click **Save** when you're happy with them.
+- **Copy formatted block** copies both languages to your clipboard in the exact tagged format store submission tooling expects:
+
+  ```
+  <en-US>
+  • Improved payment status guidance.
+  • Vehicles sorted by license expiry.
+  </en-US>
+  <ar>
+  • تحسين عرض حالة الدفع في الطلبات.
+  • ترتيب المركبات حسب تاريخ انتهاء الرخصة.
+  </ar>
+  ```
+
+  Each non-empty line is bullet-prefixed automatically if you haven't already typed one — you don't need to type `•` yourself.
+
 ## Download PDF
 
 Once a release has been published, a **Download PDF** button appears next to Edit info / Duplicate on its detail page. It opens your browser's native print dialog — choose "Save as PDF" as the destination to get a file, or print it directly. There's no server-side PDF generation and no new dependency.
