@@ -34,10 +34,8 @@ const releaseNotesLogic = require("./releaseNotesLogic");
 // person already expects to wait a moment for.
 const FREE_TRANSLATE_URL = "https://api.mymemory.translated.net/get";
 
-// langpair defaults to "en|ar" (the Arabic-box translation direction);
-// pass "ar|en" for the opposite direction (see ensureEnglishBullets below).
-async function translateLineFree(line, langpair) {
-  const url = `${FREE_TRANSLATE_URL}?${new URLSearchParams({ q: line, langpair: langpair || "en|ar" }).toString()}`;
+async function translateLineFree(line) {
+  const url = `${FREE_TRANSLATE_URL}?${new URLSearchParams({ q: line, langpair: "en|ar" }).toString()}`;
   let res;
   try {
     res = await fetch(url);
@@ -119,56 +117,70 @@ function combineWarnings(a, b) {
   return [a, b].filter(Boolean).join(" ") || null;
 }
 
-// Non-AI fallback: one plain sentence per item, built from its title and
-// category — same honest, never-invented spirit as
+// Non-AI fallback: one plain sentence per item, built straight from its
+// title — same honest, never-invented spirit as
 // releaseNotesLogic.ticketFallbackSentence, just shorter and in
-// store-bullet phrasing rather than Jira-ticket phrasing.
+// store-bullet phrasing rather than Jira-ticket phrasing. No "New:" /
+// "Improved:" / "Fixed:" label is added — just the change itself, since a
+// store listing reads as plain bullets, not a categorized internal log
+// (category is still tracked on the item for other features; it's simply
+// not printed here).
 function bulletFallbackLine(item) {
   const title = String((item && item.title) || "this change").replace(/\.$/, "");
-  const category = item && item.category;
-  let text;
-  if (category === "Bug Fix") text = "Fixed: " + title + ".";
-  else if (category === "New Feature") text = "New: " + title + ".";
-  else if (category === "Improvement") text = "Improved: " + title + ".";
-  else text = title + ".";
-  return truncate(text, MAX_BULLET_LEN);
+  return truncate(title + ".", MAX_BULLET_LEN);
 }
+
+// A single Arabic-script "word" — one or more Arabic letters/diacritics
+// with no whitespace inside — plus any punctuation immediately touching it
+// (quotes, parentheses, dashes, commas). Matches greedily so a whole
+// Arabic phrase like "بطاقة الموظف" (two words separated by one space) is
+// removed as a unit, not word-by-word, and any wrapping quote marks or
+// parentheses that only ever enclosed Arabic text go with it.
+const ARABIC_PHRASE_RE =
+  /["'“”‘’(]*[؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿][؀-ۿݐ-ݿࢠ-ࣿﭐ-﷿ﹰ-﻿\s.,،؛?!)"'“”‘’-]*/g;
 
 // Ensures every bullet in the English box is actually English. This app's
 // Jira tickets are often titled in Arabic (or a mix of Arabic and English),
 // and bulletFallbackLine above just echoes the ticket's own title verbatim
 // — so without this, a ticket titled in Arabic would land in the English
-// textarea untranslated. Gemini is separately instructed to translate any
-// Arabic in its own prompt (see MOBILE_BULLET_SYSTEM_PROMPT in
-// aiService.js), so in practice this mainly catches the non-AI fallback
-// path and anything Gemini missed — but it's applied uniformly, after
-// either path, so the English box is guaranteed Arabic-free regardless of
-// how a bullet was produced. Uses the same free, keyless MyMemory
-// translator as the Arabic box's own fallback (never blocks on AI, never
-// makes a second Gemini call just for this cleanup); a bullet that can't be
-// translated for any reason is left as-is rather than dropping its content.
-// Returns { bullets, translatedCount }.
-async function ensureEnglishBullets(bullets) {
+// textarea as-is. Gemini is separately instructed to write its bullet in
+// English only (see MOBILE_BULLET_SYSTEM_PROMPT in aiService.js), so in
+// practice this mainly catches the non-AI fallback path and anything
+// Gemini missed — but it's applied uniformly, after either path, so the
+// English box is guaranteed Arabic-free regardless of how a bullet was
+// produced.
+//
+// This removes Arabic text rather than translating it: earlier this ran
+// the Arabic-only portion through the free MyMemory translator, but that
+// depends on reaching an outside service (unreliable from some hosts) and
+// on there being any text left to have a meaning worth preserving once a
+// ticket title is stripped down to its Arabic half. Deterministic removal
+// has no such dependency and always produces something clean; nothing
+// else about a bullet's English portion is touched. Returns
+// { bullets, strippedCount }.
+function ensureEnglishBullets(bullets) {
   const out = [];
-  let translatedCount = 0;
+  let strippedCount = 0;
   for (const b of bullets) {
     if (!containsArabic(b)) {
       out.push(b);
       continue;
     }
-    try {
-      const translated = await translateLineFree(b, "ar|en");
-      if (translated) {
-        out.push(truncate(translated, MAX_BULLET_LEN));
-        translatedCount++;
-      } else {
-        out.push(b);
-      }
-    } catch (e) {
-      out.push(b); // couldn't translate — keep the original rather than losing the content
-    }
+    const cleaned = String(b)
+      .replace(ARABIC_PHRASE_RE, " ")
+      // leftover empty pairs/brackets and stray punctuation the removal can leave behind
+      .replace(/\(\s*\)/g, "")
+      .replace(/\{\s*\}/g, "")
+      .replace(/["“”‘’]\s*["“”‘’]/g, "")
+      .replace(/\s+([.,;:!?])/g, "$1")
+      .replace(/\s{2,}/g, " ")
+      .replace(/^[\s\-–—]+|[\s\-–—]+$/g, "")
+      .trim();
+    const withEnding = cleaned && !/[.!?]$/.test(cleaned) ? cleaned + "." : cleaned;
+    out.push(withEnding || "this change.");
+    strippedCount++;
   }
-  return { bullets: out, translatedCount };
+  return { bullets: out, strippedCount };
 }
 
 // Where the draft's source items come from: prefer the already-generated
@@ -243,12 +255,12 @@ async function draftEnglishBullets(release) {
     }
   }
 
-  const englishResult = await ensureEnglishBullets(bullets);
-  if (englishResult.translatedCount) {
-    const n = englishResult.translatedCount;
+  const englishResult = ensureEnglishBullets(bullets);
+  if (englishResult.strippedCount) {
+    const n = englishResult.strippedCount;
     warning = combineWarnings(
       warning,
-      `${n} bullet${n === 1 ? "" : "s"} came from an Arabic ticket title and ${n === 1 ? "was" : "were"} auto-translated to English — double-check the wording.`
+      `${n} bullet${n === 1 ? "" : "s"} came from an Arabic ticket title and had the Arabic text removed — give ${n === 1 ? "it" : "them"} a look, since the English that's left is only whatever was already in the title.`
     );
   }
 

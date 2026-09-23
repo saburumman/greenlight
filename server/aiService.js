@@ -188,12 +188,12 @@ You will be given a JSON array of items, each already categorized as "New Featur
 
 For EVERY item in the array, return one object with exactly these two fields:
 - "key": the item's key, copied EXACTLY as given — never alter it.
-- "bullet": ONE short bullet line (no more than about 90 characters), written for an end user reading the app's store listing — plain, positive, customer-facing language. No ticket keys, no internal jargon, no Jira terminology, no leading bullet character ("•") or number — just the sentence itself.
+- "bullet": ONE short bullet line (no more than about 90 characters), written for an end user reading the app's store listing — plain, positive, customer-facing language. No ticket keys, no internal jargon, no Jira terminology, no leading bullet character ("•") or number — just the sentence itself. Do NOT prefix it with a label like "New:", "Improved:", or "Fixed:" — describe the change directly, the way a real store listing reads.
 
 Strict rules:
 - Never invent functionality, behavior, or user impact beyond what the supplied title/description already say.
-- A bug fix can be phrased as an improvement ("Improved X") if that reads more naturally for end users, as long as it doesn't overstate what changed.
-- The supplied title/description may be written in Arabic, English, or a mix of both (this QA tool's tickets are often titled in Arabic). Regardless of the source language, ALWAYS write the "bullet" in English only — translate any Arabic content into natural, plain English rather than leaving it untranslated, transliterating it, or copying it as-is.
+- A change can be phrased as an improvement ("Improved X") if that reads more naturally for end users, as long as it doesn't overstate what changed — but do not use it, or any other word, as a leading label followed by a colon.
+- The supplied title/description may be written in Arabic, English, or a mix of both (this QA tool's tickets are often titled in Arabic). Regardless of the source language, write the "bullet" in English only, in your own plain words — never include any Arabic script, transliterate it, or copy it as-is. If a title is entirely in Arabic and you cannot tell what it means, write a short, honest, generic English line rather than including any of the original Arabic text.
 - Return content only for items actually present in the input. Do not add items, and do not skip any.
 - Output ONLY a raw JSON array of objects with exactly the fields "key", "bullet" — no surrounding prose, no markdown code fences, no extra fields.`;
 
