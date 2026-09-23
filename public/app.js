@@ -2226,6 +2226,7 @@ function afterDetailRender(r){
   if(qs("#mrn-en")){
     state.mobileNoteDirty = false;
     updateMobileNoteStatus(r);
+    updateMobileNoteCounters();
   }
   if(state.pendingScrollTo){
     var targetId = state.pendingScrollTo;
@@ -2602,6 +2603,15 @@ function updateNotesStatus(r){
    "Translate from English" are optional AI-assisted starting points (see
    server/mobileReleaseNoteLogic.js) — every bullet stays freely editable in
    the textareas below before you save or copy. */
+// Google Play's "What's new" field (and, comfortably, Apple's App Store
+// "What's New in This Version") caps store release-note text per language
+// at 500 characters — enforced here as a hard ceiling on each textarea's
+// whole value (maxlength, so typing/pasting past it is simply blocked) plus
+// a live "n / 500" counter. server/mobileReleaseNoteLogic.js hardcodes the
+// same number as MAX_BLOCK_LEN for its own server-side truncation (Draft/
+// Translate results can't rely on maxlength, since they're set
+// programmatically) — keep both in sync if this ever changes.
+var MOBILE_NOTE_MAX_LEN = 500;
 function sectionMobileNote(r){
   var mrn = r.mobileReleaseNote || {enUS:"", ar:"", savedAt:null};
   return '<section class="card section-card" id="sec-mobile">'+
@@ -2611,19 +2621,19 @@ function sectionMobileNote(r){
         '<button class="btn btn-sm btn-primary" data-action="save-mobile-note">'+iconSave()+' Save</button>'+
       '</div></div>'+
     '<div class="section-body">'+
-      '<p class="helper-text">The short "What’s New" bullets for this release’s app store submission — one line per bullet. Copy the formatted block below straight into the store listing form.</p>'+
+      '<p class="helper-text">The short "What’s New" bullets for this release’s app store submission — one line per bullet, up to '+MOBILE_NOTE_MAX_LEN+' characters per language (the Google Play / App Store limit). Copy the formatted block below straight into the store listing form.</p>'+
       '<div class="field-row">'+
         '<div class="field">'+
-          '<div class="mrn-col-head"><label for="mrn-en">English (en-US)</label>'+
+          '<div class="mrn-col-head"><span class="mrn-col-label-group"><label for="mrn-en">English (en-US)</label><span class="mrn-counter" id="mrn-en-counter"></span></span>'+
             '<button type="button" class="btn btn-sm" data-action="draft-mobile-note-en">'+iconSpark()+' Draft from tickets</button>'+
           '</div>'+
-          '<textarea id="mrn-en" rows="10" placeholder="Improved payment status guidance.\nVehicles sorted by license expiry.">'+esc(mrn.enUS||"")+'</textarea>'+
+          '<textarea id="mrn-en" rows="10" maxlength="'+MOBILE_NOTE_MAX_LEN+'" placeholder="Improved payment status guidance.\nVehicles sorted by license expiry.">'+esc(mrn.enUS||"")+'</textarea>'+
         '</div>'+
         '<div class="field">'+
-          '<div class="mrn-col-head"><label for="mrn-ar">Arabic (ar)</label>'+
+          '<div class="mrn-col-head"><span class="mrn-col-label-group"><label for="mrn-ar">Arabic (ar)</label><span class="mrn-counter" id="mrn-ar-counter"></span></span>'+
             '<button type="button" class="btn btn-sm" data-action="translate-mobile-note-ar">'+iconSpark()+' Translate from English</button>'+
           '</div>'+
-          '<textarea id="mrn-ar" rows="10" dir="rtl" lang="ar" placeholder="تحسين عرض حالة الدفع في الطلبات.">'+esc(mrn.ar||"")+'</textarea>'+
+          '<textarea id="mrn-ar" rows="10" maxlength="'+MOBILE_NOTE_MAX_LEN+'" dir="rtl" lang="ar" placeholder="تحسين عرض حالة الدفع في الطلبات.">'+esc(mrn.ar||"")+'</textarea>'+
         '</div>'+
       '</div>'+
       '<div class="notes-status" id="mobile-note-status"></div>'+
@@ -2640,6 +2650,22 @@ function updateMobileNoteStatus(r){
   else if(savedAt) bits.push("Saved "+savedAt);
   else bits.push("Not saved yet");
   el.innerHTML = bits.join(" ");
+}
+// Live "n / 500" counter for each Mobile Release Note textarea — called on
+// every render, on every keystroke (see the delegated "input" listener
+// below), and after Draft/Translate replace a box's content programmatically
+// (which bypasses the textarea's own maxlength enforcement, so this is also
+// the only place that visibly flags an over-length AI/fallback result).
+function updateMobileNoteCounters(){
+  ["en","ar"].forEach(function(lang){
+    var ta = qs("#mrn-"+lang);
+    var counter = qs("#mrn-"+lang+"-counter");
+    if(!ta || !counter) return;
+    var len = ta.value.length;
+    counter.textContent = len+" / "+MOBILE_NOTE_MAX_LEN;
+    counter.classList.toggle("mrn-counter-warn", len >= Math.floor(MOBILE_NOTE_MAX_LEN*0.9) && len < MOBILE_NOTE_MAX_LEN);
+    counter.classList.toggle("mrn-counter-max", len >= MOBILE_NOTE_MAX_LEN);
+  });
 }
 // Splits a textarea's content into one trimmed, non-empty line per bullet —
 // the client-side twin of mobileReleaseNoteLogic.linesToBullets on the
@@ -3408,6 +3434,7 @@ function handleDraftMobileNoteEn(r){
       if(ta) ta.value = result.enUS || "";
       state.mobileNoteDirty = true;
       updateMobileNoteStatus(r);
+      updateMobileNoteCounters();
       showToast(result.aiUsed ? "Drafted from this release's tickets — review before saving." : "Drafted simple bullets from ticket titles (AI drafting isn't configured) — review before saving.");
       if(result.warning) showToast(result.warning);
     }).catch(function(e){
@@ -3435,9 +3462,11 @@ function handleTranslateMobileNoteAr(r){
       if(arTa) arTa.value = result.ar || "";
       state.mobileNoteDirty = true;
       updateMobileNoteStatus(r);
+      updateMobileNoteCounters();
       showToast(result.engine==="gemini"
         ? "Translated with AI — review before saving."
         : "Translated with a free machine-translation service (no AI configured) — review carefully before saving, phrasing may be rougher than AI.");
+      if(result.warning) showToast(result.warning);
     }).catch(function(e){
       setMobileNoteButtonBusy("translate-mobile-note-ar", false, "", iconSpark()+' Translate from English');
       showToast("Couldn't translate: "+e.message);
@@ -3819,6 +3848,7 @@ document.addEventListener("input", function(e){
     state.mobileNoteDirty = true;
     var rMrn = state.releases[state.route.id];
     if(rMrn) updateMobileNoteStatus(rMrn);
+    updateMobileNoteCounters();
   }
   if(e.target && e.target.id==="global-search"){
     state.searchQuery = e.target.value;

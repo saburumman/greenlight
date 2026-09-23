@@ -60,11 +60,53 @@ async function translateLinesFree(lines) {
 }
 
 const MAX_BULLET_LEN = 110;
+// Google Play's "What's new" field (and, comfortably, Apple's App Store
+// "What's New in This Version") caps store release-note text per language
+// at 500 characters — this app enforces the same limit on the *whole*
+// joined block per language (all bullets + the newlines between them), not
+// per bullet. public/app.js hardcodes the same number as MOBILE_NOTE_MAX_LEN
+// for the client-side character counter and the textareas' maxlength — keep
+// both in sync if this ever changes.
+const MAX_BLOCK_LEN = 500;
 
 function truncate(s, max) {
   s = String(s || "").trim();
   if (s.length <= max) return s;
   return s.slice(0, max).replace(/\s+\S*$/, "") + "…";
+}
+
+// Keeps as many whole bullets as fit — in their original relative order —
+// within `limit` total characters counting the "\n" that joins them (the
+// same way a plain textarea's .value.length, and the store's own text
+// field, counts it). Never truncates a bullet mid-sentence: one that
+// wouldn't fit is skipped whole, not cut short, so what's left always reads
+// as complete sentences. A skip doesn't stop the scan — a single unusually
+// long bullet (most often a longer Arabic translation of a short English
+// line) is passed over rather than cutting off every bullet after it, so
+// one outlier costs at most itself, not the rest of the list. Returns
+// { kept, droppedCount }.
+function keepWithinBlockLimit(bullets, limit) {
+  const kept = [];
+  let total = 0;
+  for (const b of bullets) {
+    const addLen = b.length + (kept.length ? 1 : 0); // +1 for the joining "\n"
+    if (total + addLen > limit) continue; // doesn't fit — skip it, keep checking the rest
+    kept.push(b);
+    total += addLen;
+  }
+  return { kept, droppedCount: bullets.length - kept.length };
+}
+
+function blockLimitWarning(droppedCount) {
+  if (!droppedCount) return null;
+  return `${droppedCount} bullet${droppedCount === 1 ? "" : "s"} left out to stay within the store's ${MAX_BLOCK_LEN}-character-per-language limit — add ${droppedCount === 1 ? "it" : "them"} back by hand if you have room, or trim the others first.`;
+}
+
+// Combines two possibly-null warning strings into one (or null) — used
+// where a result can carry both an AI-fallback warning and a block-limit
+// warning at the same time.
+function combineWarnings(a, b) {
+  return [a, b].filter(Boolean).join(" ") || null;
 }
 
 // Non-AI fallback: one plain sentence per item, built from its title and
@@ -136,21 +178,26 @@ async function draftEnglishBullets(release) {
     return { bullets: [], aiUsed: false, warning: null, empty: true };
   }
 
+  let bullets, aiUsed, warning;
   if (!aiService.isConfigured()) {
-    return { bullets: items.map(bulletFallbackLine), aiUsed: false, warning: null, empty: false };
+    bullets = items.map(bulletFallbackLine);
+    aiUsed = false;
+    warning = null;
+  } else {
+    try {
+      const raw = await aiService.generateMobileBullets(items);
+      bullets = mapBulletResponse(items, raw);
+      aiUsed = true;
+      warning = null;
+    } catch (e) {
+      bullets = items.map(bulletFallbackLine);
+      aiUsed = false;
+      warning = (e && e.message) || "AI drafting failed — used simple bullets from the ticket titles instead.";
+    }
   }
 
-  try {
-    const raw = await aiService.generateMobileBullets(items);
-    return { bullets: mapBulletResponse(items, raw), aiUsed: true, warning: null, empty: false };
-  } catch (e) {
-    return {
-      bullets: items.map(bulletFallbackLine),
-      aiUsed: false,
-      warning: (e && e.message) || "AI drafting failed — used simple bullets from the ticket titles instead.",
-      empty: false,
-    };
-  }
+  const { kept, droppedCount } = keepWithinBlockLimit(bullets, MAX_BLOCK_LEN);
+  return { bullets: kept, aiUsed, warning: combineWarnings(warning, blockLimitWarning(droppedCount)), empty: false };
 }
 
 // The single seam for Arabic translation. Tries Gemini first when
@@ -161,36 +208,51 @@ async function draftEnglishBullets(release) {
 // API key. Only throws (with a status) if BOTH paths fail, at which point
 // there's genuinely nothing to offer and the caller (routes/releases.js)
 // surfaces the failure so the person can enter Arabic manually instead.
-// Returns { lines, engine } — engine is "gemini" or "mymemory", so the
-// caller/UI can tell the person which one actually produced the text (worth
-// knowing: MyMemory's phrasing is rougher than Gemini's and deserves a
-// closer review pass before it goes into a store submission).
+// Returns { lines, engine, warning } — engine is "gemini" or "mymemory", so
+// the caller/UI can tell the person which one actually produced the text
+// (worth knowing: MyMemory's phrasing is rougher than Gemini's and deserves
+// a closer review pass before it goes into a store submission). `warning`
+// is set when the translated block had to be trimmed to fit MAX_BLOCK_LEN
+// (see keepWithinBlockLimit) — translated text can run longer or shorter
+// than the English it came from, so this is checked independently of the
+// English side's own limit.
 async function translateBulletsToArabic(lines) {
+  let translatedLines = null;
+  let engine = null;
+
   if (aiService.isConfigured()) {
     try {
       const translated = await aiService.translateToArabic(lines);
       if (Array.isArray(translated) && translated.length === lines.length) {
-        return { lines: translated.map((t) => String(t || "").trim()).filter(Boolean), engine: "gemini" };
+        translatedLines = translated.map((t) => String(t || "").trim()).filter(Boolean);
+        engine = "gemini";
       }
-      // Malformed (wrong length) response — fall through to the free
+      // else: malformed (wrong length) response — fall through to the free
       // translator below rather than failing outright.
     } catch (e) {
       // AI call failed — fall through to the free translator below.
     }
   }
 
-  try {
-    const translated = await translateLinesFree(lines);
-    return { lines: translated.map((t) => String(t || "").trim()).filter(Boolean), engine: "mymemory" };
-  } catch (e) {
-    const err = new Error(`Couldn't translate automatically (${(e && e.message) || "unknown error"}) — enter the Arabic text manually.`);
-    err.status = 502;
-    throw err;
+  if (!translatedLines) {
+    try {
+      translatedLines = (await translateLinesFree(lines)).map((t) => String(t || "").trim()).filter(Boolean);
+      engine = "mymemory";
+    } catch (e) {
+      const err = new Error(`Couldn't translate automatically (${(e && e.message) || "unknown error"}) — enter the Arabic text manually.`);
+      err.status = 502;
+      throw err;
+    }
   }
+
+  const { kept, droppedCount } = keepWithinBlockLimit(translatedLines, MAX_BLOCK_LEN);
+  return { lines: kept, engine, warning: blockLimitWarning(droppedCount) };
 }
 
 module.exports = {
   MAX_BULLET_LEN,
+  MAX_BLOCK_LEN,
+  keepWithinBlockLimit,
   bulletFallbackLine,
   buildDraftItems,
   mapBulletResponse,
