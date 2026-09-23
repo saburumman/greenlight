@@ -419,8 +419,8 @@ router.post("/:id/mobile-release-note/translate-ar", asyncHandler(async (req, re
   }
 
   try {
-    const translatedLines = await mobileReleaseNoteLogic.translateBulletsToArabic(lines);
-    res.json({ ar: translatedLines.join("\n") });
+    const result = await mobileReleaseNoteLogic.translateBulletsToArabic(lines);
+    res.json({ ar: result.lines.join("\n"), engine: result.engine });
   } catch (e) {
     res.status(e.status || 502).json({ error: e.message });
   }

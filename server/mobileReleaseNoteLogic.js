@@ -14,12 +14,50 @@
 // Like releaseNotesLogic.js, AI (see aiService.js) is used only to draft or
 // translate text, never as the only path: drafting the English bullets
 // always has a rule-based fallback (bulletFallbackLine) if AI isn't
-// configured or fails. Arabic translation has no safe rule-based
-// equivalent, so routes/releases.js requires AI to be configured for that
-// step and surfaces a clear error otherwise (see translateBulletsToArabic).
+// configured or fails. Arabic translation prefers Gemini when
+// GEMINI_API_KEY is set (better phrasing, same as the rest of this app),
+// but always has a real fallback too — MyMemory's free, keyless translation
+// API (see translateLinesFree below) — so translation works out of the box
+// with no API key at all; see translateBulletsToArabic for the order this
+// tries things in.
 
 const aiService = require("./aiService");
 const releaseNotesLogic = require("./releaseNotesLogic");
+
+// MyMemory (https://mymemory.translated.net) — a free, keyless machine
+// translation API used only as the Arabic-translation fallback when Gemini
+// isn't configured (or fails). No account/API key required; the anonymous
+// tier is rate-limited (a few thousand words/day per IP) but more than
+// enough for a handful of release-note bullets. One request per line —
+// there's no batch endpoint — done sequentially since these bullet lists
+// are always short (a handful of lines) and this is a background action the
+// person already expects to wait a moment for.
+const FREE_TRANSLATE_URL = "https://api.mymemory.translated.net/get";
+
+async function translateLineFree(line) {
+  const url = `${FREE_TRANSLATE_URL}?${new URLSearchParams({ q: line, langpair: "en|ar" }).toString()}`;
+  let res;
+  try {
+    res = await fetch(url);
+  } catch (e) {
+    throw new Error(`couldn't reach the free translation service (${e.message})`);
+  }
+  if (!res.ok) throw new Error(`free translation service returned an error (${res.status})`);
+  const data = await res.json();
+  const text = data && data.responseData && data.responseData.translatedText;
+  if (!text || (data.responseStatus && Number(data.responseStatus) >= 400)) {
+    throw new Error("free translation service returned no usable text");
+  }
+  return String(text).trim();
+}
+
+async function translateLinesFree(lines) {
+  const out = [];
+  for (const line of lines) {
+    out.push(await translateLineFree(line));
+  }
+  return out;
+}
 
 const MAX_BULLET_LEN = 110;
 
@@ -115,23 +153,40 @@ async function draftEnglishBullets(release) {
   }
 }
 
-// The single seam for Arabic translation. Unlike draftEnglishBullets, this
-// throws (with a status) rather than silently falling back — there is no
-// safe rule-based translation, so the caller (routes/releases.js) surfaces
-// the failure directly and the person enters Arabic manually instead.
+// The single seam for Arabic translation. Tries Gemini first when
+// GEMINI_API_KEY is configured (better, more natural phrasing — same model
+// used everywhere else in this app); on any failure there — or when it
+// isn't configured at all — falls back to the free, keyless MyMemory API
+// above, so translation always produces something rather than requiring an
+// API key. Only throws (with a status) if BOTH paths fail, at which point
+// there's genuinely nothing to offer and the caller (routes/releases.js)
+// surfaces the failure so the person can enter Arabic manually instead.
+// Returns { lines, engine } — engine is "gemini" or "mymemory", so the
+// caller/UI can tell the person which one actually produced the text (worth
+// knowing: MyMemory's phrasing is rougher than Gemini's and deserves a
+// closer review pass before it goes into a store submission).
 async function translateBulletsToArabic(lines) {
-  if (!aiService.isConfigured()) {
-    const e = new Error("AI translation isn't configured on this server (GEMINI_API_KEY not set) — enter the Arabic text manually.");
-    e.status = 400;
-    throw e;
+  if (aiService.isConfigured()) {
+    try {
+      const translated = await aiService.translateToArabic(lines);
+      if (Array.isArray(translated) && translated.length === lines.length) {
+        return { lines: translated.map((t) => String(t || "").trim()).filter(Boolean), engine: "gemini" };
+      }
+      // Malformed (wrong length) response — fall through to the free
+      // translator below rather than failing outright.
+    } catch (e) {
+      // AI call failed — fall through to the free translator below.
+    }
   }
-  const translated = await aiService.translateToArabic(lines); // AIError propagates as-is (has .status) on failure
-  if (!Array.isArray(translated) || translated.length !== lines.length) {
-    const e = new Error("The AI translation response didn't match the number of English bullets — try again.");
-    e.status = 502;
-    throw e;
+
+  try {
+    const translated = await translateLinesFree(lines);
+    return { lines: translated.map((t) => String(t || "").trim()).filter(Boolean), engine: "mymemory" };
+  } catch (e) {
+    const err = new Error(`Couldn't translate automatically (${(e && e.message) || "unknown error"}) — enter the Arabic text manually.`);
+    err.status = 502;
+    throw err;
   }
-  return translated.map((t) => String(t || "").trim()).filter(Boolean);
 }
 
 module.exports = {

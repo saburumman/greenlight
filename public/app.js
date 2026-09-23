@@ -3435,7 +3435,9 @@ function handleTranslateMobileNoteAr(r){
       if(arTa) arTa.value = result.ar || "";
       state.mobileNoteDirty = true;
       updateMobileNoteStatus(r);
-      showToast("Translated — review before saving (machine-translated Arabic).");
+      showToast(result.engine==="gemini"
+        ? "Translated with AI — review before saving."
+        : "Translated with a free machine-translation service (no AI configured) — review carefully before saving, phrasing may be rougher than AI.");
     }).catch(function(e){
       setMobileNoteButtonBusy("translate-mobile-note-ar", false, "", iconSpark()+' Translate from English');
       showToast("Couldn't translate: "+e.message);
