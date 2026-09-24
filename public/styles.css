@@ -315,17 +315,17 @@ a{color:inherit;}
 .regression-view-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;}
 .regression-view-tabs .view-tab.active{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);}
 
-/* Compact regression module row: two tight lines (name+owner, then status
+/* Compact regression module row: two tight lines (name, then status
    pills+actions) instead of the old stacked title/status/notes block. Scoped
    to .regression-service-row specifically so bugs/blockers/tickets, which
-   also use the shared .item-row/.item-row-actions classes, are untouched. */
+   also use the shared .item-row/.item-row-actions classes, are untouched.
+   No owner control here — assignment is Entity-level only (see
+   .regression-owner-btn on the entity heading row below). */
 .item-row.regression-service-row{flex-direction:column;align-items:stretch;padding:9px 12px;gap:0;}
 .reg-row-top{display:flex;align-items:center;justify-content:space-between;gap:10px;}
 .reg-row-name{font-weight:700;font-size:13px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .reg-row-bottom{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:6px;flex-wrap:wrap;}
 .reg-row-actions{margin-left:auto;}
-.reg-row-owner-btn{font-size:11px;padding:3px 9px;gap:4px;}
-.reg-row-owner-btn svg{width:11px;height:11px;}
 .reg-row-notes{margin-top:6px;}
 @media (max-width:760px){
   .reg-row-top{flex-wrap:wrap;}

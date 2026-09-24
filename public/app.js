@@ -568,28 +568,15 @@ function regressionEntitySummaryLine(entity){
 }
 
 /* ---- Regression assignment ----
-   Entity-level owner (entity.owner, a plain string) already existed. Each
-   module (service) can now optionally override it with its own owner —
-   stored as service.owner, but only ever written by the assignment UI
-   below, and deliberately left *absent* (not even "") on every module that
-   has never been individually assigned:
-     - service.owner is undefined -> no override; inherits the Entity owner.
-     - service.owner === ""       -> explicit override to "nobody", even if
-                                      the Entity itself has an owner.
-     - service.owner === "Name"   -> explicit override to that person.
-   That three-way split is what lets "Use Entity owner" (remove the
-   override) behave differently from "Unassigned" (explicitly assign to no
-   one) in the assignment modal below — see openRegressionAssignModal.
-   Nothing here changes what a *release* stores regression as — this is
-   still the same per-release regression snapshot as always (see
-   regressionEntities above), just one more optional field per service. */
-function regressionHasExplicitOwner(service){
-  return !!(service && typeof service.owner === "string");
-}
-function regressionEffectiveOwner(entity, service){
-  if(regressionHasExplicitOwner(service)) return service.owner;
-  return (entity && entity.owner) || "";
-}
+   Entity-level owner only (entity.owner, a plain string) — who's covering
+   this Entity's regression, for this release only. There is no per-module
+   (service) override: every module under an Entity simply follows that
+   Entity's owner. (An earlier iteration allowed an individual module to
+   override its Entity's owner via service.owner; that's been removed per
+   explicit request to keep assignment at the Entity level only. A release
+   saved during that window may still have stray service.owner values lying
+   around — they're just inert now, never read or written by anything
+   below.) */
 // Names offered in an assignment dropdown — reuses the existing "Know the
 // Team" directory (allTeamMembers) rather than a new hardcoded list, so
 // whoever's on the team there is exactly who shows up here — narrowed to
@@ -600,42 +587,26 @@ function regressionEffectiveOwner(entity, service){
 function regressionOwnerOptions(){
   return allTeamMembers().filter(function(m){ return m.regression!==false; }).map(function(m){return m.name;}).filter(Boolean);
 }
-// True when `owner` (an *effective* owner string) belongs to whoever's
-// currently working (see currentPreparerName) — the basis for "My
-// Regression". Case-insensitive, same tolerance as groupRegressionByOwner.
+// True when `owner` belongs to whoever's currently working (see
+// currentPreparerName) — the basis for "My Regression". Case-insensitive,
+// same tolerance as groupRegressionByOwner.
 function regressionOwnerIsMe(owner){
   var me = currentPreparerName().trim().toLowerCase();
   if(!me) return false;
   return (owner||"").trim().toLowerCase() === me;
 }
 // Narrows a list of entities (as regressionEntities() returns them) down to
-// what a view should show, filtering at the *module* level so an Entity
-// whose owner matches still only shows the modules that actually resolve to
-// that owner (an individually-overridden module keeps its own answer). An
-// entity left with zero modules after filtering is dropped entirely rather
-// than rendered empty. The objects returned share the same underlying
-// entity/service references as the input (shallow-copied wrappers only) —
-// every action handler re-looks-up its target from the unfiltered release
-// data by id anyway, so this is purely a display-time narrowing and never
-// affects what gets saved.
+// what a view should show. Filtering is at the *Entity* level (assignment
+// lives only on entity.owner now) — "Mine" keeps entities I own, in full;
+// "Unassigned" keeps entities with no owner, in full. Every action handler
+// re-looks-up its target from the unfiltered release data by id anyway, so
+// this is purely a display-time narrowing and never affects what gets saved.
 function filterRegressionEntitiesForView(entities, view){
   if(view!=="Mine" && view!=="Unassigned") return entities;
-  var out = [];
-  entities.forEach(function(entity){
-    var services = (entity.services||[]).filter(function(s){
-      if(view==="Mine") return regressionOwnerIsMe(regressionEffectiveOwner(entity, s));
-      // Unassigned: no explicit module owner AND no Entity owner — an
-      // explicit "Unassigned" override on a module with an owned Entity is
-      // a deliberate choice, not an oversight, so it's left out of here.
-      return !regressionHasExplicitOwner(s) && !(entity.owner||"").trim();
-    });
-    if(services.length){
-      var copy = {}; for(var k in entity) copy[k]=entity[k];
-      copy.services = services;
-      out.push(copy);
-    }
+  return entities.filter(function(entity){
+    var owner = (entity.owner||"").trim();
+    return view==="Mine" ? regressionOwnerIsMe(owner) : !owner;
   });
-  return out;
 }
 
 /* ============================================================
@@ -2465,22 +2436,17 @@ function regressionStatusButtons(entityId, s){
       '<label for="'+inputId+'" class="tone-'+toneForStatus(opt)+'">'+esc(opt)+'</label>';
   }).join("")+'</div>';
 }
-// Compact horizontal card for one module: name + effective owner on the
-// first line, status pills + the existing notes ("comment") button on the
-// second. `entity` is passed through so the owner badge and status buttons
-// can carry the entity id they need (edit-module-owner/set-regression-status
-// both re-look-up their real target by id — see the click delegation switch
-// — so this render never needs to be a live reference itself).
+// Compact horizontal card for one module: name on the first line, status
+// pills + the existing notes ("comment") button on the second. No owner
+// control here — assignment lives on the Entity only (see the heading row
+// in renderRegressionEntityGroup below); `entity` is passed through purely
+// so set-regression-status/edit-regression-notes can carry the entity id
+// they need (both re-look-up their real target by id — see the click
+// delegation switch — so this render never needs to be a live reference).
 function renderRegressionServiceRow(entity, s){
-  var effOwner = regressionEffectiveOwner(entity, s);
-  var explicit = regressionHasExplicitOwner(s);
-  var ownerTitle = explicit
-    ? (effOwner? "Explicitly assigned — click to change" : "Explicitly set to Unassigned — click to change")
-    : (effOwner? "Inherited from "+(entity.name||"the entity")+" — click to override" : "Click to assign");
   return '<div class="item-row regression-service-row'+(s.status==='FAIL'?' is-flagged':'')+'">'+
     '<div class="reg-row-top">'+
       '<div class="reg-row-name">'+esc(s.name||"Unnamed service")+'</div>'+
-      '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn reg-row-owner-btn'+(effOwner?" has-owner":"")+(explicit?" is-explicit":"")+'" data-action="edit-module-owner" data-entity-id="'+entity.id+'" data-id="'+s.id+'" title="'+escAttr(ownerTitle)+'">'+iconUser()+' '+(effOwner? esc(effOwner) : "Unassigned")+'</button>'+
     '</div>'+
     '<div class="reg-row-bottom">'+
       regressionStatusButtons(entity.id, s)+
@@ -2528,10 +2494,11 @@ function sectionRegression(r){
   var skipped = !!r.regressionSkipped;
   var entities = regressionEntities(r);
   var overall = regressionOverallStatus(r);
-  // The three views (All/My Regression/Unassigned) narrow which *modules*
-  // render — regressionStatLine/the overall pill above still reflect the
-  // whole release regardless of view, same as Group By already only ever
-  // changed layout, never what counted toward the release's own status.
+  // The three views (All/My Regression/Unassigned) narrow which *entities*
+  // render, by entity.owner — regressionStatLine/the overall pill above
+  // still reflect the whole release regardless of view, same as Group By
+  // already only ever changed layout, never what counted toward the
+  // release's own status.
   var viewEntities = filterRegressionEntitiesForView(entities, state.regressionView);
   var groupsHtml;
   if(state.regressionGroupBy === "Owner"){
@@ -2553,8 +2520,8 @@ function sectionRegression(r){
     listOrEmpty = '<div class="empty-row">No regression modules on this release yet. Click “Sync Modules” to pull in your entity/service list (or “Manage Modules” to set one up first).</div>';
   } else if(!viewEntities.length){
     listOrEmpty = '<div class="empty-row">'+(state.regressionView==="Mine"
-      ? "No regression modules are assigned to you yet."
-      : "Every regression module has an owner, directly or via its Entity.")+'</div>';
+      ? "No entities are assigned to you yet."
+      : "Every entity has an owner.")+'</div>';
   } else {
     listOrEmpty = '<div class="regression-entity-list">'+groupsHtml+'</div>';
   }
@@ -3189,145 +3156,78 @@ function openRegressionNotesModal(r, entity, existing){
   });
 }
 
-// Entity- or module-level "who's covering this" — one modal for both,
-// since they're the same choice with one extra option (a module can also
-// say "Use Entity owner" to drop its own override and go back to
-// inheriting). Reuses statusChoiceGroup (the same pill-radio list the
-// status buttons use, just without status-tone coloring) rather than a new
-// widget, and the names offered come straight from Know the Team
-// (regressionOwnerOptions) — assigning someone here never requires typing
-// a name by hand or adding a new "assignee" concept to the app.
+// Entity-level "who's covering this" — the only level assignment happens
+// at. Reuses statusChoiceGroup (the same pill-radio list the status buttons
+// use, just without status-tone coloring) rather than a new widget, and the
+// names offered come straight from Know the Team (regressionOwnerOptions) —
+// assigning someone here never requires typing a name by hand or adding a
+// new "assignee" concept to the app.
 //
-// `service` is omitted for an entity-level assignment. For a module
-// (service given), the write target still has to account for a legacy
-// (pre-Entities/Services) row: regressionEntities() wraps one of those as a
-// synthetic single-service entity whose "service" is a disconnected display
-// copy — entity._legacy is the real underlying row in that case, for
-// *either* level, since a legacy row has no separate entity/module split.
-function openRegressionAssignModal(r, entity, service){
-  var isModule = !!service;
+// The write target has to account for a legacy (pre-Entities/Services) row:
+// regressionEntities() wraps one of those as a synthetic single-service
+// entity, and entity._legacy is the real underlying row in that case.
+function openRegressionAssignModal(r, entity){
   var names = regressionOwnerOptions();
-  var INHERIT = "Use Entity owner", UNASSIGNED = "Unassigned";
-  var current, options, title, subtitle;
-  if(isModule){
-    current = regressionHasExplicitOwner(service) ? (service.owner || UNASSIGNED) : INHERIT;
-    options = names.concat([UNASSIGNED, INHERIT]);
-    title = (entity.name?entity.name+" — ":"")+(service.name||"module");
-    subtitle = regressionHasExplicitOwner(service)
-      ? "This module currently overrides its Entity's owner."
-      : "This module is currently inheriting its Entity's owner ("+((entity.owner||"").trim()||"Unassigned")+"). Choosing a name below overrides it just for this module.";
-  } else {
-    current = (entity.owner||"").trim() || UNASSIGNED;
-    options = names.concat([UNASSIGNED]);
-    title = entity.name||"Unnamed entity";
-    subtitle = "Sets the default owner for every module in this entity that doesn't have its own individual override.";
-  }
+  var UNASSIGNED = "Unassigned";
+  var current = (entity.owner||"").trim() || UNASSIGNED;
+  var options = names.concat([UNASSIGNED]);
+  var title = entity.name||"Unnamed entity";
+  var subtitle = "Sets the owner for every module in this entity's regression.";
   var body =
     '<div class="regmod-edit-name">'+esc(title)+'</div>'+
     '<p class="helper-text" style="margin:2px 0 10px;">'+esc(subtitle)+'</p>'+
     (names.length ? statusChoiceGroup("reg-owner-choice", options, current, true)
       : '<p class="helper-text" style="margin:0;">No one is in <b>Know the Team</b> yet — add people there first, or choose Unassigned below.</p>'+statusChoiceGroup("reg-owner-choice", options, current, true));
   var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">Assign</button>';
-  openModal(modalShell(isModule ? "Assign module" : "Assign Entity regression", body, foot));
+  openModal(modalShell("Assign Entity regression", body, foot));
   qs("#modal-form").addEventListener("submit", function(e){
     e.preventDefault();
     var checked = qs('input[name="reg-owner-choice"]:checked');
     var picked = checked ? checked.value : current;
-    var legacyTarget = entity._legacy || null;
-
-    if(isModule){
-      var target = legacyTarget || service;
-      var label = (entity.name?entity.name+" – ":"")+(service.name||"Unnamed module");
-      var action, details;
-      if(picked===INHERIT){
-        delete target.owner;
-        action = "REGRESSION_UNASSIGNED";
-        details = "Reverted to Entity owner — "+label;
-      } else if(picked===UNASSIGNED){
-        target.owner = "";
-        action = "REGRESSION_UNASSIGNED";
-        details = "Removed assignment from "+label;
-      } else {
-        target.owner = picked;
-        action = "REGRESSION_ASSIGNED";
-        details = "Assigned "+label+" to "+picked;
-      }
-      closeModal();
-      persistRelease(r, function(){
-        logAudit({action:action, entityType:"Regression", entityId: service.id, details: details});
-      });
-    } else {
-      var target2 = legacyTarget || entity;
-      var newOwner = picked===UNASSIGNED ? "" : picked;
-      target2.owner = newOwner;
-      closeModal();
-      var label2 = entity.name||"Unnamed entity";
-      persistRelease(r, function(){
-        var action2 = newOwner ? "ENTITY_REGRESSION_ASSIGNED" : "REGRESSION_UNASSIGNED";
-        var details2 = newOwner ? "Assigned "+label2+" regression to "+newOwner : "Removed assignment from "+label2+" regression";
-        logAudit({action:action2, entityType:"Regression", entityId: entity.id, details: details2});
-      });
-    }
+    var target = entity._legacy || entity;
+    var newOwner = picked===UNASSIGNED ? "" : picked;
+    target.owner = newOwner;
+    closeModal();
+    var label = entity.name||"Unnamed entity";
+    persistRelease(r, function(){
+      var action = newOwner ? "ENTITY_REGRESSION_ASSIGNED" : "REGRESSION_UNASSIGNED";
+      var details = newOwner ? "Assigned "+label+" regression to "+newOwner : "Removed assignment from "+label+" regression";
+      logAudit({action:action, entityType:"Regression", entityId: entity.id, details: details});
+    });
   });
 }
 
-// "Assign Regression" — the bulk workflow: assign several Entities (or
-// several individual modules) to owners in one save. Same underlying write
-// as openRegressionAssignModal above (still just entity.owner / a service's
-// owner, still one persistRelease at the end), just applied to many rows at
-// once from a table of <select>s instead of one radio list per row — a
-// plain <select> reads faster in a scan-and-click bulk table than a full
-// radio group per row would, but the *choice itself* mirrors the same three
-// states as the single-item modal above (a name, Unassigned, or — for
-// modules — Use Entity owner). Only rows that actually changed get an
-// audit entry or a write; picking the same value a row already had is a
-// no-op, same as never having opened the dropdown.
+// "Assign Regression" — the bulk workflow: assign several Entities to
+// owners in one save. Same underlying write as openRegressionAssignModal
+// above (still just entity.owner, still one persistRelease at the end),
+// just applied to many rows at once from a table of <select>s instead of
+// one radio list per row. Only rows that actually changed get an audit
+// entry or a write; picking the same value a row already had is a no-op,
+// same as never having opened the dropdown.
 function openBulkAssignRegressionModal(r){
   var entities = regressionEntities(r);
   if(!entities.length){ showToast("No regression modules on this release yet."); return; }
   var names = regressionOwnerOptions();
-  var UNASSIGNED_VAL = "__unassigned__", INHERIT_VAL = "__inherit__";
+  var UNASSIGNED_VAL = "__unassigned__";
 
   var body =
-    '<div class="field"><label>Assignment level</label>'+statusChoiceGroup("bulk-assign-level", ["Entity","Individual modules"], "Entity", true)+'</div>'+
     (names.length ? '' : '<p class="helper-text">No one is in <b>Know the Team</b> yet — add people there first to assign by name, or use Unassigned below.</p>')+
     '<div id="bulk-assign-rows"></div>';
   var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">'+iconSave()+' Save</button>';
   openModal(modalShell("Assign Regression", body, foot), {wide:true});
   var rowsEl = qs("#bulk-assign-rows");
 
-  function selectOptionsHtml(currentVal, withInherit){
+  function selectOptionsHtml(currentVal){
     var opts = [];
-    if(withInherit) opts.push('<option value="'+INHERIT_VAL+'"'+(currentVal===null?" selected":"")+'>Use Entity owner</option>');
     opts.push('<option value="'+UNASSIGNED_VAL+'"'+(currentVal===""?" selected":"")+'>Unassigned</option>');
     names.forEach(function(n){ opts.push('<option value="'+escAttr(n)+'"'+(currentVal===n?" selected":"")+'>'+esc(n)+'</option>'); });
     return opts.join("");
   }
-  function renderEntityRows(){
-    rowsEl.innerHTML = '<div class="bulk-assign-table">'+entities.map(function(ent){
-      var cur = (ent.owner||"").trim();
-      return '<div class="bulk-assign-row"><div class="bulk-assign-label">'+esc(ent.name||"Unnamed entity")+'</div>'+
-        '<select class="bulk-assign-select" data-kind="entity" data-entity-id="'+ent.id+'">'+selectOptionsHtml(cur, false)+'</select></div>';
-    }).join("")+'</div>';
-  }
-  function renderModuleRows(){
-    var rows = [];
-    entities.forEach(function(ent){
-      (ent.services||[]).forEach(function(s){
-        var cur = regressionHasExplicitOwner(s) ? (s.owner||"") : null;
-        rows.push('<div class="bulk-assign-row"><div class="bulk-assign-label">'+esc(ent.name||"")+' — '+esc(s.name||"Unnamed module")+'</div>'+
-          '<select class="bulk-assign-select" data-kind="module" data-entity-id="'+ent.id+'" data-id="'+s.id+'">'+selectOptionsHtml(cur, true)+'</select></div>');
-      });
-    });
-    rowsEl.innerHTML = rows.length ? '<div class="bulk-assign-table">'+rows.join("")+'</div>' : '<div class="empty-row">No modules to assign individually.</div>';
-  }
-  renderEntityRows();
-
-  qs("#modal-form").addEventListener("change", function(e){
-    if(e.target && e.target.name==="bulk-assign-level"){
-      if(e.target.value==="Individual modules") renderModuleRows(); else renderEntityRows();
-    }
-  });
+  rowsEl.innerHTML = '<div class="bulk-assign-table">'+entities.map(function(ent){
+    var cur = (ent.owner||"").trim();
+    return '<div class="bulk-assign-row"><div class="bulk-assign-label">'+esc(ent.name||"Unnamed entity")+'</div>'+
+      '<select class="bulk-assign-select" data-entity-id="'+ent.id+'">'+selectOptionsHtml(cur)+'</select></div>';
+  }).join("")+'</div>';
 
   qs("#modal-form").addEventListener("submit", function(e){
     e.preventDefault();
@@ -3336,32 +3236,13 @@ function openBulkAssignRegressionModal(r){
       var val = sel.value;
       var ent = entities.find(function(x){return x.id===sel.getAttribute("data-entity-id");});
       if(!ent) return;
-      if(sel.getAttribute("data-kind")==="entity"){
-        var newOwner = val===UNASSIGNED_VAL ? "" : val;
-        var oldOwner = (ent.owner||"").trim();
-        if(newOwner===oldOwner) return;
-        var target = ent._legacy || ent;
-        target.owner = newOwner;
-        changes.push({action: newOwner ? "ENTITY_REGRESSION_ASSIGNED" : "REGRESSION_UNASSIGNED", entityId: ent.id,
-          details: newOwner ? "Assigned "+(ent.name||"entity")+" regression to "+newOwner : "Removed assignment from "+(ent.name||"entity")+" regression"});
-      } else {
-        var svc = (ent.services||[]).find(function(x){return x.id===sel.getAttribute("data-id");});
-        if(!svc) return;
-        var oldVal = regressionHasExplicitOwner(svc) ? (svc.owner||"") : null;
-        var label = (ent.name?ent.name+" – ":"")+(svc.name||"module");
-        var target2 = ent._legacy || svc;
-        if(val===INHERIT_VAL){
-          if(oldVal===null) return;
-          delete target2.owner;
-          changes.push({action:"REGRESSION_UNASSIGNED", entityId: svc.id, details:"Reverted to Entity owner — "+label});
-        } else {
-          var newOwner2 = val===UNASSIGNED_VAL ? "" : val;
-          if(oldVal===newOwner2) return;
-          target2.owner = newOwner2;
-          changes.push({action: newOwner2 ? "REGRESSION_ASSIGNED" : "REGRESSION_UNASSIGNED", entityId: svc.id,
-            details: newOwner2 ? "Assigned "+label+" to "+newOwner2 : "Removed assignment from "+label});
-        }
-      }
+      var newOwner = val===UNASSIGNED_VAL ? "" : val;
+      var oldOwner = (ent.owner||"").trim();
+      if(newOwner===oldOwner) return;
+      var target = ent._legacy || ent;
+      target.owner = newOwner;
+      changes.push({action: newOwner ? "ENTITY_REGRESSION_ASSIGNED" : "REGRESSION_UNASSIGNED", entityId: ent.id,
+        details: newOwner ? "Assigned "+(ent.name||"entity")+" regression to "+newOwner : "Removed assignment from "+(ent.name||"entity")+" regression"});
     });
     if(!changes.length){ closeModal(); return; }
     closeModal();
@@ -3996,13 +3877,6 @@ document.addEventListener("click", function(e){
       if(r){
         var entOwner = regressionEntities(r).find(function(x){return x.id===entityId;});
         if(entOwner) openRegressionAssignModal(r, entOwner);
-      }
-      break;
-    case "edit-module-owner":
-      if(r){
-        var entMod = regressionEntities(r).find(function(x){return x.id===entityId;});
-        var svcMod = entMod && (entMod.services||[]).find(function(x){return x.id===id;});
-        if(entMod && svcMod) openRegressionAssignModal(r, entMod, svcMod);
       }
       break;
     case "open-assign-regression": if(r) openBulkAssignRegressionModal(r); break;
