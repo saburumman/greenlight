@@ -64,7 +64,14 @@ function validateAndClean(body) {
       return { error: "Photo is too large — please use a smaller image." };
     }
   }
-  return { clean: { name, role, department, bio, specialties, tools, linkedin, github, photo } };
+  // Whether this person should appear in the Regression section's
+  // assignment dropdowns. Client always sends an explicit true/false from
+  // its toggle; a record saved before this field existed simply has no
+  // `regression` key at all, and the client treats that missing key as
+  // eligible (true) for backward compatibility — see regressionOwnerOptions()
+  // in public/app.js.
+  const regression = !!(body && body.regression);
+  return { clean: { name, role, department, bio, specialties, tools, linkedin, github, photo, regression } };
 }
 
 router.get("/", asyncHandler(async (req, res) => {

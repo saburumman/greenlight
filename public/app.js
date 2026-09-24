@@ -592,9 +592,13 @@ function regressionEffectiveOwner(entity, service){
 }
 // Names offered in an assignment dropdown — reuses the existing "Know the
 // Team" directory (allTeamMembers) rather than a new hardcoded list, so
-// whoever's on the team there is exactly who shows up here.
+// whoever's on the team there is exactly who shows up here — narrowed to
+// members with their "Available for regression assignment" toggle on.
+// `m.regression !== false` (rather than `=== true`) so a team member saved
+// before this toggle existed, with no `regression` key at all, still counts
+// as eligible instead of silently vanishing from every assign dropdown.
 function regressionOwnerOptions(){
-  return allTeamMembers().map(function(m){return m.name;}).filter(Boolean);
+  return allTeamMembers().filter(function(m){ return m.regression!==false; }).map(function(m){return m.name;}).filter(Boolean);
 }
 // True when `owner` (an *effective* owner string) belongs to whoever's
 // currently working (see currentPreparerName) — the basis for "My
@@ -1314,7 +1318,7 @@ function teamMemberCardHtml(m){
     '</div>'+
     '<div class="team-avatar'+(m.photo?" has-photo":"")+'">'+avatar+'</div>'+
     '<div class="team-card-name">'+esc(m.name)+(m.seeded?' <span class="badge badge-manual">Example</span>':'')+'</div>'+
-    '<div class="team-card-role">'+esc(m.role||"")+'</div>'+
+    '<div class="team-card-role">'+esc(m.role||"")+(m.regression===false?' <span class="hint">· not in Regression assign list</span>':'')+'</div>'+
     (m.bio ? '<p class="team-card-bio">'+esc(m.bio)+'</p>' : '')+
     (specialtiesHtml ? '<div class="team-card-chips">'+specialtiesHtml+'</div>' : '')+
     (toolsHtml ? '<div class="team-card-chips">'+toolsHtml+'</div>' : '')+
@@ -1400,8 +1404,11 @@ function readAndResizePhoto(file){
 function openTeamMemberModal(existing){
   var isEdit = !!existing;
   var draft = existing
-    ? {name:existing.name, role:existing.role||"", department:existing.department||"", bio:existing.bio||"", specialties:(existing.specialties||[]).slice(), tools:(existing.tools||[]).slice(), linkedin:existing.linkedin||"", github:existing.github||"", photo:existing.photo||""}
-    : {name:"", role:"", department:"", bio:"", specialties:[], tools:[], linkedin:"", github:"", photo:""};
+    // A record saved before the Regression toggle existed has no `regression`
+    // key at all — treat that as eligible (checked) so nobody who was already
+    // usable as a regression assignee silently disappears from the list.
+    ? {name:existing.name, role:existing.role||"", department:existing.department||"", bio:existing.bio||"", specialties:(existing.specialties||[]).slice(), tools:(existing.tools||[]).slice(), linkedin:existing.linkedin||"", github:existing.github||"", photo:existing.photo||"", regression: existing.regression!==false}
+    : {name:"", role:"", department:"", bio:"", specialties:[], tools:[], linkedin:"", github:"", photo:"", regression:true};
   var pendingPhoto = draft.photo; // updated in place as the file input changes; submitted as-is
   var departmentOptions = distinct(allTeamMembers().map(function(m){return m.department;}));
 
@@ -1427,6 +1434,10 @@ function openTeamMemberModal(existing){
     '<div class="field-row">'+
       '<div class="field"><label for="f-team-linkedin">LinkedIn <span class="hint">(optional)</span></label><input type="url" id="f-team-linkedin" value="'+escAttr(draft.linkedin)+'" placeholder="https://linkedin.com/in/…"></div>'+
       '<div class="field"><label for="f-team-github">GitHub <span class="hint">(optional)</span></label><input type="url" id="f-team-github" value="'+escAttr(draft.github)+'" placeholder="https://github.com/…"></div>'+
+    '</div>'+
+    '<div class="field">'+
+      '<span class="regression-skip-toggle">Available for regression assignment'+toggleSwitch("team-regression", draft.regression, "Show this person in the Regression section's assignment dropdowns")+'</span>'+
+      '<span class="hint" style="display:block;margin-top:4px;">Off = hidden from the Regression section\'s assign lists (still visible here in Know the Team).</span>'+
     '</div>';
   var foot = (isEdit? '<button type="button" class="btn btn-danger" id="del-team-member">'+iconTrash()+' Delete</button>' : '<span></span>')+
     '<span style="flex:1"></span><button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">'+(isEdit?"Save changes":"Save")+'</button>';
@@ -1470,7 +1481,8 @@ function openTeamMemberModal(existing){
       tools: splitCommaList(qs("#f-team-tools").value),
       linkedin: qs("#f-team-linkedin").value.trim(),
       github: qs("#f-team-github").value.trim(),
-      photo: pendingPhoto
+      photo: pendingPhoto,
+      regression: !!(qs("#toggle-team-regression") && qs("#toggle-team-regression").checked)
     };
     var submitBtn = qs('#modal-form button[type="submit"]');
     if(submitBtn) submitBtn.disabled = true;
