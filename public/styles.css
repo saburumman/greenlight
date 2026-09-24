@@ -303,6 +303,48 @@ a{color:inherit;}
 .regression-owner-group-count{color:var(--ink-faint);font-weight:600;font-size:12px;}
 .regression-owner-group .regression-entity-group + .regression-entity-group{margin-top:20px;}
 
+/* Entity heading: name + compact summary stacked on the left, the owner
+   control on the right (unchanged position/behavior from before — still
+   the same button, still opens the same kind of modal, just now a
+   dropdown-style pick list instead of free text). */
+.regression-entity-heading-main{min-width:0;}
+.regression-entity-summary{font-size:11.5px;color:var(--ink-faint);font-weight:600;margin-top:2px;}
+
+/* View tabs (All / My Regression / Unassigned) — small plain buttons, not a
+   new tab component; .active just mirrors how a checked status pill looks. */
+.regression-view-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;}
+.regression-view-tabs .view-tab.active{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);}
+
+/* Compact regression module row: two tight lines (name+owner, then status
+   pills+actions) instead of the old stacked title/status/notes block. Scoped
+   to .regression-service-row specifically so bugs/blockers/tickets, which
+   also use the shared .item-row/.item-row-actions classes, are untouched. */
+.item-row.regression-service-row{flex-direction:column;align-items:stretch;padding:9px 12px;gap:0;}
+.reg-row-top{display:flex;align-items:center;justify-content:space-between;gap:10px;}
+.reg-row-name{font-weight:700;font-size:13px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.reg-row-bottom{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:6px;flex-wrap:wrap;}
+.reg-row-actions{margin-left:auto;}
+.reg-row-owner-btn{font-size:11px;padding:3px 9px;gap:4px;}
+.reg-row-owner-btn svg{width:11px;height:11px;}
+.reg-row-notes{margin-top:6px;}
+@media (max-width:760px){
+  .reg-row-top{flex-wrap:wrap;}
+  .reg-row-name{white-space:normal;}
+  .reg-row-bottom{justify-content:flex-start;}
+  .reg-row-actions{margin-left:0;}
+}
+
+/* Assign Regression (bulk) modal: one row per Entity or per module, a label
+   plus a native <select> — deliberately plain, no new table component. */
+.bulk-assign-table{display:flex;flex-direction:column;gap:8px;max-height:44vh;overflow-y:auto;padding-right:2px;}
+.bulk-assign-row{display:flex;align-items:center;justify-content:space-between;gap:10px;border:1px solid var(--border);border-radius:8px;padding:8px 10px;}
+.bulk-assign-label{font-size:12.5px;font-weight:600;color:var(--ink-soft);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.bulk-assign-select{border:1px solid var(--border-strong);border-radius:7px;padding:6px 9px;font-size:12.5px;font-family:inherit;background:var(--surface);color:var(--ink);flex-shrink:0;min-width:160px;}
+@media (max-width:520px){
+  .bulk-assign-row{flex-direction:column;align-items:stretch;}
+  .bulk-assign-select{min-width:0;}
+}
+
 /* Manage Regression Modules modal: editable entity cards with services */
 .regmod-entity-list{display:flex;flex-direction:column;gap:14px;}
 .regmod-entity-card{border:1px solid var(--border);border-radius:var(--radius-md);padding:12px;background:var(--surface-alt);}
