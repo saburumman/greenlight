@@ -14,7 +14,7 @@ var SEC_STATUSES = ["PASS","WARNING","FAIL"];
 var PLATFORM_LABELS = {web:"Web", android:"Android", ios:"iOS"};
 var TICKET_BUCKETS = ["Open / To Do","In QA","Blocked","Completed"];
 var TICKET_STATUS_OPTIONS = ["Open / To Do","In Progress","In QA","Blocked","Completed"];
-var TICKET_GROUP_MODES = ["None","Status","Priority","Issue Type"];
+var TICKET_GROUP_MODES = ["QA Assignee","None","Status","Priority","Issue Type"];
 var REGRESSION_GROUP_MODES = ["Entity","Owner"];
 
 function toneForStatus(s){
@@ -248,7 +248,7 @@ var state = {
   jiraStatus: {connected:false},
   notesDirty: false,
   mobileNoteDirty: false, // unsaved-edit flag for the Mobile Release Note textareas — same pattern as notesDirty above
-  ticketGroupBy: "None",
+  ticketGroupBy: "QA Assignee", // default grouping for the Tickets section — see groupTickets
   ticketCollapsed: {}, // groupKey -> true if collapsed
   regressionGroupBy: "Entity", // "Entity" (default list) or "Owner" (bucketed by assignee, see sectionRegression)
   regressionView: "All", // "All" | "Mine" | "Unassigned" — see filterRegressionEntitiesForView
@@ -1203,6 +1203,8 @@ var AUDIT_ACTION_LABELS = {
   RELEASE_UPDATED: "Updated Release Info",
   TICKET_ADDED: "Added Ticket",
   TICKET_UPDATED: "Updated Ticket",
+  TICKET_QA_ASSIGNED: "Assigned Ticket QA Owner",
+  TICKET_QA_UNASSIGNED: "Unassigned Ticket QA Owner",
   JIRA_SYNCED: "Synced Jira",
   REGRESSION_UPDATED: "Updated Regression",
   REGRESSION_ASSIGNED: "Assigned Regression",
@@ -2338,14 +2340,23 @@ function priorityRank(p){
   var key = String(p||"").toLowerCase();
   return order.hasOwnProperty(key) ? order[key] : 50;
 }
+// Names offered for a ticket's QA Assignee — the full Know the Team roster.
+// Deliberately NOT narrowed by Regression's "Available for regression
+// assignment" toggle: QA ownership of a ticket is a separate concept from
+// covering an Entity's regression, so someone can be eligible for one and
+// not the other.
+function ticketAssigneeOptions(){
+  return allTeamMembers().map(function(m){return m.name;}).filter(Boolean);
+}
 function groupTickets(tickets, mode){
   if(mode==="None"){
     return [{key:"__all__", label:"All Tickets", items:tickets.slice()}];
   }
-  var field = mode==="Status" ? "bucket" : mode==="Priority" ? "priority" : "issueType";
+  var field = mode==="Status" ? "bucket" : mode==="Priority" ? "priority" : mode==="QA Assignee" ? "qaAssignee" : "issueType";
+  var fallback = mode==="QA Assignee" ? "Unassigned" : "Not provided";
   var buckets = {};
   tickets.forEach(function(t){
-    var v = t[field] || "Not provided";
+    var v = (t[field]||"").toString().trim() || fallback;
     if(!buckets[v]) buckets[v] = [];
     buckets[v].push(t);
   });
@@ -2354,6 +2365,13 @@ function groupTickets(tickets, mode){
     keys.sort(function(a,b){ return TICKET_BUCKETS.indexOf(a) - TICKET_BUCKETS.indexOf(b); });
   } else if(mode==="Priority"){
     keys.sort(function(a,b){ var d = priorityRank(a)-priorityRank(b); return d!==0? d : a.localeCompare(b); });
+  } else if(mode==="QA Assignee"){
+    // Alphabetical by assignee, with the Unassigned bucket always last.
+    keys.sort(function(a,b){
+      if(a==="Unassigned" && b!=="Unassigned") return 1;
+      if(b==="Unassigned" && a!=="Unassigned") return -1;
+      return a.localeCompare(b);
+    });
   } else {
     keys.sort(function(a,b){ return a.localeCompare(b); });
   }
@@ -2381,6 +2399,7 @@ function sectionTickets(r){
           '<span class="badge">'+esc(t.issueType||"Not provided")+'</span>'+
           '<span class="badge '+(t.source==="Jira"?"badge-jira":"badge-manual")+'">'+esc(t.source||"Manual")+'</span>'+
         '</span>'+
+        '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn'+(t.qaAssignee?" has-owner":"")+'" data-action="edit-ticket-assignee" data-key="'+escAttr(t.key)+'" title="'+(t.qaAssignee?"Change QA assignee":"Assign a QA owner")+'">'+iconUser()+' '+(t.qaAssignee? esc(t.qaAssignee) : "Unassigned")+'</button>'+
         '<a class="ticket-open-link" href="'+escAttr(t.url||"#")+'" target="_blank" rel="noopener noreferrer">Open '+iconLink()+'</a>'+
         '<span class="ticket-actions">'+
           '<button class="btn btn-sm btn-icon" data-action="edit-ticket" data-key="'+escAttr(t.key)+'" aria-label="Edit ticket">'+iconEdit()+'</button>'+
@@ -3124,6 +3143,41 @@ function openEditTicketModal(r, ticket){
     closeModal();
     persistRelease(r, function(){
       logAudit({action:"TICKET_UPDATED", entityType:"Ticket", entityId: ticket.key, details: ticket.title || "Untitled"});
+    });
+  });
+}
+
+// QA Assignee for one ticket — same pill-radio pattern as Regression's
+// Entity-assign modal (statusChoiceGroup, a name / Unassigned choice),
+// sourced from ticketAssigneeOptions (the full Know the Team roster). A
+// Jira re-sync never touches qaAssignee: it isn't one of the fields Jira
+// supplies (see jiraClient.fieldsToTicket), so the server's upsert merge
+// (routes/releases.js#upsertTicket spreads the incoming Jira fields over
+// the prior stored ticket) leaves whatever was already assigned here
+// completely untouched — no special "preserve on sync" code needed.
+function openTicketAssigneeModal(r, ticket){
+  var names = ticketAssigneeOptions();
+  var UNASSIGNED = "Unassigned";
+  var current = (ticket.qaAssignee||"").trim() || UNASSIGNED;
+  var options = names.concat([UNASSIGNED]);
+  var body =
+    '<div class="regmod-edit-name">'+esc(ticket.key)+' — '+esc(ticket.title||"Untitled")+'</div>'+
+    (names.length ? statusChoiceGroup("ticket-assignee-choice", options, current, true)
+      : '<p class="helper-text" style="margin:0;">No one is in <b>Know the Team</b> yet — add people there first, or choose Unassigned below.</p>'+statusChoiceGroup("ticket-assignee-choice", options, current, true));
+  var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">Assign</button>';
+  openModal(modalShell("Assign QA owner", body, foot));
+  qs("#modal-form").addEventListener("submit", function(e){
+    e.preventDefault();
+    var checked = qs('input[name="ticket-assignee-choice"]:checked');
+    var picked = checked ? checked.value : current;
+    var newOwner = picked===UNASSIGNED ? "" : picked;
+    ticket.qaAssignee = newOwner;
+    ticket.updatedAt = new Date().toISOString();
+    closeModal();
+    persistRelease(r, function(){
+      var action = newOwner ? "TICKET_QA_ASSIGNED" : "TICKET_QA_UNASSIGNED";
+      var details = newOwner ? "Assigned "+ticket.key+" to "+newOwner : "Removed QA assignment from "+ticket.key;
+      logAudit({action:action, entityType:"Ticket", entityId: ticket.key, details: details});
     });
   });
 }
@@ -3921,6 +3975,7 @@ document.addEventListener("click", function(e){
     case "add-ticket": if(r) openAddTicketModal(r); break;
     case "edit-ticket": if(r){ var t=(r.tickets||[]).find(function(x){return x.key===key;}); if(t) openEditTicketModal(r,t); } break;
     case "delete-ticket": if(r){ r.tickets=(r.tickets||[]).filter(function(x){return x.key!==key;}); persistRelease(r); } break;
+    case "edit-ticket-assignee": if(r){ var ta=(r.tickets||[]).find(function(x){return x.key===key;}); if(ta) openTicketAssigneeModal(r,ta); } break;
     case "resync-jira": if(r && state.jiraStatus.connected) handleResyncJira(r); break;
     case "toggle-ticket-group":
       var gkey = el2.getAttribute("data-key");
