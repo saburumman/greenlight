@@ -1,6 +1,7 @@
-// A thin, deliberately small client for Jira's REST API — just the 2 calls
-// Greenlight needs: look up one issue, and search issues by Fix Version. No
-// writes to Jira are ever made.
+// A thin, deliberately small client for Jira's REST API — look up one
+// issue, search issues by Fix Version, and (internally, cached) resolve the
+// "QA Assigned" custom field's id once by name. No writes to Jira are ever
+// made.
 //
 // Every call goes out as a specific signed-in Greenlight user, using that
 // user's own Atlassian OAuth access token (see auth/atlassianTokens.js) —
@@ -90,7 +91,21 @@ function adfToPlainText(doc) {
 
 const TICKET_FIELDS = ["summary", "status", "issuetype", "priority", "description", "resolution", "comment", "fixVersions"];
 
-function fieldsToTicket(key, baseUrl, fields) {
+// A Jira custom field's raw value shape depends on how the field itself was
+// set up on this Jira site — a user picker (~{displayName, emailAddress,
+// accountId, ...}), a single-select (~{value}), a plain text field (a bare
+// string), or a multi-value variant of any of those (an array, in which
+// case the first entry wins — "QA Assigned" is conceptually single-owner).
+// This normalizes whichever shape shows up down to one display string.
+function extractFieldDisplayName(raw) {
+  if (raw == null) return "";
+  if (Array.isArray(raw)) return raw.length ? extractFieldDisplayName(raw[0]) : "";
+  if (typeof raw === "string") return raw.trim();
+  if (typeof raw === "object") return String(raw.displayName || raw.value || raw.name || "").trim();
+  return "";
+}
+
+function fieldsToTicket(key, baseUrl, fields, qaAssignedFieldId) {
   const status = (fields && fields.status) || {};
   const statusCategoryKey = status.statusCategory && status.statusCategory.key;
   // A couple of the most recent comments only — enough for the release-notes
@@ -103,7 +118,7 @@ function fieldsToTicket(key, baseUrl, fields) {
     .filter(Boolean)
     .join(" ")
     .slice(0, 600);
-  return {
+  const ticket = {
     key,
     url: `${baseUrl.replace(/\/+$/, "")}/browse/${key}`,
     title: (fields && fields.summary) || "Untitled",
@@ -115,6 +130,42 @@ function fieldsToTicket(key, baseUrl, fields) {
     resolution: (fields && fields.resolution && fields.resolution.name) || "",
     recentComments,
   };
+  // Only set qaAssignedFromJira when this Jira site actually HAS a "QA
+  // Assigned" field (qaAssignedFieldId truthy) — its absence (undefined
+  // key, not "") tells the client "we don't know", distinct from "" which
+  // means "Jira confirms the field exists but is empty for this issue".
+  // The client (public/app.js: ticketEffectiveAssignee/upsertTicket's
+  // merge) always prefers a manual override in Greenlight over this value,
+  // and this value alone is refreshed on every sync — see
+  // routes/releases.js#upsertTicket, which never touches ticket.qaAssignee.
+  if (qaAssignedFieldId) {
+    ticket.qaAssignedFromJira = extractFieldDisplayName(fields && fields[qaAssignedFieldId]);
+  }
+  return ticket;
+}
+
+// Jira mints a fresh customfield_NNNNN id per site for a custom field like
+// "QA Assigned" — there's no fixed id to hardcode. Resolved once by exact
+// name match (case-insensitive) via GET /field and cached in memory for the
+// life of the process, same rationale as auth/atlassianOAuth.js#getCloudId:
+// this deployment only ever talks to one fixed Jira site (one JIRA_SITE_URL
+// env var), so the field's id can never change underneath it mid-process.
+// null means either this Jira site has no such field, or the lookup itself
+// failed (missing scope, transient error) — either way, every sync below
+// just proceeds without QA Assigned data rather than failing outright.
+let cachedQaAssignedFieldId; // undefined = not looked up yet, null = confirmed absent, string = found
+async function getQaAssignedFieldId(accessToken, cloudId) {
+  if (cachedQaAssignedFieldId !== undefined) return cachedQaAssignedFieldId;
+  try {
+    const fields = await jiraFetch(accessToken, cloudId, "/field");
+    const match = (Array.isArray(fields) ? fields : []).find(
+      (f) => typeof f.name === "string" && f.name.trim().toLowerCase() === "qa assigned"
+    );
+    cachedQaAssignedFieldId = match ? match.id : null;
+  } catch (e) {
+    cachedQaAssignedFieldId = null;
+  }
+  return cachedQaAssignedFieldId;
 }
 
 // Resolves the two things every request below needs: this user's current
@@ -142,12 +193,14 @@ function forUser(authUser) {
     async getIssue(key) {
       const { accessToken, cloudId } = await resolveAuth(authUser);
       const cfg = oauth.getConfig();
+      const qaAssignedFieldId = await getQaAssignedFieldId(accessToken, cloudId);
+      const fieldsToFetch = qaAssignedFieldId ? TICKET_FIELDS.concat([qaAssignedFieldId]) : TICKET_FIELDS;
       const data = await jiraFetch(
         accessToken,
         cloudId,
-        `/issue/${encodeURIComponent(key)}?fields=${TICKET_FIELDS.join(",")}`
+        `/issue/${encodeURIComponent(key)}?fields=${fieldsToFetch.join(",")}`
       );
-      return fieldsToTicket(data.key || key, cfg.jiraSiteUrl, data.fields);
+      return fieldsToTicket(data.key || key, cfg.jiraSiteUrl, data.fields, qaAssignedFieldId);
     },
 
     // Searches for every issue whose Fix Version/s matches the given version
@@ -162,6 +215,8 @@ function forUser(authUser) {
     async searchByFixVersion(fixVersion) {
       const { accessToken, cloudId } = await resolveAuth(authUser);
       const cfg = oauth.getConfig();
+      const qaAssignedFieldId = await getQaAssignedFieldId(accessToken, cloudId);
+      const fieldsToFetch = qaAssignedFieldId ? TICKET_FIELDS.concat([qaAssignedFieldId]) : TICKET_FIELDS;
       const jql = `fixVersion = ${JSON.stringify(fixVersion)} ORDER BY key ASC`;
       const pageSize = 100;
       const tickets = [];
@@ -171,7 +226,7 @@ function forUser(authUser) {
         const body = {
           jql,
           maxResults: pageSize,
-          fields: TICKET_FIELDS,
+          fields: fieldsToFetch,
         };
         if (nextPageToken) body.nextPageToken = nextPageToken;
 
@@ -181,7 +236,7 @@ function forUser(authUser) {
         });
         const issues = page.issues || [];
         for (const issue of issues) {
-          tickets.push(fieldsToTicket(issue.key, cfg.jiraSiteUrl, issue.fields));
+          tickets.push(fieldsToTicket(issue.key, cfg.jiraSiteUrl, issue.fields, qaAssignedFieldId));
         }
 
         if (!issues.length || page.isLast || !page.nextPageToken) break;

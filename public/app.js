@@ -2348,15 +2348,43 @@ function priorityRank(p){
 function ticketAssigneeOptions(){
   return allTeamMembers().map(function(m){return m.name;}).filter(Boolean);
 }
+/* ---- Ticket QA Assignee: manual override vs. Jira-synced value ----
+   ticket.qaAssignedFromJira is Jira's own "QA Assigned" custom field
+   (server/jiraClient.js), refreshed on every sync/lookup — a ticket never
+   touched in Greenlight simply doesn't have a qaAssignee key at all.
+   ticket.qaAssignee is a manual override set from the assign modal below —
+   its mere PRESENCE (even as "", an explicit "Unassigned" choice) is what
+   marks it as manual, exactly the same undefined/""/"Name" three-way split
+   used for the (now-removed) regression module override, and for the same
+   reason: it's what lets "revert to Jira's value" behave differently from
+   "explicitly assign to no one". A manual override always wins; syncing
+   from Jira again (routes/releases.js#upsertTicket) never overwrites
+   qaAssignee, only qaAssignedFromJira. */
+function ticketHasManualAssignee(ticket){
+  return !!(ticket && Object.prototype.hasOwnProperty.call(ticket, "qaAssignee"));
+}
+function ticketEffectiveAssignee(ticket){
+  if(!ticket) return "";
+  if(ticketHasManualAssignee(ticket)) return (ticket.qaAssignee||"").trim();
+  return (ticket.qaAssignedFromJira||"").trim();
+}
+function renderTicketAssigneeBtn(t){
+  var eff = ticketEffectiveAssignee(t);
+  var manual = ticketHasManualAssignee(t);
+  var title = manual
+    ? (eff ? "Manually assigned — click to change" : "Explicitly set to Unassigned — click to change")
+    : (eff ? "Synced from Jira's QA Assigned field — click to override" : "Assign a QA owner");
+  return '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn'+(eff?" has-owner":"")+'" data-action="edit-ticket-assignee" data-key="'+escAttr(t.key)+'" title="'+escAttr(title)+'">'+iconUser()+' '+(eff? esc(eff) : "Unassigned")+'</button>';
+}
 function groupTickets(tickets, mode){
   if(mode==="None"){
     return [{key:"__all__", label:"All Tickets", items:tickets.slice()}];
   }
-  var field = mode==="Status" ? "bucket" : mode==="Priority" ? "priority" : mode==="QA Assignee" ? "qaAssignee" : "issueType";
+  var field = mode==="Status" ? "bucket" : mode==="Priority" ? "priority" : "issueType";
   var fallback = mode==="QA Assignee" ? "Unassigned" : "Not provided";
   var buckets = {};
   tickets.forEach(function(t){
-    var v = (t[field]||"").toString().trim() || fallback;
+    var v = (mode==="QA Assignee" ? ticketEffectiveAssignee(t) : (t[field]||"").toString().trim()) || fallback;
     if(!buckets[v]) buckets[v] = [];
     buckets[v].push(t);
   });
@@ -2399,7 +2427,7 @@ function sectionTickets(r){
           '<span class="badge">'+esc(t.issueType||"Not provided")+'</span>'+
           '<span class="badge '+(t.source==="Jira"?"badge-jira":"badge-manual")+'">'+esc(t.source||"Manual")+'</span>'+
         '</span>'+
-        '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn'+(t.qaAssignee?" has-owner":"")+'" data-action="edit-ticket-assignee" data-key="'+escAttr(t.key)+'" title="'+(t.qaAssignee?"Change QA assignee":"Assign a QA owner")+'">'+iconUser()+' '+(t.qaAssignee? esc(t.qaAssignee) : "Unassigned")+'</button>'+
+        renderTicketAssigneeBtn(t)+
         '<a class="ticket-open-link" href="'+escAttr(t.url||"#")+'" target="_blank" rel="noopener noreferrer">Open '+iconLink()+'</a>'+
         '<span class="ticket-actions">'+
           '<button class="btn btn-sm btn-icon" data-action="edit-ticket" data-key="'+escAttr(t.key)+'" aria-label="Edit ticket">'+iconEdit()+'</button>'+
@@ -3149,19 +3177,28 @@ function openEditTicketModal(r, ticket){
 
 // QA Assignee for one ticket — same pill-radio pattern as Regression's
 // Entity-assign modal (statusChoiceGroup, a name / Unassigned choice),
-// sourced from ticketAssigneeOptions (the full Know the Team roster). A
-// Jira re-sync never touches qaAssignee: it isn't one of the fields Jira
-// supplies (see jiraClient.fieldsToTicket), so the server's upsert merge
-// (routes/releases.js#upsertTicket spreads the incoming Jira fields over
-// the prior stored ticket) leaves whatever was already assigned here
-// completely untouched — no special "preserve on sync" code needed.
+// sourced from ticketAssigneeOptions (the full Know the Team roster), plus
+// one extra option when there's currently a manual override: "Use Jira's
+// assignee", which clears the override (deletes ticket.qaAssignee) and goes
+// back to following Jira's "QA Assigned" field. A manual choice here always
+// wins over Jira going forward — a re-sync only ever refreshes
+// qaAssignedFromJira, never qaAssignee (see routes/releases.js#upsertTicket
+// and ticketEffectiveAssignee above).
 function openTicketAssigneeModal(r, ticket){
   var names = ticketAssigneeOptions();
-  var UNASSIGNED = "Unassigned";
-  var current = (ticket.qaAssignee||"").trim() || UNASSIGNED;
-  var options = names.concat([UNASSIGNED]);
+  var UNASSIGNED = "Unassigned", USE_JIRA = "Use Jira's assignee";
+  var hasOverride = ticketHasManualAssignee(ticket);
+  var jiraValue = (ticket.qaAssignedFromJira||"").trim();
+  var current = hasOverride ? ((ticket.qaAssignee||"").trim() || UNASSIGNED) : (jiraValue || UNASSIGNED);
+  var options = names.concat([UNASSIGNED]).concat(hasOverride ? [USE_JIRA] : []);
+  var subtitle = hasOverride
+    ? (jiraValue ? "Jira's own QA Assigned field currently says "+jiraValue+". Your manual choice below overrides it until you pick “"+USE_JIRA+"”."
+                 : "This has a manual override — Jira's QA Assigned field has no value for this ticket right now.")
+    : (jiraValue ? "Currently synced from Jira's QA Assigned field ("+jiraValue+"). Choosing a name below overrides it just for this ticket."
+                 : "Jira's QA Assigned field has no value for this ticket yet — assign someone below, or leave it to pick up a value from Jira later.");
   var body =
     '<div class="regmod-edit-name">'+esc(ticket.key)+' — '+esc(ticket.title||"Untitled")+'</div>'+
+    '<p class="helper-text" style="margin:2px 0 10px;">'+esc(subtitle)+'</p>'+
     (names.length ? statusChoiceGroup("ticket-assignee-choice", options, current, true)
       : '<p class="helper-text" style="margin:0;">No one is in <b>Know the Team</b> yet — add people there first, or choose Unassigned below.</p>'+statusChoiceGroup("ticket-assignee-choice", options, current, true));
   var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">Assign</button>';
@@ -3170,13 +3207,20 @@ function openTicketAssigneeModal(r, ticket){
     e.preventDefault();
     var checked = qs('input[name="ticket-assignee-choice"]:checked');
     var picked = checked ? checked.value : current;
-    var newOwner = picked===UNASSIGNED ? "" : picked;
-    ticket.qaAssignee = newOwner;
+    var action, details;
+    if(picked===USE_JIRA){
+      delete ticket.qaAssignee;
+      action = "TICKET_QA_UNASSIGNED";
+      details = "Reverted to Jira's QA Assigned field — "+ticket.key;
+    } else {
+      var newOwner = picked===UNASSIGNED ? "" : picked;
+      ticket.qaAssignee = newOwner;
+      action = newOwner ? "TICKET_QA_ASSIGNED" : "TICKET_QA_UNASSIGNED";
+      details = newOwner ? "Assigned "+ticket.key+" to "+newOwner : "Removed QA assignment from "+ticket.key;
+    }
     ticket.updatedAt = new Date().toISOString();
     closeModal();
     persistRelease(r, function(){
-      var action = newOwner ? "TICKET_QA_ASSIGNED" : "TICKET_QA_UNASSIGNED";
-      var details = newOwner ? "Assigned "+ticket.key+" to "+newOwner : "Removed QA assignment from "+ticket.key;
       logAudit({action:action, entityType:"Ticket", entityId: ticket.key, details: details});
     });
   });
