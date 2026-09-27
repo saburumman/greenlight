@@ -92,17 +92,22 @@ function adfToPlainText(doc) {
 const TICKET_FIELDS = ["summary", "status", "issuetype", "priority", "description", "resolution", "comment", "fixVersions"];
 
 // A Jira custom field's raw value shape depends on how the field itself was
-// set up on this Jira site — a user picker (~{displayName, emailAddress,
-// accountId, ...}), a single-select (~{value}), a plain text field (a bare
-// string), or a multi-value variant of any of those (an array, in which
-// case the first entry wins — "QA Assigned" is conceptually single-owner).
-// This normalizes whichever shape shows up down to one display string.
-function extractFieldDisplayName(raw) {
-  if (raw == null) return "";
-  if (Array.isArray(raw)) return raw.length ? extractFieldDisplayName(raw[0]) : "";
-  if (typeof raw === "string") return raw.trim();
-  if (typeof raw === "object") return String(raw.displayName || raw.value || raw.name || "").trim();
-  return "";
+// set up on this Jira site — a single user picker (~{displayName,
+// emailAddress, accountId, ...}), a multi-user picker (an array of those), a
+// single- or multi-select (~{value}/array of those), or a plain text field
+// (a bare string). "QA Assigned" is a MULTI-person field on this Jira site
+// (a ticket can have more than one QA owner), so this always returns an
+// array — a single (non-array) value normalizes to a one-item array, and
+// each array entry is normalized the same way a single value would be.
+function extractFieldDisplayNames(raw) {
+  if (raw == null) return [];
+  if (Array.isArray(raw)) return raw.map(extractFieldDisplayNames).flat().filter(Boolean);
+  if (typeof raw === "string") return raw.trim() ? [raw.trim()] : [];
+  if (typeof raw === "object") {
+    const name = String(raw.displayName || raw.value || raw.name || "").trim();
+    return name ? [name] : [];
+  }
+  return [];
 }
 
 function fieldsToTicket(key, baseUrl, fields, qaAssignedFieldId) {
@@ -132,14 +137,16 @@ function fieldsToTicket(key, baseUrl, fields, qaAssignedFieldId) {
   };
   // Only set qaAssignedFromJira when this Jira site actually HAS a "QA
   // Assigned" field (qaAssignedFieldId truthy) — its absence (undefined
-  // key, not "") tells the client "we don't know", distinct from "" which
-  // means "Jira confirms the field exists but is empty for this issue".
-  // The client (public/app.js: ticketEffectiveAssignee/upsertTicket's
-  // merge) always prefers a manual override in Greenlight over this value,
-  // and this value alone is refreshed on every sync — see
-  // routes/releases.js#upsertTicket, which never touches ticket.qaAssignee.
+  // key, not []) tells the client "we don't know", distinct from [] which
+  // means "Jira confirms the field exists but has nobody set for this
+  // issue". Always an array (possibly multiple people) — see
+  // extractFieldDisplayNames above. The client (public/app.js:
+  // ticketEffectiveAssignees) always prefers a manual override in
+  // Greenlight over this value, and this value alone is refreshed on every
+  // sync — see routes/releases.js#upsertTicket, which never touches
+  // ticket.qaAssignee.
   if (qaAssignedFieldId) {
-    ticket.qaAssignedFromJira = extractFieldDisplayName(fields && fields[qaAssignedFieldId]);
+    ticket.qaAssignedFromJira = extractFieldDisplayNames(fields && fields[qaAssignedFieldId]);
   }
   return ticket;
 }

@@ -2349,45 +2349,70 @@ function ticketAssigneeOptions(){
   return allTeamMembers().map(function(m){return m.name;}).filter(Boolean);
 }
 /* ---- Ticket QA Assignee: manual override vs. Jira-synced value ----
+   "QA Assigned" is a MULTI-person Jira field — a ticket can have more than
+   one QA owner — so both sides of this are always arrays of names, never a
+   single string.
    ticket.qaAssignedFromJira is Jira's own "QA Assigned" custom field
    (server/jiraClient.js), refreshed on every sync/lookup — a ticket never
    touched in Greenlight simply doesn't have a qaAssignee key at all.
    ticket.qaAssignee is a manual override set from the assign modal below —
-   its mere PRESENCE (even as "", an explicit "Unassigned" choice) is what
-   marks it as manual, exactly the same undefined/""/"Name" three-way split
-   used for the (now-removed) regression module override, and for the same
-   reason: it's what lets "revert to Jira's value" behave differently from
+   its mere PRESENCE (even as [], an explicit "nobody" choice) is what marks
+   it as manual, the same undefined/[]/[...names] three-way split used for
+   the (now-removed) regression module override, and for the same reason:
+   it's what lets "revert to Jira's value" behave differently from
    "explicitly assign to no one". A manual override always wins; syncing
    from Jira again (routes/releases.js#upsertTicket) never overwrites
-   qaAssignee, only qaAssignedFromJira. */
+   qaAssignee, only qaAssignedFromJira. ticketAssigneesArray tolerates a
+   plain string too, for a release saved by the earlier single-assignee
+   version of this feature (before it became multi-person). */
 function ticketHasManualAssignee(ticket){
   return !!(ticket && Object.prototype.hasOwnProperty.call(ticket, "qaAssignee"));
 }
-function ticketEffectiveAssignee(ticket){
-  if(!ticket) return "";
-  if(ticketHasManualAssignee(ticket)) return (ticket.qaAssignee||"").trim();
-  return (ticket.qaAssignedFromJira||"").trim();
+function ticketAssigneesArray(value){
+  var list = Array.isArray(value) ? value : (value ? [value] : []);
+  return list.map(function(v){ return (v||"").toString().trim(); }).filter(Boolean);
+}
+function ticketEffectiveAssignees(ticket){
+  if(!ticket) return [];
+  if(ticketHasManualAssignee(ticket)) return ticketAssigneesArray(ticket.qaAssignee);
+  return ticketAssigneesArray(ticket.qaAssignedFromJira);
 }
 function renderTicketAssigneeBtn(t){
-  var eff = ticketEffectiveAssignee(t);
+  var eff = ticketEffectiveAssignees(t);
   var manual = ticketHasManualAssignee(t);
+  var label = eff.length ? eff.join(", ") : "Unassigned";
   var title = manual
-    ? (eff ? "Manually assigned — click to change" : "Explicitly set to Unassigned — click to change")
-    : (eff ? "Synced from Jira's QA Assigned field — click to override" : "Assign a QA owner");
-  return '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn'+(eff?" has-owner":"")+'" data-action="edit-ticket-assignee" data-key="'+escAttr(t.key)+'" title="'+escAttr(title)+'">'+iconUser()+' '+(eff? esc(eff) : "Unassigned")+'</button>';
+    ? (eff.length ? "Manually assigned — click to change" : "Explicitly set to Unassigned — click to change")
+    : (eff.length ? "Synced from Jira's QA Assigned field — click to override" : "Assign a QA owner");
+  return '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn'+(eff.length?" has-owner":"")+'" data-action="edit-ticket-assignee" data-key="'+escAttr(t.key)+'" title="'+escAttr(title)+'">'+iconUser()+' '+esc(label)+'</button>';
 }
 function groupTickets(tickets, mode){
   if(mode==="None"){
     return [{key:"__all__", label:"All Tickets", items:tickets.slice()}];
   }
-  var field = mode==="Status" ? "bucket" : mode==="Priority" ? "priority" : "issueType";
-  var fallback = mode==="QA Assignee" ? "Unassigned" : "Not provided";
   var buckets = {};
-  tickets.forEach(function(t){
-    var v = (mode==="QA Assignee" ? ticketEffectiveAssignee(t) : (t[field]||"").toString().trim()) || fallback;
-    if(!buckets[v]) buckets[v] = [];
-    buckets[v].push(t);
-  });
+  if(mode==="QA Assignee"){
+    // A ticket can have more than one QA owner — it's filed under EVERY one
+    // of its effective assignees (not just the first), so a ticket assigned
+    // to two people genuinely shows up in both of their buckets. A ticket
+    // with nobody effectively assigned lands in Unassigned instead.
+    tickets.forEach(function(t){
+      var names = ticketEffectiveAssignees(t);
+      if(!names.length){
+        (buckets["Unassigned"] = buckets["Unassigned"]||[]).push(t);
+      } else {
+        names.forEach(function(name){
+          (buckets[name] = buckets[name]||[]).push(t);
+        });
+      }
+    });
+  } else {
+    var field = mode==="Status" ? "bucket" : mode==="Priority" ? "priority" : "issueType";
+    tickets.forEach(function(t){
+      var v = (t[field]||"").toString().trim() || "Not provided";
+      (buckets[v] = buckets[v]||[]).push(t);
+    });
+  }
   var keys = Object.keys(buckets);
   if(mode==="Status"){
     keys.sort(function(a,b){ return TICKET_BUCKETS.indexOf(a) - TICKET_BUCKETS.indexOf(b); });
@@ -2936,6 +2961,18 @@ function statusChoiceGroup(name, options, current, plain){
     return '<input type="radio" name="'+name+'" id="'+id+'" value="'+esc(o)+'" '+(o===current?"checked":"")+'><label for="'+id+'" class="'+toneClass.trim()+'">'+esc(o)+'</label>';
   }).join("")+'</div>';
 }
+// Same pill-list look as statusChoiceGroup above, but checkboxes — more
+// than one can be checked at once — for a picker where several choices
+// legitimately apply together, like a ticket's (possibly multi-person) QA
+// Assignee. Shares the exact same .status-choice CSS: the `input:checked +
+// label` selector styles a checked checkbox identically to a checked radio.
+function multiChoiceGroup(name, options, selected){
+  var sel = selected || [];
+  return '<div class="status-choice">'+options.map(function(o){
+    var id = name+"-"+o.replace(/[^A-Za-z0-9]/g,"");
+    return '<input type="checkbox" name="'+name+'" id="'+id+'" value="'+esc(o)+'" '+(sel.indexOf(o)!==-1?"checked":"")+'><label for="'+id+'">'+esc(o)+'</label>';
+  }).join("")+'</div>';
+}
 function modalShell(title, bodyHtml, footHtml, formId){
   return '<div class="modal-head"><h3>'+esc(title)+'</h3><button class="btn btn-icon btn-ghost" data-action="close-modal" aria-label="Close">'+iconClose()+'</button></div>'+
     '<form id="'+(formId||"modal-form")+'"><div class="modal-body">'+bodyHtml+'</div><div class="modal-foot">'+footHtml+'</div></form>';
@@ -3175,52 +3212,56 @@ function openEditTicketModal(r, ticket){
   });
 }
 
-// QA Assignee for one ticket — same pill-radio pattern as Regression's
-// Entity-assign modal (statusChoiceGroup, a name / Unassigned choice),
-// sourced from ticketAssigneeOptions (the full Know the Team roster), plus
-// one extra option when there's currently a manual override: "Use Jira's
-// assignee", which clears the override (deletes ticket.qaAssignee) and goes
-// back to following Jira's "QA Assigned" field. A manual choice here always
-// wins over Jira going forward — a re-sync only ever refreshes
+// QA Assignee(s) for one ticket — a checkbox pill-list (multiChoiceGroup),
+// since "QA Assigned" is a multi-person Jira field: a ticket can genuinely
+// have more than one owner. Sourced from ticketAssigneeOptions (the full
+// Know the Team roster). "Use Jira's assignees" (shown only when there's
+// currently a manual override) clears it (deletes ticket.qaAssignee) and
+// goes back to following Jira's field. A manual choice here always wins
+// over Jira going forward — a re-sync only ever refreshes
 // qaAssignedFromJira, never qaAssignee (see routes/releases.js#upsertTicket
-// and ticketEffectiveAssignee above).
+// and ticketEffectiveAssignees above).
 function openTicketAssigneeModal(r, ticket){
   var names = ticketAssigneeOptions();
-  var UNASSIGNED = "Unassigned", USE_JIRA = "Use Jira's assignee";
   var hasOverride = ticketHasManualAssignee(ticket);
-  var jiraValue = (ticket.qaAssignedFromJira||"").trim();
-  var current = hasOverride ? ((ticket.qaAssignee||"").trim() || UNASSIGNED) : (jiraValue || UNASSIGNED);
-  var options = names.concat([UNASSIGNED]).concat(hasOverride ? [USE_JIRA] : []);
+  var jiraNames = ticketAssigneesArray(ticket.qaAssignedFromJira);
+  var currentSelected = hasOverride ? ticketAssigneesArray(ticket.qaAssignee) : jiraNames.slice();
   var subtitle = hasOverride
-    ? (jiraValue ? "Jira's own QA Assigned field currently says "+jiraValue+". Your manual choice below overrides it until you pick “"+USE_JIRA+"”."
-                 : "This has a manual override — Jira's QA Assigned field has no value for this ticket right now.")
-    : (jiraValue ? "Currently synced from Jira's QA Assigned field ("+jiraValue+"). Choosing a name below overrides it just for this ticket."
-                 : "Jira's QA Assigned field has no value for this ticket yet — assign someone below, or leave it to pick up a value from Jira later.");
+    ? (jiraNames.length ? "Jira's own QA Assigned field currently lists "+jiraNames.join(", ")+". Your manual choice below overrides it until you revert to Jira's assignees."
+                        : "This has a manual override — Jira's QA Assigned field has no one set for this ticket right now.")
+    : (jiraNames.length ? "Currently synced from Jira's QA Assigned field ("+jiraNames.join(", ")+"). Checking names below overrides it just for this ticket."
+                        : "Jira's QA Assigned field has no one set for this ticket yet — check anyone below, or leave it to pick up a value from Jira later.");
   var body =
     '<div class="regmod-edit-name">'+esc(ticket.key)+' — '+esc(ticket.title||"Untitled")+'</div>'+
     '<p class="helper-text" style="margin:2px 0 10px;">'+esc(subtitle)+'</p>'+
-    (names.length ? statusChoiceGroup("ticket-assignee-choice", options, current, true)
-      : '<p class="helper-text" style="margin:0;">No one is in <b>Know the Team</b> yet — add people there first, or choose Unassigned below.</p>'+statusChoiceGroup("ticket-assignee-choice", options, current, true));
-  var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">Assign</button>';
-  openModal(modalShell("Assign QA owner", body, foot));
-  qs("#modal-form").addEventListener("submit", function(e){
-    e.preventDefault();
-    var checked = qs('input[name="ticket-assignee-choice"]:checked');
-    var picked = checked ? checked.value : current;
-    var action, details;
-    if(picked===USE_JIRA){
-      delete ticket.qaAssignee;
-      action = "TICKET_QA_UNASSIGNED";
-      details = "Reverted to Jira's QA Assigned field — "+ticket.key;
-    } else {
-      var newOwner = picked===UNASSIGNED ? "" : picked;
-      ticket.qaAssignee = newOwner;
-      action = newOwner ? "TICKET_QA_ASSIGNED" : "TICKET_QA_UNASSIGNED";
-      details = newOwner ? "Assigned "+ticket.key+" to "+newOwner : "Removed QA assignment from "+ticket.key;
-    }
+    (names.length
+      ? multiChoiceGroup("ticket-assignee-check", names, currentSelected)+'<p class="hint" style="margin-top:8px;">Check as many as apply — leave all unchecked for Unassigned.</p>'
+      : '<p class="helper-text" style="margin:0;">No one is in <b>Know the Team</b> yet — add people there first.</p>');
+  var foot = (hasOverride ? '<button type="button" class="btn btn-ghost" id="ticket-assignee-use-jira">Use Jira’s assignees</button>' : '<span></span>')+
+    '<span style="flex:1"></span><button type="button" class="btn" data-action="close-modal">Cancel</button>'+
+    (names.length ? '<button type="submit" class="btn btn-primary">Save</button>' : '');
+  openModal(modalShell("Assign QA owners", body, foot));
+
+  var useJiraBtn = qs("#ticket-assignee-use-jira");
+  if(useJiraBtn) useJiraBtn.addEventListener("click", function(){
+    delete ticket.qaAssignee;
     ticket.updatedAt = new Date().toISOString();
     closeModal();
     persistRelease(r, function(){
+      logAudit({action:"TICKET_QA_UNASSIGNED", entityType:"Ticket", entityId: ticket.key, details: "Reverted to Jira's QA Assigned field — "+ticket.key});
+    });
+  });
+
+  if(!names.length) return; // nothing to check, and no Save button to wire up
+  qs("#modal-form").addEventListener("submit", function(e){
+    e.preventDefault();
+    var picked = qsa('input[name="ticket-assignee-check"]:checked').map(function(el){ return el.value; });
+    ticket.qaAssignee = picked; // presence of the key marks this manual, even when picked is []
+    ticket.updatedAt = new Date().toISOString();
+    closeModal();
+    persistRelease(r, function(){
+      var action = picked.length ? "TICKET_QA_ASSIGNED" : "TICKET_QA_UNASSIGNED";
+      var details = picked.length ? "Assigned "+ticket.key+" to "+picked.join(", ") : "Removed QA assignment from "+ticket.key;
       logAudit({action:action, entityType:"Ticket", entityId: ticket.key, details: details});
     });
   });
