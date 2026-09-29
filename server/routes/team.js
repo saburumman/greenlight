@@ -101,6 +101,41 @@ router.get("/:id", asyncHandler(async (req, res) => {
   res.json(m);
 }));
 
+// Links (or unlinks) the CALLING user's own signed-in account to a Know the
+// Team entry — this is the server-side "This is me" pointer the client uses
+// to resolve "My Regression" (see public/app.js#currentPreparerName /
+// myLinkedTeamMemberId), instead of hoping the caller's Atlassian display
+// name happens to be spelled identically to the free-text name someone
+// picked for them in Know the Team. Deliberately self-service only: the
+// linked identity always comes from req.authUser.email (the verified
+// session), never from the request body, so nobody can link an account to
+// someone else's entry. Setting a new link clears it from any other entry
+// previously linked to that same email first, so a person is only ever
+// linked to one entry at a time; this never touches any of the member's
+// other fields (name, role, bio, ...) or their `seeded`/`updatedAt`
+// bookkeeping, so it's safe to call from a one-click UI without disturbing
+// anything else about the record.
+router.put("/:id/link-me", asyncHandler(async (req, res) => {
+  if (!req.authUser || !req.authUser.email) {
+    return res.status(401).json({ error: "Sign in required." });
+  }
+  const existing = await db.team.get(req.params.id);
+  if (!existing) return notFound(res);
+  const email = String(req.authUser.email).trim().toLowerCase();
+  const linked = !!(req.body && req.body.linked);
+
+  const all = await db.team.list();
+  for (const m of all) {
+    if (m.id !== existing.id && m.linkedEmail === email) {
+      await db.team.set(m.id, { ...m, linkedEmail: null });
+    }
+  }
+
+  const updated = { ...existing, linkedEmail: linked ? email : null };
+  await db.team.set(existing.id, updated);
+  res.json(updated);
+}));
+
 router.put("/:id", asyncHandler(async (req, res) => {
   const existing = await db.team.get(req.params.id);
   if (!existing) return notFound(res);

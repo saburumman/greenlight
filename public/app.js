@@ -171,7 +171,8 @@ var api = {
   listTeam: function(){ return apiCall("GET","/team"); },
   createTeamMember: function(data){ return apiCall("POST","/team", data); },
   updateTeamMember: function(id, data){ return apiCall("PUT","/team/"+id, data); },
-  deleteTeamMember: function(id){ return apiCall("DELETE","/team/"+id); }
+  deleteTeamMember: function(id){ return apiCall("DELETE","/team/"+id); },
+  linkMeToTeamMember: function(id, linked){ return apiCall("PUT","/team/"+id+"/link-me", {linked: !!linked}); }
 };
 
 /* ============================================================
@@ -703,32 +704,39 @@ function regressionTemplateLabel(status){
 // character-for-character identical to how their name was entered in Know
 // the Team (a stray apostrophe, a missing hyphen, a nickname vs. full name,
 // etc. are all enough to silently break the match). Rather than guessing at
-// fuzzy string normalization, this lets a signed-in user explicitly pin
-// "this Know the Team entry is me" once (see toggleMyTeamMember / the
-// team-card menu) — stored client-side per Atlassian account (by email, in
-// localStorage, since Know the Team has no link to auth accounts server-
-// side) — and that pin, when set, is authoritative: the exact Know the Team
-// name is what gets compared against entity.owner, which is exactly what
-// assignment dropdowns wrote there in the first place. Guest-mode
-// deployments don't need this — a guest picks their own display name
-// directly (see "Now working as"), so it already matches whatever they type
-// into Know the Team.
-function myIdentityStorageKey(){
-  var email = state.auth && state.auth.user && state.auth.user.email;
-  return email ? "greenlight.myTeamMember."+String(email).trim().toLowerCase() : null;
-}
+// fuzzy string normalization for the match itself, a signed-in user pins
+// "this Know the Team entry is me" once (via the team-card menu, or the
+// one-click suggestion offered on an empty "My Regression" — see
+// suggestedMyTeamMember below) and that pin is authoritative from then on:
+// the exact Know the Team name is what gets compared against entity.owner,
+// which is exactly what assignment dropdowns wrote there in the first
+// place. The pin itself is stored server-side, on the team member's own
+// record (member.linkedEmail — see server/routes/team.js's PUT
+// /:id/link-me), keyed by the signed-in email — never in localStorage — so
+// it's set once and works from any browser or device, not just the one it
+// was set on. Guest-mode deployments don't need this at all — a guest picks
+// their own display name directly (see "Now working as"), so it already
+// matches whatever they type into Know the Team.
 function myLinkedTeamMemberId(){
-  var storageKey = myIdentityStorageKey();
-  if(!storageKey) return "";
-  try{ return localStorage.getItem(storageKey) || ""; }catch(e){ return ""; }
+  var email = state.auth && state.auth.user && state.auth.user.email;
+  if(!email) return "";
+  email = String(email).trim().toLowerCase();
+  var found = allTeamMembers().find(function(m){
+    return m.linkedEmail && String(m.linkedEmail).trim().toLowerCase()===email;
+  });
+  return found ? found.id : "";
 }
-function setMyLinkedTeamMemberId(id){
-  var storageKey = myIdentityStorageKey();
-  if(!storageKey) return;
-  try{
-    if(id) localStorage.setItem(storageKey, id);
-    else localStorage.removeItem(storageKey);
-  }catch(e){}
+// Persists (or clears) the "This is me" link via the server, updates the
+// local copy of that team member so the UI reflects it immediately, and
+// re-renders. Used both by the Know the Team card menu and by the one-click
+// suggestion in the Regression section's empty "My Regression" state.
+function setMyLinkedTeamMember(id, linked){
+  return api.linkMeToTeamMember(id, linked).then(function(saved){
+    state.team[saved.id] = saved;
+    render();
+  }).catch(function(err){
+    showToast(err.message || "Couldn't update that link.");
+  });
 }
 function currentPreparerName(){
   var linkedId = myLinkedTeamMemberId();
@@ -736,6 +744,33 @@ function currentPreparerName(){
   if(state.auth && state.auth.oauthEnabled && state.auth.authenticated && state.auth.user && state.auth.user.name) return state.auth.user.name;
   if(state.guest && state.guest.displayName) return state.guest.displayName;
   return "";
+}
+// Normalizes a name for a *suggestion-only* fuzzy match — never used for the
+// actual "is this me" comparison, which always stays an exact string match
+// against the linked Know the Team entry (myLinkedTeamMemberId/
+// regressionOwnerIsMe). Stripping punctuation/case/extra whitespace is
+// exactly enough to see past what actually broke "My Regression" here (a
+// stray apostrophe) without silently treating two different real people as
+// the same one — it only ever powers a suggestion the user still has to
+// click to confirm.
+function normalizeNameForSuggestion(name){
+  return String(name||"")
+    .toLowerCase()
+    .replace(/['’`´]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+// When the signed-in user hasn't linked themselves to a Know the Team entry
+// yet, looks for one whose name normalizes to the same thing as their own
+// (Atlassian) display name — e.g. "Sara Abu-Rumman" vs. "Sara' Abu-Rumman" —
+// so the empty "My Regression" state can offer a one-click "is this you?"
+// instead of sending them off to Know the Team to find and link it by hand.
+// Returns null when already linked, or when nothing normalizes to a match.
+function suggestedMyTeamMember(){
+  if(myLinkedTeamMemberId()) return null;
+  var mine = normalizeNameForSuggestion(currentPreparerName());
+  if(!mine) return null;
+  return allTeamMembers().find(function(m){ return normalizeNameForSuggestion(m.name)===mine; }) || null;
 }
 // One release-note item's fields, preferring the server-generated item
 // (AI-assisted or rule-based, per releaseNotesLogic.js) and falling back to
@@ -2640,9 +2675,18 @@ function sectionRegression(r){
   if(!entities.length){
     listOrEmpty = '<div class="empty-row">No regression modules on this release yet. Click “Sync Modules” to pull in your entity/service list (or “Manage Modules” to set one up first).</div>';
   } else if(!viewEntities.length){
+    // "My Regression" came up empty — before assuming nothing's actually
+    // assigned, check for a Know the Team entry that's very likely the
+    // signed-in user under a slightly different spelling (see
+    // suggestedMyTeamMember) and offer a one-click way to confirm it, right
+    // here, instead of sending them off to Know the Team to link it by hand.
+    var meSuggestion = state.regressionView==="Mine" ? suggestedMyTeamMember() : null;
     listOrEmpty = '<div class="empty-row">'+(state.regressionView==="Mine"
       ? "No entities are assigned to you yet."
-      : "Every entity has an owner.")+'</div>';
+      : "Every entity has an owner.")+
+      (meSuggestion ? '<div class="regression-me-suggestion">Is <strong>'+esc(meSuggestion.name)+'</strong> you? '+
+        '<button type="button" class="btn btn-sm btn-primary" data-action="toggle-my-team-member" data-id="'+meSuggestion.id+'">'+iconUser()+' Yes, that’s me</button></div>' : '')+
+      '</div>';
   } else {
     listOrEmpty = '<div class="regression-entity-list">'+groupsHtml+'</div>';
   }
@@ -4189,8 +4233,7 @@ document.addEventListener("click", function(e){
       openConfirm("Delete this team member?", "This removes <b>"+esc(teamTarget?teamTarget.name:"")+"</b> from Know the Team.", "Delete", function(){ deleteTeamMember(id); }, true);
       break;
     case "toggle-my-team-member":
-      setMyLinkedTeamMemberId(myLinkedTeamMemberId()===id ? "" : id);
-      render();
+      setMyLinkedTeamMember(id, myLinkedTeamMemberId()!==id);
       break;
   }
 });

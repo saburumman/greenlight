@@ -282,6 +282,7 @@ a{color:inherit;}
 .item-row-actions{display:flex;gap:4px;flex-shrink:0;}
 .id-tag{font-family:var(--font-mono);font-size:12px;color:var(--ink-faint);}
 .empty-row{padding:22px;text-align:center;color:var(--ink-faint);font-size:13px;border:1px dashed var(--border-strong);border-radius:var(--radius-md);}
+.regression-me-suggestion{margin-top:12px;padding-top:12px;border-top:1px dashed var(--border-strong);color:var(--ink);font-size:13px;display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;}
 
 /* ================= REGRESSION: ENTITY -> SERVICES ================= */
 .regmod-edit-name{font-weight:800;font-size:14.5px;padding:2px 0 2px;}
