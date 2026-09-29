@@ -695,7 +695,44 @@ function regressionTemplateLabel(status){
   if(status==="IN PROGRESS") return "In Progress";
   return "N/A"; // NOT PROVIDED
 }
+// "My Regression" (regressionOwnerIsMe) has to match the signed-in user
+// against entity.owner, a plain string picked from the Know the Team
+// roster. When sign-in is via Atlassian, the display name the browser sees
+// (state.auth.user.name) comes straight from that person's Atlassian
+// profile — it's not something they typed, and there's no guarantee it's
+// character-for-character identical to how their name was entered in Know
+// the Team (a stray apostrophe, a missing hyphen, a nickname vs. full name,
+// etc. are all enough to silently break the match). Rather than guessing at
+// fuzzy string normalization, this lets a signed-in user explicitly pin
+// "this Know the Team entry is me" once (see toggleMyTeamMember / the
+// team-card menu) — stored client-side per Atlassian account (by email, in
+// localStorage, since Know the Team has no link to auth accounts server-
+// side) — and that pin, when set, is authoritative: the exact Know the Team
+// name is what gets compared against entity.owner, which is exactly what
+// assignment dropdowns wrote there in the first place. Guest-mode
+// deployments don't need this — a guest picks their own display name
+// directly (see "Now working as"), so it already matches whatever they type
+// into Know the Team.
+function myIdentityStorageKey(){
+  var email = state.auth && state.auth.user && state.auth.user.email;
+  return email ? "greenlight.myTeamMember."+String(email).trim().toLowerCase() : null;
+}
+function myLinkedTeamMemberId(){
+  var storageKey = myIdentityStorageKey();
+  if(!storageKey) return "";
+  try{ return localStorage.getItem(storageKey) || ""; }catch(e){ return ""; }
+}
+function setMyLinkedTeamMemberId(id){
+  var storageKey = myIdentityStorageKey();
+  if(!storageKey) return;
+  try{
+    if(id) localStorage.setItem(storageKey, id);
+    else localStorage.removeItem(storageKey);
+  }catch(e){}
+}
 function currentPreparerName(){
+  var linkedId = myLinkedTeamMemberId();
+  if(linkedId && state.team && state.team[linkedId] && state.team[linkedId].name) return state.team[linkedId].name;
   if(state.auth && state.auth.oauthEnabled && state.auth.authenticated && state.auth.user && state.auth.user.name) return state.auth.user.name;
   if(state.guest && state.guest.displayName) return state.guest.displayName;
   return "";
@@ -935,22 +972,28 @@ function loadTeam(){
 }
 
 function boot(){
-  var tasks = [loadJiraStatus()];
+  // Know the Team names are needed well beyond the Know the Team view
+  // itself — regression/ticket assignment dropdowns (regressionOwnerOptions,
+  // ticketAssigneeOptions) and "My Regression" (currentPreparerName) all
+  // read state.team, so it has to be loaded on every boot rather than only
+  // when navigating to "team" — otherwise a release opened directly (or on
+  // first load) sees an empty roster until the user happens to visit Know
+  // the Team first. Small dataset, cheap GET — same as loadJiraStatus above.
+  var tasks = [loadJiraStatus(), loadTeam()];
   if(state.route.view==="detail"){
     tasks.push(loadOne(state.route.id));
   } else if(state.route.view==="audit"){
     tasks.push(loadAuditLog());
   } else if(state.route.view==="testData"){
     tasks.push(loadTestData());
-  } else if(state.route.view==="team"){
-    tasks.push(loadTeam());
   } else if(state.route.view==="home"){
     // Landing page needs real release data (At a Glance / Recent Releases)
     // and the audit log (Recent Activity) — both read-only GETs, so simply
     // viewing the landing page never writes a new audit event.
     tasks.push(loadList());
     tasks.push(loadAuditLog());
-  } else {
+  } else if(state.route.view!=="team"){
+    // "team" needs nothing beyond the loadTeam() already queued above.
     tasks.push(loadList());
   }
   Promise.all(tasks).then(render);
@@ -1281,16 +1324,22 @@ function teamMemberCardHtml(m){
   if(m.linkedin) linkBits.push('<a class="btn btn-ghost btn-sm" href="'+escAttr(m.linkedin)+'" target="_blank" rel="noopener">'+iconLink()+' LinkedIn</a>');
   if(m.github) linkBits.push('<a class="btn btn-ghost btn-sm" href="'+escAttr(m.github)+'" target="_blank" rel="noopener">'+iconLink()+' GitHub</a>');
   var avatar = m.photo ? '<img src="'+escAttr(m.photo)+'" alt="">' : esc(initials(m.name));
+  // Only signed-in (Atlassian) deployments need a way to pin "this is me" —
+  // a guest already picks their own exact display name (see
+  // currentPreparerName), so it already matches whatever they typed here.
+  var showMeOption = !!(state.auth && state.auth.oauthEnabled && state.auth.authenticated);
+  var isMe = showMeOption && myLinkedTeamMemberId()===m.id;
   return '<div class="team-card">'+
     '<div class="dd team-card-menu">'+
       '<button class="btn btn-sm btn-icon" data-action="toggle-team-menu" data-id="'+m.id+'" aria-label="More actions">'+iconDots()+'</button>'+
       '<div class="menu" id="team-menu-'+m.id+'">'+
+        (showMeOption ? '<button data-action="toggle-my-team-member" data-id="'+m.id+'">'+iconUser()+(isMe?' Remove "This is me"':' This is me')+'</button>' : '')+
         '<button data-action="edit-team-member" data-id="'+m.id+'">'+iconEdit()+' Edit</button>'+
         '<button class="danger" data-action="delete-team-member" data-id="'+m.id+'">'+iconTrash()+' Delete</button>'+
       '</div>'+
     '</div>'+
     '<div class="team-avatar'+(m.photo?" has-photo":"")+'">'+avatar+'</div>'+
-    '<div class="team-card-name">'+esc(m.name)+(m.seeded?' <span class="badge badge-manual">Example</span>':'')+'</div>'+
+    '<div class="team-card-name">'+esc(m.name)+(isMe?' <span class="badge badge-me" title="Entities assigned to this name show up in your My Regression view">'+iconUser()+' You</span>':'')+(m.seeded?' <span class="badge badge-manual">Example</span>':'')+'</div>'+
     '<div class="team-card-role">'+esc(m.role||"")+(m.regression===false?' <span class="hint">· not in Regression assign list</span>':'')+'</div>'+
     (m.bio ? '<p class="team-card-bio">'+esc(m.bio)+'</p>' : '')+
     (specialtiesHtml ? '<div class="team-card-chips">'+specialtiesHtml+'</div>' : '')+
@@ -4138,6 +4187,10 @@ document.addEventListener("click", function(e){
     case "delete-team-member":
       var teamTarget = state.team[id];
       openConfirm("Delete this team member?", "This removes <b>"+esc(teamTarget?teamTarget.name:"")+"</b> from Know the Team.", "Delete", function(){ deleteTeamMember(id); }, true);
+      break;
+    case "toggle-my-team-member":
+      setMyLinkedTeamMemberId(myLinkedTeamMemberId()===id ? "" : id);
+      render();
       break;
   }
 });

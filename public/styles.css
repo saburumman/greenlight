@@ -144,6 +144,8 @@ a{color:inherit;}
 .badge{display:inline-flex;align-items:center;padding:2px 7px;border-radius:5px;font-size:10.5px;font-weight:700;letter-spacing:.03em;text-transform:uppercase;}
 .badge-manual{background:var(--neutral-bg);color:var(--neutral-fg);}
 .badge-jira{background:var(--info-bg);color:var(--info-fg);}
+.badge-me{background:var(--accent-soft);color:var(--accent);border:1px solid var(--accent-soft-border);gap:3px;}
+.badge-me svg{width:10px;height:10px;}
 
 /* ================= CARDS ================= */
 .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);box-shadow:var(--shadow-card);}
