@@ -373,22 +373,32 @@ async function translateBulletsToArabic(lines) {
   let engine = null;
 
   if (aiService.isConfigured()) {
+    // AI is configured, so it's the only translator we use — no silent
+    // fall-through to the free translator on failure. A Gemini problem
+    // (network error, bad status, or a malformed/length-mismatched
+    // response) is surfaced as a clear error so the person knows to retry
+    // or enter the Arabic manually, instead of getting an unannounced,
+    // lower-quality MyMemory translation.
+    let translated;
     try {
-      const translated = await aiService.translateToArabic(lines);
-      if (Array.isArray(translated) && translated.length === lines.length) {
-        const z = zipNonEmpty(lines, translated);
-        translatedLines = z.lines;
-        sourceLines = z.sources;
-        engine = "gemini";
-      }
-      // else: malformed (wrong length) response — fall through to the free
-      // translator below rather than failing outright.
+      translated = await aiService.translateToArabic(lines);
     } catch (e) {
-      // AI call failed — fall through to the free translator below.
+      const err = new Error(`AI translation failed (${(e && e.message) || "unknown error"}) — try again, or enter the Arabic text manually.`);
+      err.status = (e && e.status) || 502;
+      throw err;
     }
-  }
-
-  if (!translatedLines) {
+    if (!Array.isArray(translated) || translated.length !== lines.length) {
+      const err = new Error("AI translation returned an unexpected response — try again, or enter the Arabic text manually.");
+      err.status = 502;
+      throw err;
+    }
+    const z = zipNonEmpty(lines, translated);
+    translatedLines = z.lines;
+    sourceLines = z.sources;
+    engine = "gemini";
+  } else {
+    // No AI configured at all — fall back to the free translator so the
+    // feature still works without an API key.
     try {
       const raw = await translateLinesFree(lines);
       const z = zipNonEmpty(lines, raw);
