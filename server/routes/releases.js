@@ -400,10 +400,20 @@ router.post("/:id/mobile-release-note/draft-en", asyncHandler(async (req, res) =
   const release = await db.releases.get(req.params.id);
   if (!release) return notFound(res);
 
-  const result = await mobileReleaseNoteLogic.draftEnglishBullets(release);
+  // Optional: specific ticket keys to draft from (see the "Draft From
+  // Tickets" picker in public/app.js) — empty/absent means every ticket,
+  // the original behavior. See mobileReleaseNoteLogic.buildDraftItems for
+  // how this narrows things down.
+  const ticketKeys = Array.isArray(req.body && req.body.ticketKeys)
+    ? req.body.ticketKeys.map((k) => String(k || "").trim()).filter(Boolean)
+    : [];
+
+  const result = await mobileReleaseNoteLogic.draftEnglishBullets(release, ticketKeys);
   if (result.empty) {
     return res.status(400).json({
-      error: "This release has no tickets or release-note items yet to draft bullets from — add tickets (or generate Release Notes) first, or write the bullets manually.",
+      error: ticketKeys.length
+        ? "None of the tickets you selected could be found on this release — pick different tickets, or leave none selected to draft from all of them."
+        : "This release has no tickets or release-note items yet to draft bullets from — add tickets (or generate Release Notes) first, or write the bullets manually.",
     });
   }
   res.json({

@@ -155,7 +155,7 @@ var api = {
   deleteTicket: function(id, key){ return apiCall("DELETE","/releases/"+id+"/tickets/"+encodeURIComponent(key)); },
   jiraSync: function(id){ return apiCall("POST","/releases/"+id+"/jira-sync"); },
   generateReleaseNotes: function(id){ return apiCall("POST","/releases/"+id+"/release-notes/generate"); },
-  draftMobileNoteEn: function(id){ return apiCall("POST","/releases/"+id+"/mobile-release-note/draft-en"); },
+  draftMobileNoteEn: function(id, ticketKeys){ return apiCall("POST","/releases/"+id+"/mobile-release-note/draft-en", {ticketKeys: ticketKeys||[]}); },
   translateMobileNoteAr: function(id, enUS){ return apiCall("POST","/releases/"+id+"/mobile-release-note/translate-ar", {enUS:enUS}); },
   syncRegressionModules: function(id){ return apiCall("POST","/releases/"+id+"/regression-sync"); },
   jiraStatus: function(){ return apiCall("GET","/jira/status"); },
@@ -3871,18 +3871,25 @@ function setMobileNoteButtonBusy(action, on, busyLabel, idleHtml){
     btn.innerHTML = idleHtml;
   }
 }
-function handleDraftMobileNoteEn(r){
-  var run = function(){
+// Does the actual draft API call + textarea fill — shared by both paths
+// into it: the ticket-picker modal's "Generate" (below), and directly here
+// when there are no tickets to pick from in the first place. ticketKeys is
+// an array of Jira keys to draft from; empty/omitted means "every ticket on
+// this release", exactly the original (pre-picker) behavior.
+function runDraftMobileNoteEn(r, ticketKeys){
+  var keys = ticketKeys || [];
+  var doDraft = function(){
     clearMobileNoteValidation("mrn-en-validation");
     setMobileNoteButtonBusy("draft-mobile-note-en", true, "Drafting…", iconSpark()+' Draft from tickets');
-    api.draftMobileNoteEn(r._id).then(function(result){
+    api.draftMobileNoteEn(r._id, keys).then(function(result){
       setMobileNoteButtonBusy("draft-mobile-note-en", false, "", iconSpark()+' Draft from tickets');
       var ta = qs("#mrn-en");
       if(ta) ta.value = result.enUS || "";
       state.mobileNoteDirty = true;
       updateMobileNoteStatus(r);
       updateMobileNoteCounters();
-      showToast(result.aiUsed ? "Drafted from this release's tickets — review before saving." : "Drafted simple bullets from ticket titles (AI drafting isn't configured) — review before saving.");
+      var sourceNote = keys.length ? " from "+keys.length+" selected ticket"+pluralize(keys.length,"","s") : " from this release's tickets";
+      showToast(result.aiUsed ? "Drafted"+sourceNote+" — review before saving." : "Drafted simple bullets"+sourceNote+" (AI drafting isn't configured) — review before saving.");
       var droppedLabels = (result.droppedItems||[]).map(function(it){
         return (it.key? it.key+": ":"")+(it.title||"(untitled ticket)");
       });
@@ -3895,8 +3902,53 @@ function handleDraftMobileNoteEn(r){
   };
   var ta = qs("#mrn-en");
   if(ta && ta.value.trim()){
-    openConfirm("Redraft English bullets?", "This replaces the current English text with a fresh draft from this release's tickets.", "Redraft", run, false);
-  } else run();
+    openConfirm("Redraft English bullets?", "This replaces the current English text with a fresh draft from "+(keys.length ? "the tickets you selected." : "this release's tickets.")+"", "Redraft", doDraft, false);
+  } else doDraft();
+}
+// "Draft from tickets" opens a picker so specific tickets can be chosen as
+// the source — e.g. a release that bundles some internal/non-user-facing
+// work the store listing shouldn't mention. Leaving every checkbox unchecked
+// and clicking Generate keeps the original behavior exactly: every ticket on
+// the release. Skips straight to drafting (no picker) when there's nothing
+// to pick from yet — same as before this feature existed.
+function openMobileNoteTicketPickerModal(r){
+  var tickets = r.tickets || [];
+  if(!tickets.length){ runDraftMobileNoteEn(r, []); return; }
+  var body =
+    '<p class="helper-text">Pick which tickets to draft the English bullets from. Leave none checked to draft from every ticket in this release.</p>'+
+    '<div class="field-row" style="margin:0 0 10px;">'+
+      '<button type="button" class="btn btn-sm" id="mrn-picker-select-all">Select all</button>'+
+      '<button type="button" class="btn btn-sm" id="mrn-picker-clear">Clear</button>'+
+    '</div>'+
+    '<div class="mrn-ticket-picker-list" id="mrn-picker-list">'+tickets.map(function(t, i){
+      var id = "mrn-pick-"+i;
+      return '<label class="mrn-ticket-picker-row" for="'+id+'">'+
+        '<input type="checkbox" id="'+id+'" value="'+escAttr(t.key)+'">'+
+        '<span><span class="mrn-ticket-picker-key">'+esc(t.key)+'</span>'+esc(t.title||"(untitled ticket)")+'</span>'+
+      '</label>';
+    }).join("")+'</div>';
+  var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">'+iconSpark()+' Generate</button>';
+  openModal(modalShell("Draft From Tickets", body, foot), {wide:true});
+
+  var listEl = qs("#mrn-picker-list");
+  var selectAllBtn = qs("#mrn-picker-select-all");
+  var clearBtn = qs("#mrn-picker-clear");
+  if(selectAllBtn) selectAllBtn.addEventListener("click", function(){
+    qsa('input[type="checkbox"]', listEl).forEach(function(cb){ cb.checked = true; });
+  });
+  if(clearBtn) clearBtn.addEventListener("click", function(){
+    qsa('input[type="checkbox"]', listEl).forEach(function(cb){ cb.checked = false; });
+  });
+
+  qs("#modal-form").addEventListener("submit", function(e){
+    e.preventDefault();
+    var selectedKeys = qsa('input[type="checkbox"]:checked', listEl).map(function(cb){ return cb.value; });
+    closeModal();
+    runDraftMobileNoteEn(r, selectedKeys);
+  });
+}
+function handleDraftMobileNoteEn(r){
+  openMobileNoteTicketPickerModal(r);
 }
 function handleTranslateMobileNoteAr(r){
   var enTa = qs("#mrn-en");

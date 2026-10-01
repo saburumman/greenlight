@@ -214,13 +214,38 @@ function ensureEnglishBullets(bullets) {
 // (release.tickets), summarized with the same rule-based categorizer/
 // summary Release Notes itself falls back to, for a release that has
 // tickets but has never run "Generate Release Notes".
-function buildDraftItems(release) {
-  const rnItems = (release.releaseNotes && release.releaseNotes.items) || [];
-  if (rnItems.length) {
-    return rnItems.map((it) => ({ key: it.sourceKey, title: it.title, description: it.description, category: it.category }));
-  }
+//
+// ticketKeys (optional): when given a non-empty array of Jira keys, narrows
+// the result down to just those tickets — the "Draft From Tickets" picker in
+// public/app.js (openMobileNoteTicketPickerModal). Omitted/empty means every
+// ticket, exactly the pre-picker behavior above. A selected key that isn't
+// covered by release.releaseNotes.items (e.g. a ticket added after Release
+// Notes was last generated) still gets drafted — it falls back to the same
+// rule-based summary the no-Release-Notes-yet path already uses below —
+// rather than silently dropping that ticket from the draft.
+function buildDraftItems(release, ticketKeys) {
+  const selected = Array.isArray(ticketKeys) && ticketKeys.length ? new Set(ticketKeys) : null;
   const tickets = release.tickets || [];
-  return tickets.map((t) => {
+  const rnItems = (release.releaseNotes && release.releaseNotes.items) || [];
+
+  if (rnItems.length) {
+    let items = rnItems.map((it) => ({ key: it.sourceKey, title: it.title, description: it.description, category: it.category }));
+    if (selected) {
+      const covered = new Set(items.filter((it) => it.key && selected.has(it.key)).map((it) => it.key));
+      items = items.filter((it) => it.key && selected.has(it.key));
+      const missing = tickets.filter((t) => selected.has(t.key) && !covered.has(t.key));
+      items = items.concat(
+        missing.map((t) => {
+          const rb = releaseNotesLogic.ruleBasedSummary(t);
+          return { key: t.key, title: rb.title, description: rb.description, category: rb.category };
+        })
+      );
+    }
+    return items;
+  }
+
+  const base = selected ? tickets.filter((t) => selected.has(t.key)) : tickets;
+  return base.map((t) => {
     const rb = releaseNotesLogic.ruleBasedSummary(t);
     return { key: t.key, title: rb.title, description: rb.description, category: rb.category };
   });
@@ -255,8 +280,8 @@ function linesToBullets(text) {
 // pattern as releaseNotesLogic.generateReleaseNotes). Always returns a
 // usable result: AI attempt + validation, falling back to
 // bulletFallbackLine per item on any failure or when AI isn't configured.
-async function draftEnglishBullets(release) {
-  const items = buildDraftItems(release);
+async function draftEnglishBullets(release, ticketKeys) {
+  const items = buildDraftItems(release, ticketKeys);
   if (!items.length) {
     return { bullets: [], aiUsed: false, warning: null, droppedItems: [], empty: true };
   }
