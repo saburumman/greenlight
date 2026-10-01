@@ -24,19 +24,32 @@ function newReleaseDoc(name, version, date, qaOwner, regressionModules) {
     // at creation time — each release owns its own copy, so editing the
     // master list later never changes a release that already exists (see
     // db.regressionModules and routes/regressionModules.js).
-    regression: (regressionModules || []).map((entity) => ({
-      id: crypto.randomUUID(),
-      entityId: entity.id,
-      name: entity.name,
-      owner: "", // who's covering this entity's regression, for this release only — set from the UI, never copied from the master list
-      services: (entity.services || []).map((s) => ({
+    regression: (regressionModules || []).map((entity) => {
+      const services = (entity.services || []).map((s) => ({
         id: crypto.randomUUID(),
         serviceId: s.id,
         name: s.name,
         status: "NOT TESTED",
         notes: "",
-      })),
-    })),
+      }));
+      const row = {
+        id: crypto.randomUUID(),
+        entityId: entity.id,
+        name: entity.name,
+        owner: "", // who's covering this entity's regression, for this release only — set from the UI, never copied from the master list
+        services,
+      };
+      // No services under this entity (e.g. a page not broken into
+      // sub-services) — give the entity its own status/notes so it's
+      // tracked as a single item instead of having no status control at
+      // all and being silently excluded from the release's regression
+      // totals (see regressionAllServices in public/app.js).
+      if (!services.length) {
+        row.status = "NOT TESTED";
+        row.notes = "";
+      }
+      return row;
+    }),
     regressionSkipped: false, // when true, regression is excluded from the AI assessment for this release
     published: null, // set when "Publish Release" is clicked — { at, recommendation } snapshot; never blocks further edits
     bugs: [],
@@ -475,21 +488,30 @@ router.post("/:id/regression-sync", asyncHandler(async (req, res) => {
   for (const masterEntity of masterEntities) {
     let releaseEntity = release.regression.find((e) => e.entityId === masterEntity.id);
     if (!releaseEntity) {
-      release.regression.push({
+      const newServices = (masterEntity.services || []).map((s) => ({
+        id: crypto.randomUUID(),
+        serviceId: s.id,
+        name: s.name,
+        status: "NOT TESTED",
+        notes: "",
+      }));
+      const newRow = {
         id: crypto.randomUUID(),
         entityId: masterEntity.id,
         name: masterEntity.name,
         owner: "",
-        services: (masterEntity.services || []).map((s) => ({
-          id: crypto.randomUUID(),
-          serviceId: s.id,
-          name: s.name,
-          status: "NOT TESTED",
-          notes: "",
-        })),
-      });
+        services: newServices,
+      };
+      // No services under this entity — give it its own status/notes (see
+      // the matching comment in newReleaseDoc above) so it's tracked as a
+      // single item rather than left with no status control at all.
+      if (!newServices.length) {
+        newRow.status = "NOT TESTED";
+        newRow.notes = "";
+      }
+      release.regression.push(newRow);
       addedEntities += 1;
-      addedServices += (masterEntity.services || []).length;
+      addedServices += newServices.length;
       continue;
     }
     // Entity already tracked on this release — keep its display name
@@ -510,6 +532,14 @@ router.post("/:id/regression-sync", asyncHandler(async (req, res) => {
       } else {
         existingService.name = masterService.name;
       }
+    }
+    // Backfills an entity that was already tracked with zero services
+    // before this feature existed (e.g. synced before this change shipped)
+    // so it still gets a real status/notes pair rather than relying solely
+    // on the client's display-time default.
+    if (!releaseEntity.services.length && releaseEntity.status === undefined) {
+      releaseEntity.status = "NOT TESTED";
+      releaseEntity.notes = releaseEntity.notes || "";
     }
   }
 

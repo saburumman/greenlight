@@ -492,13 +492,26 @@ function regressionEntities(r){
 function regressionAllServices(r){
   var out = [];
   regressionEntities(r).forEach(function(entity){
-    (entity.services||[]).forEach(function(s){
+    var services = entity.services||[];
+    if(!services.length){
+      // No services under this entity (e.g. a page that isn't broken into
+      // sub-services) — the entity's own status, set via the "Overall
+      // status" control, stands in for it so it still counts toward the
+      // release's regression totals/overall status instead of silently
+      // being left out. Defaults to NOT TESTED, same as a freshly-synced
+      // service, so an entity nobody has looked at yet still reads as
+      // outstanding rather than as passing by omission.
+      out.push({ entityId:entity.id, entityName:entity.name, id:entity.id, name:entity.name, status:entity.status||"NOT TESTED", notes:entity.notes, _entityLevel:true });
+      return;
+    }
+    services.forEach(function(s){
       out.push({ entityId:entity.id, entityName:entity.name, id:s.id, name:s.name, status:s.status, notes:s.notes });
     });
   });
   return out;
 }
 function regressionItemLabel(m){
+  if(m._entityLevel) return m.entityName || m.name || "Unnamed entity";
   return (m.entityName? m.entityName+" – ":"")+(m.name||"Unnamed service");
 }
 function regressionOverallStatus(r){
@@ -2592,6 +2605,19 @@ function regressionStatusButtons(entityId, s){
       '<label for="'+inputId+'" class="tone-'+toneForStatus(opt)+'">'+esc(opt)+'</label>';
   }).join("")+'</div>';
 }
+// Same segmented status control as regressionStatusButtons, but scoped to
+// the Entity itself rather than one of its services — used only when the
+// entity has no services configured, so there's otherwise no status control
+// for it at all (see renderRegressionEntityGroup).
+function regressionEntityStatusButtons(entity){
+  var current = entity.status || "NOT TESTED";
+  return '<div class="status-choice regression-status-choice">'+REG_STATUSES.map(function(opt){
+    var inputId = "regentstatus-"+entity.id+"-"+opt.replace(/[^A-Za-z0-9]/g,"");
+    return '<input type="radio" name="regentstatus-'+entity.id+'" id="'+inputId+'" value="'+esc(opt)+'" '+
+      'data-action="set-regression-entity-status" data-entity-id="'+esc(entity.id)+'" '+(opt===current?"checked":"")+'>'+
+      '<label for="'+inputId+'" class="tone-'+toneForStatus(opt)+'">'+esc(opt)+'</label>';
+  }).join("")+'</div>';
+}
 // Compact horizontal card for one module: name on the first line, status
 // pills + the existing notes ("comment") button on the second. No owner
 // control here — assignment lives on the Entity only (see the heading row
@@ -2615,17 +2641,44 @@ function renderRegressionServiceRow(entity, s){
 }
 function renderRegressionEntityGroup(entity){
   var services = entity.services||[];
-  var rows = services.map(function(s){ return renderRegressionServiceRow(entity, s); }).join("");
   var owner = entity.owner || "";
+  var ownerBtnHtml = '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn'+(owner?" has-owner":"")+'" data-action="edit-regression-owner" data-entity-id="'+entity.id+'" title="'+(owner?"Change owner":"Assign an owner")+'">'+iconUser()+' '+(owner? esc(owner) : "Assign owner")+'</button>';
+  if(!services.length){
+    // No services under this entity (e.g. a page that isn't broken into
+    // sub-services) — track regression status on the entity itself as a
+    // single item instead of leaving it with no status control at all.
+    // Reuses the same row markup/classes as a service row (regression-
+    // service-row, reg-row-*) so it looks and behaves consistently.
+    var entStatus = entity.status || "NOT TESTED";
+    return '<div class="regression-entity-group">'+
+      '<div class="regression-entity-heading-row">'+
+        '<div class="regression-entity-heading-main">'+
+          '<div class="regression-entity-heading">'+esc(entity.name||"Unnamed entity")+'</div>'+
+          '<div class="regression-entity-summary">No services configured — tracked as one item</div>'+
+        '</div>'+
+        ownerBtnHtml+
+      '</div>'+
+      '<div class="item-list"><div class="item-row regression-service-row'+(entStatus==="FAIL"?" is-flagged":"")+'">'+
+        '<div class="reg-row-top"><div class="reg-row-name">Overall status</div></div>'+
+        '<div class="reg-row-bottom">'+regressionEntityStatusButtons(entity)+
+          '<div class="item-row-actions reg-row-actions">'+
+            '<button type="button" class="btn btn-sm btn-icon" data-action="edit-regression-entity-notes" data-entity-id="'+entity.id+'" aria-label="'+(entity.notes?"Edit":"Add")+' notes" title="'+(entity.notes?"Edit":"Add")+' notes">'+iconNote()+'</button>'+
+          '</div>'+
+        '</div>'+
+        (entity.notes? '<div class="item-row-desc reg-row-notes">'+esc(entity.notes)+'</div>':'')+
+      '</div></div>'+
+    '</div>';
+  }
+  var rows = services.map(function(s){ return renderRegressionServiceRow(entity, s); }).join("");
   return '<div class="regression-entity-group">'+
     '<div class="regression-entity-heading-row">'+
       '<div class="regression-entity-heading-main">'+
         '<div class="regression-entity-heading">'+esc(entity.name||"Unnamed entity")+'</div>'+
         '<div class="regression-entity-summary">'+esc(regressionEntitySummaryLine(entity))+'</div>'+
       '</div>'+
-      '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn'+(owner?" has-owner":"")+'" data-action="edit-regression-owner" data-entity-id="'+entity.id+'" title="'+(owner?"Change owner":"Assign an owner")+'">'+iconUser()+' '+(owner? esc(owner) : "Assign owner")+'</button>'+
+      ownerBtnHtml+
     '</div>'+
-    (services.length ? '<div class="item-list">'+rows+'</div>' : '<div class="empty-row">No services configured for this entity.</div>')+
+    '<div class="item-list">'+rows+'</div>'+
   '</div>';
 }
 // Buckets entities by their assigned Owner (case-insensitive on the name,
@@ -3384,6 +3437,28 @@ function openRegressionNotesModal(r, entity, existing){
     var regLabel = (entity.name||"Unnamed entity")+(isLegacy? "" : " — "+(existing.name||"Unnamed service"));
     persistRelease(r, function(){
       logAudit({action:"REGRESSION_UPDATED", entityType:"Regression", entityId: existing.id || entity.id, details: "Updated notes — "+regLabel});
+    });
+  });
+}
+
+// Notes for an entity's own "Overall status" (used only when the entity has
+// no services — see renderRegressionEntityGroup/regressionEntityStatusButtons).
+// `entity` here is always the real release.regression row (regressionEntities()
+// returns it directly, not a copy, for anything that isn't a legacy flat
+// row — and a 0-service entity can never be legacy, see regressionEntities),
+// so writing straight to entity.notes is safe.
+function openRegressionEntityNotesModal(r, entity){
+  var body =
+    '<div class="regmod-edit-name">'+esc(entity.name||"Unnamed entity")+'</div>'+
+    '<div class="field"><label for="f-notes">Notes</label><textarea id="f-notes" rows="4" placeholder="Add a note about this page’s regression result…">'+esc(entity.notes||"")+'</textarea></div>';
+  var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">Save note</button>';
+  openModal(modalShell("Regression notes", body, foot));
+  qs("#modal-form").addEventListener("submit", function(e){
+    e.preventDefault();
+    entity.notes = qs("#f-notes").value.trim();
+    closeModal();
+    persistRelease(r, function(){
+      logAudit({action:"REGRESSION_UPDATED", entityType:"Regression", entityId: entity.id, details: "Updated notes — "+(entity.name||"Unnamed entity")});
     });
   });
 }
@@ -4157,6 +4232,12 @@ document.addEventListener("click", function(e){
         if(ent && svc) openRegressionNotesModal(r, ent, svc);
       }
       break;
+    case "edit-regression-entity-notes":
+      if(r){
+        var entN = regressionEntities(r).find(function(x){return x.id===entityId;});
+        if(entN) openRegressionEntityNotesModal(r, entN);
+      }
+      break;
     case "edit-regression-owner":
       if(r){
         var entOwner = regressionEntities(r).find(function(x){return x.id===entityId;});
@@ -4321,6 +4402,16 @@ document.addEventListener("change", function(e){
     var regLabel4 = (ent4.name?ent4.name+" – ":"")+(svc4.name||"Unnamed service");
     persistRelease(r4, function(){
       logAudit({action:"REGRESSION_UPDATED", entityType:"Regression", entityId:svc4.id, details: regLabel4+" → "+target4.status});
+    });
+  }
+  if(elp.matches('[data-action="set-regression-entity-status"]')){
+    var r9 = state.releases[state.route.id]; if(!r9) return;
+    var entId9 = elp.getAttribute("data-entity-id");
+    var ent9 = regressionEntities(r9).find(function(x){return x.id===entId9;});
+    if(!ent9) return;
+    ent9.status = elp.value;
+    persistRelease(r9, function(){
+      logAudit({action:"REGRESSION_UPDATED", entityType:"Regression", entityId:ent9.id, details: (ent9.name||"Unnamed entity")+" → "+ent9.status});
     });
   }
   if(elp.id === "ticket-group-by"){
