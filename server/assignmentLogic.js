@@ -37,26 +37,33 @@ function normalizeName(name) {
     .trim();
 }
 
+function compactName(name) {
+  return normalizeName(name).replace(/ /g, "");
+}
+
 function indexTeam(team) {
   const byId = new Map();
-  const byName = new Map(); // normalized name -> id, only when UNIQUE
-  const seen = new Map();
+  const byName = new Map(); // compact name (or Jira name) -> id, only when UNIQUE
+  const claims = new Map(); // key -> set of member ids claiming it
   for (const m of team || []) {
     if (!m || !m.id) continue;
     byId.set(m.id, m);
-    const key = normalizeName(m.name);
-    if (!key) continue;
-    seen.set(key, (seen.get(key) || 0) + 1);
-    byName.set(key, m.id);
+    const names = [m.name].concat(Array.isArray(m.jiraNames) ? m.jiraNames : []);
+    for (const n of names) {
+      const key = compactName(n);
+      if (!key) continue;
+      if (!claims.has(key)) claims.set(key, new Set());
+      claims.get(key).add(m.id);
+    }
   }
-  // Two members normalizing to the same name would make a name match a
-  // guess — leave those unresolved rather than picking one.
-  for (const [key, n] of seen) if (n > 1) byName.delete(key);
+  // Two members claiming the same name would make a match a guess — leave
+  // those unresolved rather than picking one.
+  for (const [key, ids] of claims) if (ids.size === 1) byName.set(key, [...ids][0]);
   return { byId, byName };
 }
 
 function resolveNameToId(name, index) {
-  const key = normalizeName(name);
+  const key = compactName(name);
   return key && index.byName.has(key) ? index.byName.get(key) : null;
 }
 

@@ -1,7 +1,8 @@
 // "Know the Team" API — a small, editable roster, independent of releases
 // and independent of the auth system entirely: this is display-only data
 // (name, role, bio, specialties, tools, optional links/photo), never a
-// permission, role, or account of any kind. Mirrors routes/testData.js's
+// role or account. The one exception is the opt-in `statisticsAccess` flag,
+// which only decides who is shown the Statistics page. Mirrors routes/testData.js's
 // style — a plain top-level collection, simple REST verbs, no new patterns.
 //
 // Auth: every request here already passed requireAuth (see index.js /
@@ -71,7 +72,19 @@ function validateAndClean(body) {
   // eligible (true) for backward compatibility — see regressionOwnerOptions()
   // in public/app.js.
   const regression = !!(body && body.regression);
-  return { clean: { name, role, department, bio, specialties, tools, linkedin, github, photo, regression } };
+  const clean = { name, role, department, bio, specialties, tools, linkedin, github, photo, regression };
+  // Who may open the Statistics page. Opt-in (a member without the key has no
+  // access). Only set when the request actually carries a boolean, so an
+  // edit from a client that doesn't know about it can never switch someone's
+  // access off (PUT merges these fields over the existing record).
+  if (body && typeof body.statisticsAccess === "boolean") clean.statisticsAccess = body.statisticsAccess;
+  // Extra names this person goes by in Jira (when it spells them differently
+  // from `name`), used to match Jira's "QA Assigned" field to them. Same
+  // "only when sent" rule, so an older client can't wipe them.
+  if (body && (Array.isArray(body.jiraNames) || typeof body.jiraNames === "string")) {
+    clean.jiraNames = cleanStringList(body.jiraNames);
+  }
+  return { clean };
 }
 
 router.get("/", asyncHandler(async (req, res) => {
@@ -85,6 +98,7 @@ router.post("/", asyncHandler(async (req, res) => {
   const id = crypto.randomUUID();
   const member = {
     id,
+    statisticsAccess: false,
     ...result.clean,
     seeded: false,
     createdBy: (req.authUser && req.authUser.name) || "Unknown",

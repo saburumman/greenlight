@@ -1179,12 +1179,20 @@ var SIDENAV_ITEMS = [
   {icon:"🏠", label:"Landing Page", action:"nav-home", match:["home"]},
   {icon:"🚀", label:"Release Monitor", action:"nav-list", match:["list","detail"]},
   {icon:"🧪", label:"Test Data", action:"nav-test-data", match:["testData"]},
-  {icon:"📊", label:"Statistics", action:"nav-statistics", match:["statistics"]},
+  {icon:"📊", label:"Statistics", action:"nav-statistics", match:["statistics"], needs:"statistics"},
   {icon:"📋", label:"Audit", action:"nav-audit", match:["audit"]},
   {icon:"👥", label:"Know the Team", action:"nav-team", match:["team"]}
 ];
+// Statistics is limited to the Know the Team members flagged "Statistics
+// access" — an opt-in flag (absent/false = no access) on the member the
+// signed-in user linked themselves to. This gates the UI (nav item, landing
+// card, the page itself); see README for what it does and doesn't protect.
+function canViewStatistics(){
+  var me = currentMember();
+  return !!(me && me.statisticsAccess===true);
+}
 function sidenavHtml(){
-  return SIDENAV_ITEMS.map(function(it){
+  return SIDENAV_ITEMS.filter(function(it){ return it.needs!=="statistics" || canViewStatistics(); }).map(function(it){
     var active = it.match.indexOf(state.route.view) > -1;
     return '<button type="button" class="sidenav-item'+(active?" active":"")+'" data-action="'+it.action+'">'+
       '<span class="sidenav-icon">'+it.icon+'</span><span class="sidenav-label">'+esc(it.label)+'</span></button>';
@@ -1278,7 +1286,7 @@ function renderHome(){
     {icon:"📊", title:"Statistics", desc:"See QA workload and activity by date, release and team member.", btn:"Open Statistics →", action:"nav-statistics"},
     {icon:"📋", title:"Audit", desc:"Track important changes and see who performed them.", btn:"View Audit →", action:"nav-audit"},
     {icon:"👥", title:"Know the Team", desc:"Meet the people behind the quality.", btn:"Meet the Team →", action:"nav-team"}
-  ];
+  ].filter(function(c){ return c.action!=="nav-statistics" || canViewStatistics(); });
   var cardsHtml = '<section class="home-section"><div class="feature-grid">'+
     cards.map(function(c){
       return '<div class="feature-card">'+
@@ -1549,6 +1557,13 @@ function statsReleaseItems(r){
   });
   return items;
 }
+// Statistics covers the QA team only: Know the Team members available for
+// regression assignment (the same list the Regression section assigns from).
+function statsQaIds(){
+  var o = {};
+  regressionOwnerOptions().forEach(function(m){ o[m.id] = true; });
+  return o;
+}
 function statsEmptyRow(){ return {tickets:0, regression:0, passed:0, failed:0, blocked:0}; }
 function statsAddItem(row, it){
   if(it.kind==="ticket"){ row.tickets++; if(it.blocked) row.blocked++; }
@@ -1560,11 +1575,14 @@ function computeStatistics(f, now){
   f = Object.assign(statsDefaultFilters(), f||{});
   var bounds = statsRangeBounds(f, now);
   var relIds = (state.releaseOrder||[]).filter(function(id){ return state.releases[id] && (!f.releaseId || id===f.releaseId); });
+  var qa = statsQaIds();
 
   // ---- snapshot items (assignments + where each stands) ----
   var items = [];
   relIds.forEach(function(id){
     statsReleaseItems(state.releases[id]).forEach(function(it){
+      if(it.kind==="blocker") return; // release-level, belongs to no one
+      if(!qa[it.assignee]) return; // unassigned, or not a QA team member
       if(!statsInRange(it.ts, bounds, f)) return;
       if(f.memberId && it.assignee!==f.memberId) return;
       items.push(it);
@@ -1603,6 +1621,7 @@ function computeStatistics(f, now){
     var ts = statsTime(e.createdAt);
     if(!statsInRange(ts, bounds, f)) return;
     if(e.action==="REGRESSION_UPDATED" && m.newStatus){
+      if(!m.changedBy || !qa[m.changedBy]) return; // only QA team members' activity
       if(f.memberId && m.changedBy!==f.memberId) return;
       eventCount++;
       var d = dayRow(ts);
@@ -1610,9 +1629,9 @@ function computeStatistics(f, now){
       else if(m.newStatus==="FAIL") d.failed++;
       else if(m.newStatus==="WARNING") d.warning++;
       else if(m.newStatus==="NOT TESTED") d.notTested++;
-      if(m.changedBy) actRow(m.changedBy).statusChanges++; else unlinkedChanges++;
-      if(m.assignedTo && m.changedBy!==m.assignedTo) actRow(m.assignedTo).changedByOthers++;
-    } else if(STATS_ASSIGN_ACTIONS.indexOf(e.action)>-1 && m.assignedTo && m.scope!=="module-inherit"){
+      actRow(m.changedBy).statusChanges++;
+      if(m.assignedTo && qa[m.assignedTo] && m.changedBy!==m.assignedTo) actRow(m.assignedTo).changedByOthers++;
+    } else if(STATS_ASSIGN_ACTIONS.indexOf(e.action)>-1 && m.assignedTo && qa[m.assignedTo] && m.scope!=="module-inherit"){
       if(f.memberId && m.assignedTo!==f.memberId) return;
       eventCount++;
       dayRow(ts).assigned++;
@@ -1647,7 +1666,7 @@ function statsTable(headers, rowsHtml){
 function statsNumCell(n){ return '<td class="num">'+n+'</td>'; }
 function statsFiltersHtml(f){
   var releases = (state.releaseOrder||[]).map(function(id){ return state.releases[id]; }).filter(Boolean);
-  var members = allTeamMembers();
+  var members = regressionOwnerOptions();
   return '<div class="stats-filters">'+
     '<div class="field"><label for="stats-range">Date</label><select id="stats-range" data-stats-field="range">'+
       STATS_RANGES.map(function(o){ return '<option value="'+o.value+'"'+(f.range===o.value?" selected":"")+'>'+esc(o.label)+'</option>'; }).join("")+'</select></div>'+
@@ -1659,8 +1678,18 @@ function statsFiltersHtml(f){
       members.map(function(m){ return '<option value="'+escAttr(m.id)+'"'+(f.memberId===m.id?" selected":"")+'>'+esc(m.name)+'</option>'; }).join("")+'</select></div>'+
   '</div>';
 }
+function renderStatisticsNoAccess(){
+  var me = currentMember();
+  var why = !me
+    ? 'Link your sign-in to your <b>Know the Team</b> entry first (top bar → Link to team), then ask a teammate who has access to turn on <b>Statistics access</b> for you.'
+    : 'Your Know the Team entry doesn’t have <b>Statistics access</b>. Ask a teammate who has it to turn it on in Know the Team → Edit.';
+  return '<div class="list-head"><div><h1>Statistics</h1></div></div>'+
+    '<div class="empty-state"><h3>You don’t have access to Statistics</h3><p>'+why+'</p></div>';
+}
 function renderStatistics(){
-  var head = '<div class="list-head"><div><h1>Statistics</h1><p>Workload and QA activity across releases — for visibility only, not a performance measure.</p></div></div>';
+  if(!state.teamReady) return '<div class="list-head"><div><h1>Statistics</h1></div></div><div class="empty-state"><h3>Loading…</h3></div>';
+  if(!canViewStatistics()) return renderStatisticsNoAccess();
+  var head = '<div class="list-head"><div><h1>Statistics</h1><p>Workload and QA activity of the QA team across releases — for visibility only, not a performance measure.</p></div></div>';
   if(!state.listReady || !state.auditReady) return head+'<div class="empty-state"><h3>Loading statistics…</h3></div>';
   var f = state.statsFilters || (state.statsFilters = statsDefaultFilters());
   var st = computeStatistics(f);
@@ -1676,7 +1705,7 @@ function renderStatistics(){
 
   var memberRows = statsOrderedIds(st.byMember).map(function(id){
     var r = st.byMember[id]; if(statsRowIsEmpty(r)) return "";
-    return '<tr><td>'+esc(statsMemberLabel(id))+(id===""?' <span class="hint">· incl. release blockers</span>':'')+'</td>'+statsNumCell(r.tickets)+statsNumCell(r.regression)+statsNumCell(r.passed)+statsNumCell(r.failed)+statsNumCell(r.blocked)+'</tr>';
+    return '<tr><td>'+esc(statsMemberLabel(id))+'</td>'+statsNumCell(r.tickets)+statsNumCell(r.regression)+statsNumCell(r.passed)+statsNumCell(r.failed)+statsNumCell(r.blocked)+'</tr>';
   }).join("");
   var releaseRows = (state.releaseOrder||[]).filter(function(id){ return st.byRelease[id] && !statsRowIsEmpty(st.byRelease[id]); }).map(function(id){
     var r = st.byRelease[id];
@@ -1689,7 +1718,7 @@ function renderStatistics(){
   var actRows = actIds.map(function(id){
     var a = st.activity[id]; if(!a.assigned && !a.statusChanges && !a.changedByOthers) return "";
     return '<tr><td>'+esc(memberNameById(id))+'</td>'+statsNumCell(a.assigned)+statsNumCell(a.statusChanges)+statsNumCell(a.changedByOthers)+'</tr>';
-  }).join("") + (st.unlinkedChanges ? '<tr><td>Not linked to a team member</td>'+statsNumCell(0)+statsNumCell(st.unlinkedChanges)+statsNumCell(0)+'</tr>' : '');
+  }).join("");
 
   return head+filtersHtml+cardsHtml+
     '<div class="stats-section"><h2>By QA member</h2>'+statsTable(["QA Member","Tickets","Regression","Passed","Failed","Blocked"], memberRows)+'</div>'+
@@ -1698,7 +1727,7 @@ function renderStatistics(){
       '<p class="stats-note">Counts regression assignments and status changes recorded in the Audit Log, per day.</p></div>'+
     '<div class="stats-section"><h2>Assignment vs. activity</h2>'+statsTable(["QA Member","Assigned","Status Changes","Changed By Others"], actRows)+
       '<p class="stats-note">Assigned = regression modules currently assigned · Status Changes = regression statuses the member changed · Changed By Others = changes to the member’s assigned regression made by someone else. This is for QA workflow visibility only — not a measure of anyone’s performance.</p></div>'+
-    '<p class="stats-note">Items assigned before assignment dates were recorded have no date, so they appear under “All time” only. Release blockers belong to the release, so they are counted under Unassigned and only when no member is selected.</p>';
+    '<p class="stats-note">Items assigned before assignment dates were recorded have no date, so they appear under “All time” only. Only QA team members (Know the Team members available for regression assignment) are included — unassigned work, other assignees and release-level blockers are not.</p>';
 }
 
 /* ============================================================
@@ -1744,7 +1773,7 @@ function teamMemberCardHtml(m){
     '</div>'+
     '<div class="team-avatar'+(m.photo?" has-photo":"")+'">'+avatar+'</div>'+
     '<div class="team-card-name">'+esc(m.name)+(isMe?' <span class="badge badge-me" title="Regression assigned to you shows up in your My Regression view">'+iconUser()+' You</span>':'')+(m.seeded?' <span class="badge badge-manual">Example</span>':'')+'</div>'+
-    '<div class="team-card-role">'+esc(m.role||"")+(m.regression===false?' <span class="hint">· not in Regression assign list</span>':'')+'</div>'+
+    '<div class="team-card-role">'+esc(m.role||"")+(m.regression===false?' <span class="hint">· not in Regression assign list</span>':'')+(m.statisticsAccess===true?' <span class="hint">· Statistics access</span>':'')+'</div>'+
     (m.bio ? '<p class="team-card-bio">'+esc(m.bio)+'</p>' : '')+
     (specialtiesHtml ? '<div class="team-card-chips">'+specialtiesHtml+'</div>' : '')+
     (toolsHtml ? '<div class="team-card-chips">'+toolsHtml+'</div>' : '')+
@@ -1833,8 +1862,8 @@ function openTeamMemberModal(existing){
     // A record saved before the Regression toggle existed has no `regression`
     // key at all — treat that as eligible (checked) so nobody who was already
     // usable as a regression assignee silently disappears from the list.
-    ? {name:existing.name, role:existing.role||"", department:existing.department||"", bio:existing.bio||"", specialties:(existing.specialties||[]).slice(), tools:(existing.tools||[]).slice(), linkedin:existing.linkedin||"", github:existing.github||"", photo:existing.photo||"", regression: existing.regression!==false}
-    : {name:"", role:"", department:"", bio:"", specialties:[], tools:[], linkedin:"", github:"", photo:"", regression:true};
+    ? {name:existing.name, role:existing.role||"", department:existing.department||"", bio:existing.bio||"", specialties:(existing.specialties||[]).slice(), tools:(existing.tools||[]).slice(), linkedin:existing.linkedin||"", github:existing.github||"", photo:existing.photo||"", regression: existing.regression!==false, statisticsAccess: existing.statisticsAccess===true, jiraNames:(existing.jiraNames||[]).slice()}
+    : {name:"", role:"", department:"", bio:"", specialties:[], tools:[], linkedin:"", github:"", photo:"", regression:true, statisticsAccess:false, jiraNames:[]};
   var pendingPhoto = draft.photo; // updated in place as the file input changes; submitted as-is
   var departmentOptions = distinct(allTeamMembers().map(function(m){return m.department;}));
 
@@ -1856,6 +1885,7 @@ function openTeamMemberModal(existing){
     suggestionDatalist("team-department-suggestions", departmentOptions)+
     '<div class="field"><label for="f-team-bio">Short bio <span class="hint">(optional)</span></label><textarea id="f-team-bio" rows="3">'+esc(draft.bio)+'</textarea></div>'+
     '<div class="field"><label for="f-team-specialties">QA specialties <span class="hint">(optional)</span></label><input type="text" id="f-team-specialties" value="'+escAttr(draft.specialties.join(", "))+'" placeholder="e.g. Automation, QA Strategy"><span class="hint">Separate multiple with commas.</span></div>'+
+    '<div class="field"><label for="f-team-jira-names">Jira name(s) <span class="hint">(optional)</span></label><input type="text" id="f-team-jira-names" value="'+escAttr(draft.jiraNames.join(", "))+'" placeholder="e.g. Sara\' Aburomman"><span class="hint">Only needed when Jira spells this person differently from the Name above — tickets Jira assigns under it then count for them. Separate multiple with commas.</span></div>'+
     '<div class="field"><label for="f-team-tools">Tools / technologies <span class="hint">(optional)</span></label><input type="text" id="f-team-tools" value="'+escAttr(draft.tools.join(", "))+'" placeholder="e.g. Playwright, Postman"><span class="hint">Separate multiple with commas.</span></div>'+
     '<div class="field-row">'+
       '<div class="field"><label for="f-team-linkedin">LinkedIn <span class="hint">(optional)</span></label><input type="url" id="f-team-linkedin" value="'+escAttr(draft.linkedin)+'" placeholder="https://linkedin.com/in/…"></div>'+
@@ -1864,6 +1894,10 @@ function openTeamMemberModal(existing){
     '<div class="field">'+
       '<span class="regression-skip-toggle">Available for regression assignment'+toggleSwitch("team-regression", draft.regression, "Show this person in the Regression section's assignment dropdowns")+'</span>'+
       '<span class="hint" style="display:block;margin-top:4px;">Off = hidden from the Regression section\'s assign lists (still visible here in Know the Team).</span>'+
+    '</div>'+
+    '<div class="field">'+
+      '<span class="regression-skip-toggle">Statistics access'+toggleSwitch("team-statistics", draft.statisticsAccess, "Let this person open the Statistics page (once they link their sign-in to this card)")+'</span>'+
+      '<span class="hint" style="display:block;margin-top:4px;">Off = the Statistics page is hidden for this person. Takes effect once they use “Link to team” / “This is me”.</span>'+
     '</div>';
   var foot = (isEdit? '<button type="button" class="btn btn-danger" id="del-team-member">'+iconTrash()+' Delete</button>' : '<span></span>')+
     '<span style="flex:1"></span><button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">'+(isEdit?"Save changes":"Save")+'</button>';
@@ -1905,10 +1939,12 @@ function openTeamMemberModal(existing){
       bio: qs("#f-team-bio").value.trim(),
       specialties: splitCommaList(qs("#f-team-specialties").value),
       tools: splitCommaList(qs("#f-team-tools").value),
+      jiraNames: splitCommaList(qs("#f-team-jira-names").value),
       linkedin: qs("#f-team-linkedin").value.trim(),
       github: qs("#f-team-github").value.trim(),
       photo: pendingPhoto,
-      regression: !!(qs("#toggle-team-regression") && qs("#toggle-team-regression").checked)
+      regression: !!(qs("#toggle-team-regression") && qs("#toggle-team-regression").checked),
+      statisticsAccess: !!(qs("#toggle-team-statistics") && qs("#toggle-team-statistics").checked)
     };
     var submitBtn = qs('#modal-form button[type="submit"]');
     if(submitBtn) submitBtn.disabled = true;
@@ -1917,6 +1953,7 @@ function openTeamMemberModal(existing){
       state.team[saved.id] = saved;
       if(state.teamOrder.indexOf(saved.id)===-1) state.teamOrder.unshift(saved.id);
       closeModal();
+      renderSidenav();
       if(state.route.view==="team") render();
       logAudit({action: isEdit ? "TEAM_MEMBER_UPDATED" : "TEAM_MEMBER_ADDED", entityType:"TeamMember", entityId:saved.id, details:saved.name});
       showToast(isEdit? "✓ Team member updated" : "✓ Team member added");
@@ -2823,11 +2860,36 @@ function ticketJiraNames(ticket){
   var list = Array.isArray(v) ? v : (v ? [v] : []);
   return list.map(function(x){ return (x||"").toString().trim(); }).filter(Boolean);
 }
+// Same name with every space/punctuation mark removed ("Al-irani" and
+// "Alirani" and "Al Irani" all read the same).
+function compactName(name){ return normalizeNameForSuggestion(name).replace(/ /g, ""); }
+// The names that identify a member in Jira: their Know the Team name plus any
+// "Jira name(s)" they were given there (member.jiraNames) for when Jira
+// spells them differently.
+function memberJiraKeys(m){
+  var keys = [compactName(m.name)];
+  (Array.isArray(m.jiraNames) ? m.jiraNames : []).forEach(function(n){ keys.push(compactName(n)); });
+  return keys.filter(Boolean);
+}
+// Jira display name -> team member id, only when exactly one member claims it.
 function memberIdForJiraName(name){
-  var key = normalizeNameForSuggestion(name);
+  var key = compactName(name);
   if(!key) return "";
-  var hits = allTeamMembers().filter(function(m){ return normalizeNameForSuggestion(m.name)===key; });
+  var hits = allTeamMembers().filter(function(m){ return memberJiraKeys(m).indexOf(key)>-1; });
   return hits.length===1 ? hits[0].id : "";
+}
+// Names kept from the old name-based model for a ticket whose manual QA
+// assignee couldn't be matched to a member then (see server/assignmentLogic.js).
+function ticketLegacyNames(ticket){
+  var v = ticket && ticket.legacyQaAssignee;
+  return (Array.isArray(v) ? v : []).map(function(x){ return (x||"").toString().trim(); }).filter(Boolean);
+}
+// Names on a ticket that still don't resolve to anyone in Know the Team.
+function ticketUnmatchedNames(ticket){
+  var manual = ticketHasManualAssignee(ticket);
+  if(manual && ticket.assignedTo) return [];
+  var names = manual ? ticketLegacyNames(ticket) : ticketJiraNames(ticket);
+  return names.filter(function(n){ return !memberIdForJiraName(n); });
 }
 function ticketJiraMemberId(ticket){
   var names = ticketJiraNames(ticket);
@@ -2840,7 +2902,14 @@ function ticketJiraMemberId(ticket){
 // The team member a ticket is effectively assigned to ("" = nobody).
 function ticketAssignedMemberId(ticket){
   if(!ticket) return "";
-  if(ticketHasManualAssignee(ticket)) return ticket.assignedTo || "";
+  if(ticketHasManualAssignee(ticket)){
+    if(ticket.assignedTo) return ticket.assignedTo;
+    // Assigned by name before ids existed and not matched back then — try
+    // again now (a member may have been renamed or given a Jira name since).
+    var legacy = ticketLegacyNames(ticket);
+    for(var i=0;i<legacy.length;i++){ var lid = memberIdForJiraName(legacy[i]); if(lid) return lid; }
+    return "";
+  }
   return ticketJiraMemberId(ticket);
 }
 // Short display text: the member's name, or — only when Jira names someone
@@ -2851,6 +2920,9 @@ function ticketAssigneeLabel(ticket){
   if(!ticketHasManualAssignee(ticket)){
     var names = ticketJiraNames(ticket);
     if(names.length) return names.join(", ")+" (Jira)";
+  } else {
+    var old = ticketLegacyNames(ticket);
+    if(old.length) return old.join(", ")+" (not in Know the Team)";
   }
   return "";
 }
@@ -4030,11 +4102,28 @@ function openEditTicketModal(r, ticket){
 // goes back to following Jira's QA Assigned field. The assignment audit
 // event (assigned / reassigned / unassigned, with the previous and new
 // member) is written by the server when the release is saved.
+// Saves an extra Jira display name on a Know the Team member (so tickets
+// Jira assigns under that spelling match them) — same PUT the Edit modal uses.
+function addJiraNameToMember(memberId, jiraName){
+  var m = state.team && state.team[memberId];
+  if(!m || !jiraName) return Promise.resolve();
+  var names = (Array.isArray(m.jiraNames) ? m.jiraNames : []).slice();
+  if(names.indexOf(jiraName)===-1) names.push(jiraName);
+  var payload = {name:m.name, role:m.role||"", department:m.department||"", bio:m.bio||"", specialties:m.specialties||[], tools:m.tools||[],
+    linkedin:m.linkedin||"", github:m.github||"", photo:m.photo||"", regression:m.regression!==false, jiraNames:names};
+  if(typeof m.statisticsAccess==="boolean") payload.statisticsAccess = m.statisticsAccess;
+  return api.updateTeamMember(memberId, payload).then(function(saved){
+    state.team[saved.id] = saved;
+    render();
+    showToast("✓ “"+jiraName+"” now counts as "+saved.name);
+  }).catch(function(err){ showToast((err && err.message) || "Couldn't save the Jira name."); });
+}
 function openTicketAssigneeModal(r, ticket){
   var members = ticketAssigneeOptions();
   var hasOverride = ticketHasManualAssignee(ticket);
   var jiraNames = ticketJiraNames(ticket);
   var current = ticketAssignedMemberId(ticket);
+  var unmatched = ticketUnmatchedNames(ticket);
   var subtitle = hasOverride
     ? (jiraNames.length ? "Jira's own QA Assigned field lists "+jiraNames.join(", ")+". Your choice below overrides it for this release only."
                         : "Set for this release only.")
@@ -4045,7 +4134,10 @@ function openTicketAssigneeModal(r, ticket){
     '<p class="helper-text" style="margin:2px 0 10px;">'+esc(subtitle)+'</p>'+
     (members.length
       ? memberChoiceGroup("ticket-assignee-choice", members, current, [{value:"", label:"Unassigned", after:true}])
-      : '<p class="helper-text" style="margin:0;">No one is in <b>Know the Team</b> yet — add people there first.</p>');
+      : '<p class="helper-text" style="margin:0;">No one is in <b>Know the Team</b> yet — add people there first.</p>')+
+    (unmatched.length && members.length
+      ? '<label class="helper-text" style="display:flex;gap:6px;align-items:flex-start;margin:12px 0 0;"><input type="checkbox" id="ticket-remember-alias" style="margin-top:3px;"> <span>Also remember “'+esc(unmatched[0])+'” as this person’s Jira name — every ticket with that name (in any release) then counts for them.</span></label>'
+      : '');
   var foot = (hasOverride ? '<button type="button" class="btn btn-ghost" id="ticket-assignee-use-jira">Use Jira’s assignee</button>' : '<span></span>')+
     '<span style="flex:1"></span><button type="button" class="btn" data-action="close-modal">Cancel</button>'+
     (members.length ? '<button type="submit" class="btn btn-primary">Save</button>' : '');
@@ -4066,11 +4158,15 @@ function openTicketAssigneeModal(r, ticket){
     var picked = checked ? checked.value : current;
     if(picked===current && (hasOverride || !picked)){ closeModal(); return; } // nothing changed
     ticket.assignedTo = picked || null; // the key being present marks it manual, even when null
+    delete ticket.legacyQaAssignee; // resolved by this choice
     ticket.updatedAt = new Date().toISOString();
+    var remember = qs("#ticket-remember-alias");
+    var rememberName = picked && remember && remember.checked ? unmatched[0] : "";
     closeModal();
     persistRelease(r, function(){
       showToast(picked ? "✓ "+ticket.key+" assigned to "+memberNameById(picked) : "✓ "+ticket.key+" unassigned");
     });
+    if(rememberName) addJiraNameToMember(picked, rememberName);
   });
 }
 
