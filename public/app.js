@@ -182,58 +182,20 @@ var api = {
 };
 
 /* ============================================================
-   GUEST SESSION
-   Not authentication — just a lightweight "who's working?" name tag,
-   persisted client-side, used only to label audit-log entries and to show
-   a name in the header. No password, no server-side account of any kind.
-   ============================================================ */
-var GUEST_SESSION_KEY = "rm_guest_session";
-function getGuestSession(){
-  try{
-    var raw = localStorage.getItem(GUEST_SESSION_KEY);
-    if(!raw) return null;
-    var s = JSON.parse(raw);
-    if(!s || !s.sessionId || !s.displayName) return null;
-    return s;
-  }catch(e){ return null; }
-}
-function saveGuestSession(s){
-  try{ localStorage.setItem(GUEST_SESSION_KEY, JSON.stringify(s)); }catch(e){ /* best-effort */ }
-}
-function createGuestSession(name){
-  var now = new Date().toISOString();
-  var s = { sessionId: crypto.randomUUID(), displayName: name, createdAt: now, lastActiveAt: now };
-  saveGuestSession(s);
-  return s;
-}
-function renameGuestSession(name){
-  var s = getGuestSession();
-  var now = new Date().toISOString();
-  if(!s) s = createGuestSession(name);
-  else { s.displayName = name; s.lastActiveAt = now; saveGuestSession(s); }
-  return s;
-}
-function touchGuestSession(){
-  var s = getGuestSession();
-  if(!s) return;
-  s.lastActiveAt = new Date().toISOString();
-  saveGuestSession(s);
-}
-
-/* ============================================================
    AUDIT LOG (client side)
-   A thin, reusable logger — every call-site just says what happened;
-   this fills in who (the current guest) and when. Best-effort and
-   fire-and-forget: a failed or missing guest session never blocks the
-   actual user action, it just falls back to an "Unknown" label server-side.
+   A thin, reusable logger — every call-site just says what happened and the
+   SERVER fills in who (the signed-in account, resolved to its Know the Team
+   member id) and when; nothing about identity is sent from here, so it can't
+   be spoofed. Best-effort and fire-and-forget: a failed audit write never
+   blocks the actual user action. Assignment changes and regression status
+   changes are not logged from here at all — the server derives them from the
+   release save itself (see server/assignmentLogic.js), where it knows both
+   the before/after state and who acted.
    ============================================================ */
 function logAudit(opts){
   try{
-    var g = state.guest || getGuestSession();
     var payload = {
       id: crypto.randomUUID(), // lets a retried request be deduped server-side
-      sessionId: g ? g.sessionId : null,
-      userName: g ? g.displayName : "Unknown",
       action: opts.action,
       entityType: opts.entityType || "",
       entityId: opts.entityId || "",
@@ -259,14 +221,14 @@ var state = {
   ticketCollapsed: {}, // groupKey -> true if collapsed
   regressionGroupBy: "Entity", // "Entity" (default list) or "Owner" (bucketed by assignee, see sectionRegression)
   regressionView: "All", // "All" | "Mine" | "Unassigned" — see filterRegressionEntitiesForView
+  statsFilters: null, // Statistics page filters {range, from, to, releaseId, memberId} — created on first visit (see statsDefaultFilters)
   incidentFilters: {}, // releaseId -> {scope:"All"|"TICKET"|"RELEASE", severity, status} — the Incidents section's lightweight filters (see incidentFilterFor)
   pendingScrollTo: null, // section id to scroll to right after the next detail render (e.g. from a search result)
   searchQuery: "",
   searchResults: [],
   searchActiveIndex: -1,
-  guest: null, // current guest session — see GUEST SESSION helpers above (only used when auth.oauthEnabled is false)
-  auth: {oauthEnabled:false, authenticated:false, user:null}, // from /auth/me — see initAuthThenBoot()
-  blockingModal: false, // true while the welcome/sign-in modal is open
+  auth: {authenticated:false, user:null}, // from /auth/me — see initAuthThenBoot()
+  blockingModal: false, // true while the sign-in modal is open
   auditLog: [],
   auditReady: false,
   assessmentLoggedFor: {}, // releaseId -> true, so AI_ASSESSMENT_GENERATED logs once per viewing, not every re-render
@@ -523,8 +485,9 @@ function regressionEntities(r){
     return {
       id: item.id,
       name: item.name,
-      owner: item.owner || "",
-      services: [{ id:item.id, name:item.name, status:item.status, notes:item.notes }],
+      assignedTo: item.assignedTo || null,
+      legacyOwner: item.legacyOwner,
+      services: [{ id:item.id, name:item.name, status:item.status, notes:item.notes, lastChange:item.lastChange }],
       _legacy: item
     };
   });
@@ -621,46 +584,84 @@ function regressionEntitySummaryLine(entity){
   return parts.join(" · ");
 }
 
-/* ---- Regression assignment ----
-   Entity-level owner only (entity.owner, a plain string) — who's covering
-   this Entity's regression, for this release only. There is no per-module
-   (service) override: every module under an Entity simply follows that
-   Entity's owner. (An earlier iteration allowed an individual module to
-   override its Entity's owner via service.owner; that's been removed per
-   explicit request to keep assignment at the Entity level only. A release
-   saved during that window may still have stray service.owner values lying
-   around — they're just inert now, never read or written by anything
-   below.) */
-// Names offered in an assignment dropdown — reuses the existing "Know the
-// Team" directory (allTeamMembers) rather than a new hardcoded list, so
-// whoever's on the team there is exactly who shows up here — narrowed to
-// members with their "Available for regression assignment" toggle on.
-// `m.regression !== false` (rather than `=== true`) so a team member saved
-// before this toggle existed, with no `regression` key at all, still counts
-// as eligible instead of silently vanishing from every assign dropdown.
+/* ---- Regression assignment: Know the Team member ids, per release ----
+   Two levels, stored on the release's own regression data (so one release's
+   assignments never touch another's):
+     entity.assignedTo   member id | null — who covers the whole Entity
+     service.assignedTo  OPTIONAL per-module override: key absent = "use the
+                         Entity owner"; an id = that member; null =
+                         deliberately unassigned even though the Entity has an
+                         owner.
+   Precedence is module > entity > nobody, so changing the Entity owner moves
+   every module that follows it and never overwrites an explicit module-level
+   choice. An entity with no services is tracked as one item and uses
+   entity.assignedTo alone. Ids only — a display name is never an identity. */
+// Members offered in a regression assignment list — the Know the Team roster
+// narrowed to those with "Available for regression assignment" on.
+// `m.regression !== false` (rather than `=== true`) so a member saved before
+// that toggle existed, with no `regression` key at all, still counts as
+// eligible instead of silently vanishing from every assign list.
 function regressionOwnerOptions(){
-  return allTeamMembers().filter(function(m){ return m.regression!==false; }).map(function(m){return m.name;}).filter(Boolean);
+  return allTeamMembers().filter(function(m){ return m.regression!==false && !!m.name; });
 }
-// True when `owner` belongs to whoever's currently working (see
-// currentPreparerName) — the basis for "My Regression". Case-insensitive,
-// same tolerance as groupRegressionByOwner.
-function regressionOwnerIsMe(owner){
-  var me = currentPreparerName().trim().toLowerCase();
-  if(!me) return false;
-  return (owner||"").trim().toLowerCase() === me;
+function regressionModuleHasOverride(service){
+  return !!(service && Object.prototype.hasOwnProperty.call(service, "assignedTo"));
+}
+// Effective assignee of one module (service) of an entity: its own override
+// when it has one, otherwise the Entity's owner. "" = nobody.
+function regressionModuleAssigneeId(entity, service){
+  if(regressionModuleHasOverride(service)) return service.assignedTo || "";
+  return (entity && entity.assignedTo) || "";
+}
+// True when this member id is the person currently working (the team member
+// the signed-in user linked themselves to) — the basis for "My Regression".
+function regressionOwnerIsMe(memberId){
+  var me = currentMemberId();
+  return !!me && !!memberId && memberId===me;
 }
 // Narrows a list of entities (as regressionEntities() returns them) down to
-// what a view should show. Filtering is at the *Entity* level (assignment
-// lives only on entity.owner now) — "Mine" keeps entities I own, in full;
-// "Unassigned" keeps entities with no owner, in full. Every action handler
-// re-looks-up its target from the unfiltered release data by id anyway, so
-// this is purely a display-time narrowing and never affects what gets saved.
+// what a view should show, at the MODULE level (a module can carry its own
+// assignee): "Mine" keeps the modules assigned to me, "Unassigned" the ones
+// nobody covers. An entity whose modules only partly match is shown as a
+// copy holding just the matching modules. Every action handler re-looks-up
+// its target from the unfiltered release data by id anyway, so this is purely
+// a display-time narrowing and never affects what gets saved.
 function filterRegressionEntitiesForView(entities, view){
   if(view!=="Mine" && view!=="Unassigned") return entities;
-  return entities.filter(function(entity){
-    var owner = (entity.owner||"").trim();
-    return view==="Mine" ? regressionOwnerIsMe(owner) : !owner;
+  function matches(id){ return view==="Mine" ? regressionOwnerIsMe(id) : !id; }
+  var out = [];
+  entities.forEach(function(entity){
+    var services = entity.services||[];
+    if(!services.length){
+      if(matches(entity.assignedTo||"")) out.push(entity);
+      return;
+    }
+    var kept = services.filter(function(s){ return matches(regressionModuleAssigneeId(entity, s)); });
+    if(kept.length===services.length) out.push(entity);
+    else if(kept.length) out.push(Object.assign({}, entity, {services:kept}));
   });
+  return out;
+}
+// A small "who changed this" note under a module whose status was last
+// changed by someone other than the person it's assigned to. Compact on
+// purpose (a collapsed one-line <details>), informational only — the change
+// itself was never blocked. Shown only while the status still equals the
+// change it describes, so it doesn't linger after the status moves on.
+function regressionChangeNoteHtml(holder, currentStatus){
+  var c = holder && holder.lastChange;
+  if(!c || !c.byOther || c.newStatus!==(currentStatus||"NOT TESTED")) return "";
+  var assignee = memberNameById(c.assignedTo);
+  var by = c.changedBy ? memberNameById(c.changedBy) : (c.changedByName || "someone not on the team list");
+  return '<details class="reg-change-note"><summary>⚠ Status changed by another QA member</summary>'+
+    '<div>This regression is assigned to <b>'+esc(assignee)+'</b>, but the status was changed by <b>'+esc(by)+'</b> ('+esc(c.previousStatus||"")+' → '+esc(c.newStatus||"")+(c.at?', '+esc(fmtDateTime(c.at)):'')+').</div></details>';
+}
+// Shown right after a status change is saved when the person who made it
+// isn't the one it's assigned to. A heads-up only: the change already went
+// through, and nothing here asks for confirmation.
+function warnIfChangedByOther(assigneeId){
+  if(!assigneeId || assigneeId===currentMemberId()) return;
+  var who = (currentMember() && currentMember().name) || currentPreparerName() || "someone else";
+  showToast("⚠ Regression status changed by another QA member — assigned to "+memberNameById(assigneeId)+", changed by "+who+".");
 }
 
 /* ============================================================
@@ -749,27 +750,15 @@ function regressionTemplateLabel(status){
   if(status==="IN PROGRESS") return "In Progress";
   return "N/A"; // NOT PROVIDED
 }
-// "My Regression" (regressionOwnerIsMe) has to match the signed-in user
-// against entity.owner, a plain string picked from the Know the Team
-// roster. When sign-in is via Atlassian, the display name the browser sees
-// (state.auth.user.name) comes straight from that person's Atlassian
-// profile — it's not something they typed, and there's no guarantee it's
-// character-for-character identical to how their name was entered in Know
-// the Team (a stray apostrophe, a missing hyphen, a nickname vs. full name,
-// etc. are all enough to silently break the match). Rather than guessing at
-// fuzzy string normalization for the match itself, a signed-in user pins
-// "this Know the Team entry is me" once (via the team-card menu, or the
-// one-click suggestion offered on an empty "My Regression" — see
-// suggestedMyTeamMember below) and that pin is authoritative from then on:
-// the exact Know the Team name is what gets compared against entity.owner,
-// which is exactly what assignment dropdowns wrote there in the first
-// place. The pin itself is stored server-side, on the team member's own
-// record (member.linkedEmail — see server/routes/team.js's PUT
-// /:id/link-me), keyed by the signed-in email — never in localStorage — so
-// it's set once and works from any browser or device, not just the one it
-// was set on. Guest-mode deployments don't need this at all — a guest picks
-// their own display name directly (see "Now working as"), so it already
-// matches whatever they type into Know the Team.
+/* ---- Who am I? (identity = a Know the Team member id) ----
+   Atlassian sign-in proves WHO the person is; Know the Team says which QA
+   team member that is. A signed-in user pins "this entry is me" once (the
+   team-card menu, the "Link to team" button in the top bar, or the one-click
+   suggestion on an empty "My Regression") and that link is stored
+   server-side on the member's own record (member.linkedEmail — see
+   server/routes/team.js PUT /:id/link-me), so it works from any browser.
+   Everything that needs "me" — My Regression, the changed-by-someone-else
+   warning, assignments — compares TEAM MEMBER IDS, never display names. */
 function myLinkedTeamMemberId(){
   var email = state.auth && state.auth.user && state.auth.user.email;
   if(!email) return "";
@@ -779,23 +768,50 @@ function myLinkedTeamMemberId(){
   });
   return found ? found.id : "";
 }
-// Persists (or clears) the "This is me" link via the server, updates the
-// local copy of that team member so the UI reflects it immediately, and
-// re-renders. Used both by the Know the Team card menu and by the one-click
-// suggestion in the Regression section's empty "My Regression" state.
+function currentMemberId(){ return myLinkedTeamMemberId(); }
+function currentMember(){
+  var id = myLinkedTeamMemberId();
+  return id && state.team ? (state.team[id] || null) : null;
+}
+// A team member's display name from their id. An id with no matching member
+// (someone since removed from Know the Team) reads as such instead of
+// breaking, and an empty id reads as Unassigned.
+function memberNameById(id){
+  if(!id) return "Unassigned";
+  var m = state.team && state.team[id];
+  return m && m.name ? m.name : "Removed member";
+}
+// Same pill-radio look as statusChoiceGroup, but each choice carries a team
+// member's ID as its value (the label is just the name) — so what gets saved
+// is an id, never a name. `extras` are optional leading/trailing non-member
+// choices: [{value, label}], e.g. Unassigned or "Use Entity owner".
+function memberChoiceGroup(name, members, currentId, extras){
+  var items = (extras||[]).filter(function(x){return !x.after;}).concat(members.map(function(m){ return {value:m.id, label:m.name}; }))
+    .concat((extras||[]).filter(function(x){return x.after;}));
+  return '<div class="status-choice">'+items.map(function(o, i){
+    var id = name+"-"+i;
+    return '<input type="radio" name="'+name+'" id="'+id+'" value="'+escAttr(o.value)+'" '+(o.value===currentId?"checked":"")+'><label for="'+id+'">'+esc(o.label)+'</label>';
+  }).join("")+'</div>';
+}
+// Persists (or clears) the "This is me" link via the server, then reloads
+// the roster — the server clears the link from whichever other entry held it
+// before, and re-reading is the simplest way to stay exactly in sync — and
+// re-renders. Used by the Know the Team card menu, the top-bar "Link to
+// team" picker, and the one-click suggestion in the Regression section.
 function setMyLinkedTeamMember(id, linked){
-  return api.linkMeToTeamMember(id, linked).then(function(saved){
-    state.team[saved.id] = saved;
+  return api.linkMeToTeamMember(id, linked).then(function(){
+    return loadTeam();
+  }).then(function(){
+    renderTopbarUser();
     render();
   }).catch(function(err){
-    showToast(err.message || "Couldn't update that link.");
+    showToast((err && err.message) || "Couldn't update that link.");
   });
 }
 function currentPreparerName(){
-  var linkedId = myLinkedTeamMemberId();
-  if(linkedId && state.team && state.team[linkedId] && state.team[linkedId].name) return state.team[linkedId].name;
-  if(state.auth && state.auth.oauthEnabled && state.auth.authenticated && state.auth.user && state.auth.user.name) return state.auth.user.name;
-  if(state.guest && state.guest.displayName) return state.guest.displayName;
+  var me = currentMember();
+  if(me && me.name) return me.name;
+  if(state.auth && state.auth.authenticated && state.auth.user && state.auth.user.name) return state.auth.user.name;
   return "";
 }
 // Normalizes a name for a *suggestion-only* fuzzy match — never used for the
@@ -1010,6 +1026,7 @@ function parseHash(){
   if(!h) return {view:"home"};
   if(h==="releases") return {view:"list"};
   if(h==="audit") return {view:"audit"};
+  if(h==="statistics") return {view:"statistics"};
   if(h==="test-data") return {view:"testData"};
   if(h==="team") return {view:"team"};
   var m = h.match(/^r\/([^\/]+)$/);
@@ -1093,6 +1110,11 @@ function boot(){
     tasks.push(loadOne(state.route.id));
   } else if(state.route.view==="audit"){
     tasks.push(loadAuditLog());
+  } else if(state.route.view==="statistics"){
+    // Statistics reads every release plus the audit log — read-only GETs, so
+    // simply viewing it never writes an audit event.
+    tasks.push(loadList());
+    tasks.push(loadAuditLog());
   } else if(state.route.view==="testData"){
     tasks.push(loadTestData());
   } else if(state.route.view==="home"){
@@ -1114,6 +1136,7 @@ function boot(){
 function render(){
   var app = qs("#app");
   renderSidenav();
+  renderTopbarUser();
   if(state.loadError){
     app.innerHTML = '<div class="empty-state"><h3>Can’t reach the server</h3><p>'+esc(state.loadError)+'</p><p class="helper-text" style="margin-top:8px;">Make sure the Greenlight server is running.</p></div>';
     return;
@@ -1128,6 +1151,8 @@ function render(){
     afterDetailRender(r);
   } else if(state.route.view==="audit"){
     app.innerHTML = renderAuditLog();
+  } else if(state.route.view==="statistics"){
+    app.innerHTML = renderStatistics();
   } else if(state.route.view==="testData"){
     app.innerHTML = renderTestData();
   } else if(state.route.view==="team"){
@@ -1154,6 +1179,7 @@ var SIDENAV_ITEMS = [
   {icon:"🏠", label:"Landing Page", action:"nav-home", match:["home"]},
   {icon:"🚀", label:"Release Monitor", action:"nav-list", match:["list","detail"]},
   {icon:"🧪", label:"Test Data", action:"nav-test-data", match:["testData"]},
+  {icon:"📊", label:"Statistics", action:"nav-statistics", match:["statistics"]},
   {icon:"📋", label:"Audit", action:"nav-audit", match:["audit"]},
   {icon:"👥", label:"Know the Team", action:"nav-team", match:["team"]}
 ];
@@ -1224,7 +1250,7 @@ function recentActivityHtml(){
     var releaseName = (e.entityType==="Release" && state.releases[e.entityId]) ? releaseLabel(state.releases[e.entityId]) : "";
     var detail = releaseName || e.details || "";
     return '<div class="audit-row recent-activity-row">'+
-      '<div class="audit-row-user">'+iconUser()+' '+esc(e.userName||"Unknown")+'</div>'+
+      '<div class="audit-row-user">'+iconUser()+' '+esc(auditActorName(e))+'</div>'+
       '<div class="audit-row-body"><span class="audit-row-action">'+esc(humanizeAuditAction(e.action))+'</span>'+
         (detail ? ' <span class="audit-row-details">— '+esc(detail)+'</span>' : '')+
       '</div>'+
@@ -1249,6 +1275,7 @@ function renderHome(){
   var cards = [
     {icon:"🚀", title:"Release Monitor", desc:"Monitor release readiness from one place.", btn:"Open Releases →", action:"nav-list"},
     {icon:"🧪", title:"Test Data", desc:"Manage reusable QA test data, scenarios, entities and tags.", btn:"Open Test Data →", action:"nav-test-data"},
+    {icon:"📊", title:"Statistics", desc:"See QA workload and activity by date, release and team member.", btn:"Open Statistics →", action:"nav-statistics"},
     {icon:"📋", title:"Audit", desc:"Track important changes and see who performed them.", btn:"View Audit →", action:"nav-audit"},
     {icon:"👥", title:"Know the Team", desc:"Meet the people behind the quality.", btn:"Meet the Team →", action:"nav-team"}
   ];
@@ -1355,8 +1382,11 @@ var AUDIT_ACTION_LABELS = {
   RELEASE_UPDATED: "Updated Release Info",
   TICKET_ADDED: "Added Ticket",
   TICKET_UPDATED: "Updated Ticket",
-  TICKET_QA_ASSIGNED: "Assigned Ticket QA Owner",
-  TICKET_QA_UNASSIGNED: "Unassigned Ticket QA Owner",
+  TICKET_ASSIGNED: "Assigned Ticket",
+  TICKET_REASSIGNED: "Reassigned Ticket",
+  TICKET_UNASSIGNED: "Unassigned Ticket",
+  TICKET_QA_ASSIGNED: "Assigned Ticket QA Owner", // older, name-based records
+  TICKET_QA_UNASSIGNED: "Unassigned Ticket QA Owner", // older, name-based records
   JIRA_SYNCED: "Synced Jira",
   REGRESSION_UPDATED: "Updated Regression",
   REGRESSION_ASSIGNED: "Assigned Regression",
@@ -1388,6 +1418,26 @@ var AUDIT_ACTION_LABELS = {
 function humanizeAuditAction(action){
   return AUDIT_ACTION_LABELS[action] || action;
 }
+// Who an audit record is attributed to: the Know the Team member it carries
+// (looked up by stable id, so a renamed member reads under their current
+// name), falling back to the name recorded with the entry — which is how
+// older records, and activity by someone not yet linked to a team member,
+// still read sensibly.
+function auditActorName(e){
+  var m = e && e.teamMemberId && state.team ? state.team[e.teamMemberId] : null;
+  return (m && m.name) || (e && e.userName) || "Unknown";
+}
+// The compact extra block for a regression status change made by someone
+// other than the assignee ("⚠ Saraa changed regression status — Assigned to /
+// Changed by / PREVIOUS → NEW"). Quiet by design: one muted block under the
+// row, only for the changes that actually warrant it.
+function auditStatusChangeWarnHtml(e){
+  var m = e && e.meta;
+  if(!m || !m.byOther || e.action!=="REGRESSION_UPDATED") return "";
+  var by = m.changedBy ? memberNameById(m.changedBy) : auditActorName(e);
+  return '<div class="audit-row-warn"><span class="audit-warn-head">⚠ '+esc(by)+' changed regression status</span><br>'+
+    'Assigned to: '+esc(memberNameById(m.assignedTo))+' · Changed by: '+esc(by)+' · '+esc(m.previousStatus||"")+' → '+esc(m.newStatus||"")+'</div>';
+}
 function renderAuditLog(){
   var entries = state.auditLog || [];
   var head = '<div class="list-head"><div><h1>Audit Log</h1><p>Who did what, across every release — newest first.</p></div>'+
@@ -1399,9 +1449,10 @@ function renderAuditLog(){
   var rows = entries.map(function(e){
     return '<div class="audit-row">'+
       '<div class="audit-row-time mono">'+esc(fmtDateTime(e.createdAt)||"")+'</div>'+
-      '<div class="audit-row-user">'+iconUser()+' '+esc(e.userName||"Unknown")+'</div>'+
+      '<div class="audit-row-user">'+iconUser()+' '+esc(auditActorName(e))+'</div>'+
       '<div class="audit-row-body"><span class="audit-row-action">'+esc(humanizeAuditAction(e.action))+'</span>'+
         (e.details ? ' <span class="audit-row-details">— '+esc(e.details)+'</span>' : '')+
+        auditStatusChangeWarnHtml(e)+
       '</div>'+
     '</div>';
   }).join("");
@@ -1409,10 +1460,252 @@ function renderAuditLog(){
 }
 
 /* ============================================================
+   STATISTICS
+   A dedicated page (not part of the Release Monitor): simple workload and
+   QA-activity tables, filterable by date, release and QA member — every
+   member comes from Know the Team. Everything is computed from real data:
+   release documents (tickets, ticket/regression assignments and statuses,
+   blockers) for "what's assigned and where it stands", and Audit events
+   carrying structured data (assignments, regression status changes) for
+   "what happened when". Nothing is invented — an item with no date (e.g.
+   assigned before this feature existed) only appears under "All time", and
+   a filter that matches nothing says so.
+
+   Definitions (the same everywhere on the page):
+     Tickets Assigned     tickets whose QA owner is a team member
+     Regression Assigned  regression modules whose effective owner is a member
+     Completed Work       regression modules tested (PASS / FAIL / WARNING)
+                          + tickets in the Completed bucket
+     Passed / Failed      regression modules currently PASS / FAIL
+     Blocked              tickets in the Blocked bucket + open release blockers
+                          (release blockers belong to the release, not a member)
+     Status Changes       regression status changes a member made
+     Changed By Others    changes to a member's assigned regression made by
+                          someone else (assignedTo != changedBy)
+   This is workload visibility for the QA workflow — deliberately no ranking,
+   scoring or comparison between people.
+   ============================================================ */
+var STATS_ASSIGN_ACTIONS = ["TICKET_ASSIGNED","TICKET_REASSIGNED","REGRESSION_ASSIGNED","ENTITY_REGRESSION_ASSIGNED"];
+var STATS_RANGES = [
+  {value:"all", label:"All time"},
+  {value:"7d", label:"Last 7 days"},
+  {value:"30d", label:"Last 30 days"},
+  {value:"custom", label:"Custom range"}
+];
+function statsDefaultFilters(){ return {range:"all", from:"", to:"", releaseId:"", memberId:""}; }
+function statsStartOfDay(d){ var x = new Date(d); x.setHours(0,0,0,0); return x.getTime(); }
+// {from, to} in ms; null = unbounded on that side. `now` is injectable for tests.
+function statsRangeBounds(f, now){
+  var n = now ? new Date(now) : new Date();
+  if(f.range==="7d") return {from: statsStartOfDay(n.getTime()-6*86400000), to: n.getTime()};
+  if(f.range==="30d") return {from: statsStartOfDay(n.getTime()-29*86400000), to: n.getTime()};
+  if(f.range==="custom"){
+    var from = f.from ? new Date(f.from+"T00:00:00").getTime() : null;
+    var to = f.to ? new Date(f.to+"T23:59:59.999").getTime() : null;
+    return {from: isNaN(from)?null:from, to: isNaN(to)?null:to};
+  }
+  return {from:null, to:null};
+}
+function statsInRange(ts, bounds, f){
+  if(f.range==="all") return true;
+  if(ts==null || isNaN(ts)) return false; // undated -> only under "All time"
+  if(bounds.from!=null && ts<bounds.from) return false;
+  if(bounds.to!=null && ts>bounds.to) return false;
+  return true;
+}
+function statsTime(iso){ var t = iso ? new Date(iso).getTime() : NaN; return isNaN(t) ? null : t; }
+function statsMaxTime(a, b){ return a==null ? b : (b==null ? a : Math.max(a,b)); }
+function statsDayKey(ms){
+  var d = new Date(ms);
+  return d.getFullYear()+"-"+("0"+(d.getMonth()+1)).slice(-2)+"-"+("0"+d.getDate()).slice(-2);
+}
+// Every ticket / regression module / open blocker of one release as a flat
+// item with its effective assignee, current status and (when known) the time
+// of its latest dated activity.
+function statsReleaseItems(r){
+  var items = [];
+  (r.tickets||[]).forEach(function(t){
+    items.push({kind:"ticket", releaseId:r._id, assignee:ticketAssignedMemberId(t), ts:statsTime(t.assignedAt),
+      blocked:t.bucket==="Blocked", completed:t.bucket==="Completed"});
+  });
+  regressionEntities(r).forEach(function(entity){
+    var real = entity._legacy || entity;
+    var services = entity.services||[];
+    if(!services.length){
+      items.push({kind:"regression", releaseId:r._id, assignee:entity.assignedTo||"", status:entity.status||"NOT TESTED",
+        ts:statsMaxTime(statsTime(real.assignedAt), statsTime(real.lastChange && real.lastChange.at))});
+      return;
+    }
+    services.forEach(function(sv){
+      var override = regressionModuleHasOverride(sv) && !entity._legacy;
+      var holder = entity._legacy ? entity._legacy : sv;
+      var assignedAt = override ? statsTime(sv.assignedAt) : statsTime(real.assignedAt);
+      items.push({kind:"regression", releaseId:r._id, assignee:regressionModuleAssigneeId(entity, sv), status:sv.status||"NOT TESTED",
+        ts:statsMaxTime(assignedAt, statsTime(holder.lastChange && holder.lastChange.at))});
+    });
+  });
+  (r.blockers||[]).forEach(function(b){
+    if(b.status==="Open" || b.status==="In Progress") items.push({kind:"blocker", releaseId:r._id, assignee:"", ts:null});
+  });
+  return items;
+}
+function statsEmptyRow(){ return {tickets:0, regression:0, passed:0, failed:0, blocked:0}; }
+function statsAddItem(row, it){
+  if(it.kind==="ticket"){ row.tickets++; if(it.blocked) row.blocked++; }
+  else if(it.kind==="regression"){ row.regression++; if(it.status==="PASS") row.passed++; else if(it.status==="FAIL") row.failed++; }
+  else if(it.kind==="blocker"){ row.blocked++; }
+}
+// The whole page's numbers for a set of filters: {f:{range,from,to,releaseId,memberId}}.
+function computeStatistics(f, now){
+  f = Object.assign(statsDefaultFilters(), f||{});
+  var bounds = statsRangeBounds(f, now);
+  var relIds = (state.releaseOrder||[]).filter(function(id){ return state.releases[id] && (!f.releaseId || id===f.releaseId); });
+
+  // ---- snapshot items (assignments + where each stands) ----
+  var items = [];
+  relIds.forEach(function(id){
+    statsReleaseItems(state.releases[id]).forEach(function(it){
+      if(!statsInRange(it.ts, bounds, f)) return;
+      if(f.memberId && it.assignee!==f.memberId) return;
+      items.push(it);
+    });
+  });
+  var cards = {ticketsAssigned:0, regressionAssigned:0, completed:0, passed:0, failed:0, blocked:0};
+  var byMember = {}; // assignee id ("" = nobody) -> row
+  var byRelease = {};
+  items.forEach(function(it){
+    if(it.kind==="ticket"){
+      if(it.assignee) cards.ticketsAssigned++;
+      if(it.completed) cards.completed++;
+      if(it.blocked) cards.blocked++;
+    } else if(it.kind==="regression"){
+      if(it.assignee) cards.regressionAssigned++;
+      if(it.status==="PASS"||it.status==="FAIL"||it.status==="WARNING") cards.completed++;
+      if(it.status==="PASS") cards.passed++;
+      if(it.status==="FAIL") cards.failed++;
+    } else if(it.kind==="blocker"){
+      cards.blocked++;
+    }
+    statsAddItem(byMember[it.assignee] = byMember[it.assignee] || statsEmptyRow(), it);
+    statsAddItem(byRelease[it.releaseId] = byRelease[it.releaseId] || statsEmptyRow(), it);
+  });
+
+  // ---- audit events with structured data (what happened, when) ----
+  var days = {}; // yyyy-mm-dd -> counts
+  var activity = {}; // member id -> {assigned, statusChanges, changedByOthers}
+  var unlinkedChanges = 0, eventCount = 0;
+  function dayRow(ms){ var k = statsDayKey(ms); return days[k] = days[k] || {date:k, assigned:0, passed:0, failed:0, warning:0, notTested:0}; }
+  function actRow(id){ return activity[id] = activity[id] || {assigned:0, statusChanges:0, changedByOthers:0}; }
+  (state.auditLog||[]).forEach(function(e){
+    var m = e && e.meta;
+    if(!m) return;
+    if(f.releaseId && m.releaseId!==f.releaseId) return;
+    var ts = statsTime(e.createdAt);
+    if(!statsInRange(ts, bounds, f)) return;
+    if(e.action==="REGRESSION_UPDATED" && m.newStatus){
+      if(f.memberId && m.changedBy!==f.memberId) return;
+      eventCount++;
+      var d = dayRow(ts);
+      if(m.newStatus==="PASS") d.passed++;
+      else if(m.newStatus==="FAIL") d.failed++;
+      else if(m.newStatus==="WARNING") d.warning++;
+      else if(m.newStatus==="NOT TESTED") d.notTested++;
+      if(m.changedBy) actRow(m.changedBy).statusChanges++; else unlinkedChanges++;
+      if(m.assignedTo && m.changedBy!==m.assignedTo) actRow(m.assignedTo).changedByOthers++;
+    } else if(STATS_ASSIGN_ACTIONS.indexOf(e.action)>-1 && m.assignedTo && m.scope!=="module-inherit"){
+      if(f.memberId && m.assignedTo!==f.memberId) return;
+      eventCount++;
+      dayRow(ts).assigned++;
+    }
+  });
+  // "Assigned" in the assignment-vs-activity table = regression modules
+  // currently assigned to the member (same items as above).
+  items.forEach(function(it){ if(it.kind==="regression" && it.assignee) actRow(it.assignee).assigned++; });
+
+  return {
+    filters: f, cards: cards, byMember: byMember, byRelease: byRelease,
+    days: Object.keys(days).sort().reverse().map(function(k){ return days[k]; }),
+    activity: activity, unlinkedChanges: unlinkedChanges,
+    hasData: items.length>0 || eventCount>0
+  };
+}
+function statsRowIsEmpty(row){ return !row || (!row.tickets && !row.regression && !row.passed && !row.failed && !row.blocked); }
+function statsMemberLabel(id){ return id ? memberNameById(id) : "Unassigned"; }
+// Member ids that appear in a keyed map, ordered by display name with
+// "Unassigned" last (alphabetical — never ordered by any number).
+function statsOrderedIds(map){
+  var ids = Object.keys(map);
+  var real = ids.filter(function(id){return id!=="";}).sort(function(a,b){ return statsMemberLabel(a).localeCompare(statsMemberLabel(b)); });
+  return ids.indexOf("")>-1 ? real.concat([""]) : real;
+}
+function statsTable(headers, rowsHtml){
+  if(!rowsHtml) return '<div class="stats-empty">No data available for the selected filters.</div>';
+  return '<div class="stats-table-wrap"><table class="stats-table"><thead><tr>'+headers.map(function(h,i){
+    return '<th'+(i>0?' class="num"':'')+'>'+esc(h)+'</th>';
+  }).join("")+'</tr></thead><tbody>'+rowsHtml+'</tbody></table></div>';
+}
+function statsNumCell(n){ return '<td class="num">'+n+'</td>'; }
+function statsFiltersHtml(f){
+  var releases = (state.releaseOrder||[]).map(function(id){ return state.releases[id]; }).filter(Boolean);
+  var members = allTeamMembers();
+  return '<div class="stats-filters">'+
+    '<div class="field"><label for="stats-range">Date</label><select id="stats-range" data-stats-field="range">'+
+      STATS_RANGES.map(function(o){ return '<option value="'+o.value+'"'+(f.range===o.value?" selected":"")+'>'+esc(o.label)+'</option>'; }).join("")+'</select></div>'+
+    (f.range==="custom" ? '<div class="field"><label for="stats-from">From</label><input type="date" id="stats-from" data-stats-field="from" value="'+escAttr(f.from)+'"></div>'+
+      '<div class="field"><label for="stats-to">To</label><input type="date" id="stats-to" data-stats-field="to" value="'+escAttr(f.to)+'"></div>' : '')+
+    '<div class="field"><label for="stats-release">Release</label><select id="stats-release" data-stats-field="releaseId"><option value="">All Releases</option>'+
+      releases.map(function(r){ return '<option value="'+escAttr(r._id)+'"'+(f.releaseId===r._id?" selected":"")+'>'+esc(releaseLabel(r))+'</option>'; }).join("")+'</select></div>'+
+    '<div class="field"><label for="stats-member">QA Member</label><select id="stats-member" data-stats-field="memberId"><option value="">All Members</option>'+
+      members.map(function(m){ return '<option value="'+escAttr(m.id)+'"'+(f.memberId===m.id?" selected":"")+'>'+esc(m.name)+'</option>'; }).join("")+'</select></div>'+
+  '</div>';
+}
+function renderStatistics(){
+  var head = '<div class="list-head"><div><h1>Statistics</h1><p>Workload and QA activity across releases — for visibility only, not a performance measure.</p></div></div>';
+  if(!state.listReady || !state.auditReady) return head+'<div class="empty-state"><h3>Loading statistics…</h3></div>';
+  var f = state.statsFilters || (state.statsFilters = statsDefaultFilters());
+  var st = computeStatistics(f);
+  var filtersHtml = statsFiltersHtml(f);
+  if(!st.hasData){
+    return head+filtersHtml+'<div class="stats-empty">No data available for the selected filters.</div>';
+  }
+  var c = st.cards;
+  function card(n, label){ return '<div class="stats-card"><div class="num">'+n+'</div><div class="label">'+esc(label)+'</div></div>'; }
+  var cardsHtml = '<div class="stats-cards">'+
+    card(c.ticketsAssigned,"Tickets Assigned")+card(c.regressionAssigned,"Regression Assigned")+card(c.completed,"Completed Work")+
+    card(c.passed,"Passed Regression")+card(c.failed,"Failed Regression")+card(c.blocked,"Blocked Items")+'</div>';
+
+  var memberRows = statsOrderedIds(st.byMember).map(function(id){
+    var r = st.byMember[id]; if(statsRowIsEmpty(r)) return "";
+    return '<tr><td>'+esc(statsMemberLabel(id))+(id===""?' <span class="hint">· incl. release blockers</span>':'')+'</td>'+statsNumCell(r.tickets)+statsNumCell(r.regression)+statsNumCell(r.passed)+statsNumCell(r.failed)+statsNumCell(r.blocked)+'</tr>';
+  }).join("");
+  var releaseRows = (state.releaseOrder||[]).filter(function(id){ return st.byRelease[id] && !statsRowIsEmpty(st.byRelease[id]); }).map(function(id){
+    var r = st.byRelease[id];
+    return '<tr><td>'+esc(releaseLabel(state.releases[id]))+'</td>'+statsNumCell(r.tickets)+statsNumCell(r.regression)+statsNumCell(r.passed)+statsNumCell(r.failed)+statsNumCell(r.blocked)+'</tr>';
+  }).join("");
+  var dayRows = st.days.map(function(d){
+    return '<tr><td>'+esc(fmtDate(d.date))+'</td>'+statsNumCell(d.assigned)+statsNumCell(d.passed)+statsNumCell(d.failed)+statsNumCell(d.warning)+statsNumCell(d.notTested)+'</tr>';
+  }).join("");
+  var actIds = statsOrderedIds(st.activity).filter(function(id){ return id!==""; });
+  var actRows = actIds.map(function(id){
+    var a = st.activity[id]; if(!a.assigned && !a.statusChanges && !a.changedByOthers) return "";
+    return '<tr><td>'+esc(memberNameById(id))+'</td>'+statsNumCell(a.assigned)+statsNumCell(a.statusChanges)+statsNumCell(a.changedByOthers)+'</tr>';
+  }).join("") + (st.unlinkedChanges ? '<tr><td>Not linked to a team member</td>'+statsNumCell(0)+statsNumCell(st.unlinkedChanges)+statsNumCell(0)+'</tr>' : '');
+
+  return head+filtersHtml+cardsHtml+
+    '<div class="stats-section"><h2>By QA member</h2>'+statsTable(["QA Member","Tickets","Regression","Passed","Failed","Blocked"], memberRows)+'</div>'+
+    '<div class="stats-section"><h2>By release</h2>'+statsTable(["Release","Tickets","Regression","Passed","Failed","Blocked"], releaseRows)+'</div>'+
+    '<div class="stats-section"><h2>Activity by date</h2>'+statsTable(["Date","Assigned","Passed","Failed","Warning","Not Tested"], dayRows)+
+      '<p class="stats-note">Counts regression assignments and status changes recorded in the Audit Log, per day.</p></div>'+
+    '<div class="stats-section"><h2>Assignment vs. activity</h2>'+statsTable(["QA Member","Assigned","Status Changes","Changed By Others"], actRows)+
+      '<p class="stats-note">Assigned = regression modules currently assigned · Status Changes = regression statuses the member changed · Changed By Others = changes to the member’s assigned regression made by someone else. This is for QA workflow visibility only — not a measure of anyone’s performance.</p></div>'+
+    '<p class="stats-note">Items assigned before assignment dates were recorded have no date, so they appear under “All time” only. Release blockers belong to the release, so they are counted under Unassigned and only when no member is selected.</p>';
+}
+
+/* ============================================================
    KNOW THE TEAM
    An editable, informational team roster — independent of releases and
    independent of the auth system entirely: no login roles, no permissions,
-   no link to guest/Atlassian accounts. Adding or editing a member never
+   no permissions of their own. Adding or editing a member never
    grants them any access to the app; it's display data only, stored the
    same way Test Data is (its own top-level collection, plain REST CRUD).
    Starts from a small starter roster server-side (see server/db.js's
@@ -1436,10 +1729,9 @@ function teamMemberCardHtml(m){
   if(m.linkedin) linkBits.push('<a class="btn btn-ghost btn-sm" href="'+escAttr(m.linkedin)+'" target="_blank" rel="noopener">'+iconLink()+' LinkedIn</a>');
   if(m.github) linkBits.push('<a class="btn btn-ghost btn-sm" href="'+escAttr(m.github)+'" target="_blank" rel="noopener">'+iconLink()+' GitHub</a>');
   var avatar = m.photo ? '<img src="'+escAttr(m.photo)+'" alt="">' : esc(initials(m.name));
-  // Only signed-in (Atlassian) deployments need a way to pin "this is me" —
-  // a guest already picks their own exact display name (see
-  // currentPreparerName), so it already matches whatever they typed here.
-  var showMeOption = !!(state.auth && state.auth.oauthEnabled && state.auth.authenticated);
+  // Any signed-in user can pin "this entry is me" — that link is what ties
+  // their assignments, audit trail and statistics to this team member.
+  var showMeOption = !!(state.auth && state.auth.authenticated);
   var isMe = showMeOption && myLinkedTeamMemberId()===m.id;
   return '<div class="team-card">'+
     '<div class="dd team-card-menu">'+
@@ -1451,7 +1743,7 @@ function teamMemberCardHtml(m){
       '</div>'+
     '</div>'+
     '<div class="team-avatar'+(m.photo?" has-photo":"")+'">'+avatar+'</div>'+
-    '<div class="team-card-name">'+esc(m.name)+(isMe?' <span class="badge badge-me" title="Entities assigned to this name show up in your My Regression view">'+iconUser()+' You</span>':'')+(m.seeded?' <span class="badge badge-manual">Example</span>':'')+'</div>'+
+    '<div class="team-card-name">'+esc(m.name)+(isMe?' <span class="badge badge-me" title="Regression assigned to you shows up in your My Regression view">'+iconUser()+' You</span>':'')+(m.seeded?' <span class="badge badge-manual">Example</span>':'')+'</div>'+
     '<div class="team-card-role">'+esc(m.role||"")+(m.regression===false?' <span class="hint">· not in Regression assign list</span>':'')+'</div>'+
     (m.bio ? '<p class="team-card-bio">'+esc(m.bio)+'</p>' : '')+
     (specialtiesHtml ? '<div class="team-card-chips">'+specialtiesHtml+'</div>' : '')+
@@ -2502,51 +2794,73 @@ function priorityRank(p){
   var key = String(p||"").toLowerCase();
   return order.hasOwnProperty(key) ? order[key] : 50;
 }
-// Names offered for a ticket's QA Assignee — the full Know the Team roster.
-// Deliberately NOT narrowed by Regression's "Available for regression
-// assignment" toggle: QA ownership of a ticket is a separate concept from
-// covering an Entity's regression, so someone can be eligible for one and
-// not the other.
+// Team members offered for a ticket's QA assignee — the full Know the Team
+// roster, as members (id + name). Deliberately NOT narrowed by Regression's
+// "Available for regression assignment" toggle: QA ownership of a ticket is a
+// separate concept from covering an Entity's regression, so someone can be
+// eligible for one and not the other.
 function ticketAssigneeOptions(){
-  return allTeamMembers().map(function(m){return m.name;}).filter(Boolean);
+  return allTeamMembers().filter(function(m){ return !!m.name; });
 }
-/* ---- Ticket QA Assignee: manual override vs. Jira-synced value ----
-   "QA Assigned" is a MULTI-person Jira field — a ticket can have more than
-   one QA owner — so both sides of this are always arrays of names, never a
-   single string.
-   ticket.qaAssignedFromJira is Jira's own "QA Assigned" custom field
-   (server/jiraClient.js), refreshed on every sync/lookup — a ticket never
-   touched in Greenlight simply doesn't have a qaAssignee key at all.
-   ticket.qaAssignee is a manual override set from the assign modal below —
-   its mere PRESENCE (even as [], an explicit "nobody" choice) is what marks
-   it as manual, the same undefined/[]/[...names] three-way split used for
-   the (now-removed) regression module override, and for the same reason:
-   it's what lets "revert to Jira's value" behave differently from
-   "explicitly assign to no one". A manual override always wins; syncing
-   from Jira again (routes/releases.js#upsertTicket) never overwrites
-   qaAssignee, only qaAssignedFromJira. ticketAssigneesArray tolerates a
-   plain string too, for a release saved by the earlier single-assignee
-   version of this feature (before it became multi-person). */
+/* ---- Ticket QA assignment: a Know the Team member id, per release ----
+   ticket.assignedTo is a team member's id (or null). The tickets live inside
+   each release's own document, so assigning MOJ-1240 in Release A never
+   touches MOJ-1240 in Release B.
+   The KEY being present marks a manual choice (null = deliberately
+   unassigned) and always wins. A ticket with no assignedTo key just follows
+   Jira's own "QA Assigned" field (ticket.qaAssignedFromJira, refreshed on
+   every sync): those are display names from Jira, so they're matched to a
+   team member by (unique, punctuation/case-insensitive) name purely as a
+   read-time convenience — nothing about that match is stored as identity.
+   A re-sync from Jira only ever refreshes qaAssignedFromJira, never
+   assignedTo. (Older releases that stored a names array in ticket.qaAssignee
+   are converted to this shape server-side — see server/assignmentLogic.js.) */
 function ticketHasManualAssignee(ticket){
-  return !!(ticket && Object.prototype.hasOwnProperty.call(ticket, "qaAssignee"));
+  return !!(ticket && Object.prototype.hasOwnProperty.call(ticket, "assignedTo"));
 }
-function ticketAssigneesArray(value){
-  var list = Array.isArray(value) ? value : (value ? [value] : []);
-  return list.map(function(v){ return (v||"").toString().trim(); }).filter(Boolean);
+function ticketJiraNames(ticket){
+  var v = ticket && ticket.qaAssignedFromJira;
+  var list = Array.isArray(v) ? v : (v ? [v] : []);
+  return list.map(function(x){ return (x||"").toString().trim(); }).filter(Boolean);
 }
-function ticketEffectiveAssignees(ticket){
-  if(!ticket) return [];
-  if(ticketHasManualAssignee(ticket)) return ticketAssigneesArray(ticket.qaAssignee);
-  return ticketAssigneesArray(ticket.qaAssignedFromJira);
+function memberIdForJiraName(name){
+  var key = normalizeNameForSuggestion(name);
+  if(!key) return "";
+  var hits = allTeamMembers().filter(function(m){ return normalizeNameForSuggestion(m.name)===key; });
+  return hits.length===1 ? hits[0].id : "";
+}
+function ticketJiraMemberId(ticket){
+  var names = ticketJiraNames(ticket);
+  for(var i=0;i<names.length;i++){
+    var id = memberIdForJiraName(names[i]);
+    if(id) return id;
+  }
+  return "";
+}
+// The team member a ticket is effectively assigned to ("" = nobody).
+function ticketAssignedMemberId(ticket){
+  if(!ticket) return "";
+  if(ticketHasManualAssignee(ticket)) return ticket.assignedTo || "";
+  return ticketJiraMemberId(ticket);
+}
+// Short display text: the member's name, or — only when Jira names someone
+// who isn't in Know the Team — that name marked as coming from Jira.
+function ticketAssigneeLabel(ticket){
+  var id = ticketAssignedMemberId(ticket);
+  if(id) return memberNameById(id);
+  if(!ticketHasManualAssignee(ticket)){
+    var names = ticketJiraNames(ticket);
+    if(names.length) return names.join(", ")+" (Jira)";
+  }
+  return "";
 }
 function renderTicketAssigneeBtn(t){
-  var eff = ticketEffectiveAssignees(t);
+  var label = ticketAssigneeLabel(t);
   var manual = ticketHasManualAssignee(t);
-  var label = eff.length ? eff.join(", ") : "Unassigned";
   var title = manual
-    ? (eff.length ? "Manually assigned — click to change" : "Explicitly set to Unassigned — click to change")
-    : (eff.length ? "Synced from Jira's QA Assigned field — click to override" : "Assign a QA owner");
-  return '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn'+(eff.length?" has-owner":"")+'" data-action="edit-ticket-assignee" data-key="'+escAttr(t.key)+'" title="'+escAttr(title)+'">'+iconUser()+' '+esc(label)+'</button>';
+    ? (label ? "QA owner — click to change" : "Explicitly set to Unassigned — click to change")
+    : (label ? "From Jira's QA Assigned field — click to change" : "Assign a QA owner");
+  return '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn'+(label?" has-owner":"")+'" data-action="edit-ticket-assignee" data-key="'+escAttr(t.key)+'" title="'+escAttr(title)+'">'+iconUser()+' '+(label ? 'QA: '+esc(label) : 'Assign QA')+'</button>';
 }
 function groupTickets(tickets, mode){
   if(mode==="None"){
@@ -2554,19 +2868,11 @@ function groupTickets(tickets, mode){
   }
   var buckets = {};
   if(mode==="QA Assignee"){
-    // A ticket can have more than one QA owner — it's filed under EVERY one
-    // of its effective assignees (not just the first), so a ticket assigned
-    // to two people genuinely shows up in both of their buckets. A ticket
-    // with nobody effectively assigned lands in Unassigned instead.
+    // One QA owner per ticket; a ticket with nobody effectively assigned
+    // lands in Unassigned.
     tickets.forEach(function(t){
-      var names = ticketEffectiveAssignees(t);
-      if(!names.length){
-        (buckets["Unassigned"] = buckets["Unassigned"]||[]).push(t);
-      } else {
-        names.forEach(function(name){
-          (buckets[name] = buckets[name]||[]).push(t);
-        });
-      }
+      var label = ticketAssigneeLabel(t) || "Unassigned";
+      (buckets[label] = buckets[label]||[]).push(t);
     });
   } else {
     var field = mode==="Status" ? "bucket" : mode==="Priority" ? "priority" : "issueType";
@@ -2683,17 +2989,29 @@ function regressionEntityStatusButtons(entity){
       '<label for="'+inputId+'" class="tone-'+toneForStatus(opt)+'">'+esc(opt)+'</label>';
   }).join("")+'</div>';
 }
-// Compact horizontal card for one module: name on the first line, status
-// pills + the existing notes ("comment") button on the second. No owner
-// control here — assignment lives on the Entity only (see the heading row
-// in renderRegressionEntityGroup below); `entity` is passed through purely
-// so set-regression-status/edit-regression-notes can carry the entity id
-// they need (both re-look-up their real target by id — see the click
-// delegation switch — so this render never needs to be a live reference).
+// Compact horizontal card for one module: name + its assignee on the first
+// line, status pills + the existing notes ("comment") button on the second,
+// and — only when someone other than the assignee last changed the status —
+// a collapsed one-line "changed by another QA member" note. `entity` is
+// passed through so set-regression-status/edit-regression-notes can carry the
+// entity id they need (both re-look-up their real target by id — see the
+// click delegation switch — so this render never needs to be a live
+// reference).
+function regressionModuleAssigneeBtn(entity, s){
+  if(entity._legacy) return ""; // a legacy flat row IS its own entity — assigned via the entity control
+  var id = regressionModuleAssigneeId(entity, s);
+  var override = regressionModuleHasOverride(s);
+  var title = override ? (id ? "Assigned to this module — click to change" : "Deliberately unassigned — click to change")
+                       : (id ? "Follows the Entity owner — click to give this module its own" : "No one — click to assign");
+  var label = id ? memberNameById(id) : (override ? "Unassigned" : "Assign");
+  return '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn regression-module-owner'+(id?" has-owner":"")+(override?" is-override":"")+'" data-action="edit-regression-module-owner" data-entity-id="'+escAttr(entity.id)+'" data-id="'+escAttr(s.id)+'" title="'+escAttr(title)+'">'+iconUser()+' '+esc(label)+'</button>';
+}
 function renderRegressionServiceRow(entity, s){
+  var holder = entity._legacy ? entity._legacy : s;
   return '<div class="item-row regression-service-row'+(s.status==='FAIL'?' is-flagged':'')+'">'+
     '<div class="reg-row-top">'+
       '<div class="reg-row-name">'+esc(s.name||"Unnamed service")+'</div>'+
+      regressionModuleAssigneeBtn(entity, s)+
     '</div>'+
     '<div class="reg-row-bottom">'+
       regressionStatusButtons(entity.id, s)+
@@ -2701,13 +3019,16 @@ function renderRegressionServiceRow(entity, s){
         '<button type="button" class="btn btn-sm btn-icon" data-action="edit-regression-notes" data-entity-id="'+entity.id+'" data-id="'+s.id+'" aria-label="'+(s.notes?"Edit":"Add")+' notes" title="'+(s.notes?"Edit":"Add")+' notes">'+iconNote()+'</button>'+
       '</div>'+
     '</div>'+
+    regressionChangeNoteHtml(holder, s.status)+
     (s.notes? '<div class="item-row-desc reg-row-notes">'+esc(s.notes)+'</div>':'')+
   '</div>';
 }
 function renderRegressionEntityGroup(entity){
   var services = entity.services||[];
-  var owner = entity.owner || "";
-  var ownerBtnHtml = '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn'+(owner?" has-owner":"")+'" data-action="edit-regression-owner" data-entity-id="'+entity.id+'" title="'+(owner?"Change owner":"Assign an owner")+'">'+iconUser()+' '+(owner? esc(owner) : "Assign owner")+'</button>';
+  var ownerId = entity.assignedTo || "";
+  var legacyOwner = !ownerId && entity.legacyOwner ? entity.legacyOwner : "";
+  var ownerLabel = ownerId ? memberNameById(ownerId) : (legacyOwner ? legacyOwner+" (not in Know the Team)" : "Assign owner");
+  var ownerBtnHtml = '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn'+(ownerId?" has-owner":"")+'" data-action="edit-regression-owner" data-entity-id="'+entity.id+'" title="'+(ownerId?"Change owner":"Assign an owner")+'">'+iconUser()+' '+esc(ownerLabel)+'</button>';
   if(!services.length){
     // No services under this entity (e.g. a page that isn't broken into
     // sub-services) — track regression status on the entity itself as a
@@ -2730,6 +3051,7 @@ function renderRegressionEntityGroup(entity){
             '<button type="button" class="btn btn-sm btn-icon" data-action="edit-regression-entity-notes" data-entity-id="'+entity.id+'" aria-label="'+(entity.notes?"Edit":"Add")+' notes" title="'+(entity.notes?"Edit":"Add")+' notes">'+iconNote()+'</button>'+
           '</div>'+
         '</div>'+
+        regressionChangeNoteHtml(entity, entStatus)+
         (entity.notes? '<div class="item-row-desc reg-row-notes">'+esc(entity.notes)+'</div>':'')+
       '</div></div>'+
     '</div>';
@@ -2746,30 +3068,37 @@ function renderRegressionEntityGroup(entity){
     '<div class="item-list">'+rows+'</div>'+
   '</div>';
 }
-// Buckets entities by their assigned Owner (case-insensitive on the name,
-// but displayed with whatever capitalization was typed for that entity —
-// the first one encountered wins). Entities with no owner set land in one
-// "Unassigned" bucket, always last so the assigned owners sort first.
+// Buckets MODULES by their effective assignee (member id): each bucket holds
+// the entities that have at least one module assigned to that member, as
+// copies carrying only those modules. Nobody-assigned modules land in one
+// "Unassigned" bucket, always last so the named members sort first.
 function groupRegressionByOwner(entities){
-  var buckets = {}; // lowercased owner -> {label, entities}
-  var unassigned = [];
+  var buckets = {}; // member id (or "") -> {label, entities, byEntity}
+  function bucketFor(id){
+    var key = id || "";
+    if(!buckets[key]) buckets[key] = { label: id ? memberNameById(id) : "Unassigned", entities: [], byEntity: {} };
+    return buckets[key];
+  }
   entities.forEach(function(entity){
-    var owner = (entity.owner||"").trim();
-    if(!owner){ unassigned.push(entity); return; }
-    var key = owner.toLowerCase();
-    if(!buckets[key]) buckets[key] = { label: owner, entities: [] };
-    buckets[key].entities.push(entity);
+    var services = entity.services||[];
+    if(!services.length){ bucketFor(entity.assignedTo||"").entities.push(entity); return; }
+    services.forEach(function(s){
+      var b = bucketFor(regressionModuleAssigneeId(entity, s));
+      var slot = b.byEntity[entity.id];
+      if(!slot){ slot = Object.assign({}, entity, {services:[]}); b.byEntity[entity.id] = slot; b.entities.push(slot); }
+      slot.services.push(s);
+    });
   });
-  var groups = Object.keys(buckets).sort(function(a,b){ return a.localeCompare(b); }).map(function(k){ return buckets[k]; });
-  if(unassigned.length) groups.push({ label: "Unassigned", entities: unassigned });
-  return groups;
+  var named = Object.keys(buckets).filter(function(k){return k!=="";}).sort(function(a,b){ return buckets[a].label.localeCompare(buckets[b].label); }).map(function(k){ return buckets[k]; });
+  if(buckets[""]) named.push(buckets[""]);
+  return named;
 }
 function sectionRegression(r){
   var skipped = !!r.regressionSkipped;
   var entities = regressionEntities(r);
   var overall = regressionOverallStatus(r);
-  // The three views (All/My Regression/Unassigned) narrow which *entities*
-  // render, by entity.owner — regressionStatLine/the overall pill above
+  // The three views (All/My Regression/Unassigned) narrow which modules
+  // render, by their effective assignee — regressionStatLine/the overall pill above
   // still reflect the whole release regardless of view, same as Group By
   // already only ever changed layout, never what counted toward the
   // release's own status.
@@ -2799,11 +3128,13 @@ function sectionRegression(r){
     // suggestedMyTeamMember) and offer a one-click way to confirm it, right
     // here, instead of sending them off to Know the Team to link it by hand.
     var meSuggestion = state.regressionView==="Mine" ? suggestedMyTeamMember() : null;
+    var needsLink = state.regressionView==="Mine" && !currentMemberId() && !meSuggestion && allTeamMembers().length;
     listOrEmpty = '<div class="empty-row">'+(state.regressionView==="Mine"
-      ? "No entities are assigned to you yet."
-      : "Every entity has an owner.")+
+      ? ("Nothing is assigned to you yet."+(currentMemberId() ? "" : " Link yourself to your Know the Team entry so it can tell which regression is yours."))
+      : "Everything has an owner.")+
       (meSuggestion ? '<div class="regression-me-suggestion">Is <strong>'+esc(meSuggestion.name)+'</strong> you? '+
         '<button type="button" class="btn btn-sm btn-primary" data-action="toggle-my-team-member" data-id="'+meSuggestion.id+'">'+iconUser()+' Yes, that’s me</button></div>' : '')+
+      (needsLink ? '<div class="regression-me-suggestion"><button type="button" class="btn btn-sm btn-primary" data-action="link-identity">'+iconUser()+' Pick your Know the Team entry</button></div>' : '')+
       '</div>';
   } else {
     listOrEmpty = '<div class="regression-entity-list">'+groupsHtml+'</div>';
@@ -3473,31 +3804,38 @@ function field(id,label,type,value){
 
 /* ============================================================
    IDENTITY UI
-   Two modes, decided once at boot by what /auth/me reports:
-   - Atlassian login configured: a real "Sign in with Atlassian" screen
-     blocks the app until signed in; topbar shows the Atlassian account and
-     a Sign out button.
-   - Not configured (default/local): the original lightweight guest
-     name-tag flow — no password, no account, just a label for the audit
-     log — is used unchanged, via the GUEST SESSION helpers above.
+   Sign-in is Atlassian-only (the server refuses to start without it) and
+   proves who the person is; WHO THEY ARE ON THE QA TEAM comes from Know the
+   Team — the one source of identities. A signed-in user pins "this Know the
+   Team entry is me" once (the link is stored server-side, on the member's
+   own record), and from then on every assignment, audit event and statistic
+   references that member's stable id. There is no separate user list, no
+   session, and nothing to type in.
    ============================================================ */
 function renderTopbarUser(){
   var el = qs("#topbar-user");
   if(!el) return;
   var a = state.auth || {};
-  if(a.oauthEnabled){
-    if(!a.authenticated || !a.user){ el.innerHTML = ""; return; }
-    var u = a.user;
-    var avatar = u.avatarUrl ? '<img class="guest-avatar" src="'+escAttr(u.avatarUrl)+'" alt="">' : iconUser();
+  if(!a.authenticated || !a.user){ el.innerHTML = ""; return; }
+  var u = a.user;
+  var me = currentMember();
+  var avatarSrc = (me && me.photo) || u.avatarUrl;
+  var avatar = avatarSrc ? '<img class="user-avatar" src="'+escAttr(avatarSrc)+'" alt="">' : iconUser();
+  if(me){
     el.innerHTML =
-      '<span class="guest-badge" title="Signed in with Atlassian">'+avatar+' '+esc(u.name)+'</span>'+
+      '<span class="user-badge" title="Signed in with Atlassian as '+escAttr(u.name)+' · your Know the Team entry">'+avatar+' '+esc(me.name)+'</span>'+
       '<button type="button" class="btn btn-ghost btn-sm" data-action="sign-out">Sign out</button>';
     return;
   }
-  if(!state.guest){ el.innerHTML = ""; return; }
+  // Not linked to a Know the Team entry yet — assignments and audit entries
+  // can't be tied to a team member until they are, so offer it right here
+  // (non-blocking: everything else keeps working in the meantime).
   el.innerHTML =
-    '<span class="guest-badge" title="Guest session — not a signed-in account">'+iconUser()+' '+esc(state.guest.displayName)+'</span>'+
-    '<button type="button" class="btn btn-ghost btn-sm" data-action="change-user">Change User</button>';
+    '<span class="user-badge" title="Signed in with Atlassian">'+avatar+' '+esc(u.name)+'</span>'+
+    (state.teamReady && allTeamMembers().length
+      ? '<button type="button" class="btn btn-sm" data-action="link-identity" title="Pick your Know the Team entry so your work is attributed to you">'+iconUser()+' Link to team</button>'
+      : '')+
+    '<button type="button" class="btn btn-ghost btn-sm" data-action="sign-out">Sign out</button>';
 }
 function openSignInModal(){
   state.blockingModal = true;
@@ -3506,48 +3844,32 @@ function openSignInModal(){
     '<div class="modal-backdrop open" id="modal-backdrop"><div class="modal">'+
       '<div class="modal-head"><h3>Sign in to Greenlight</h3></div>'+
       '<div class="modal-body">'+
-        '<p class="helper-text" style="margin:0;">This deployment requires signing in with your company Atlassian account. Only people with access to this Jira site can use Greenlight — your activity will be tracked in the audit log under your Atlassian name.</p>'+
+        '<p class="helper-text" style="margin:0;">This deployment requires signing in with your company Atlassian account. Only people with access to this Jira site can use Greenlight. Your activity is attributed to your entry in Know the Team.</p>'+
       '</div>'+
       '<div class="modal-foot"><a class="btn btn-primary" href="/auth/login" style="flex:1;justify-content:center;">'+iconJira()+' Sign in with Atlassian</a></div>'+
     '</div></div>';
 }
-function openWelcomeModal(){
-  state.blockingModal = true;
-  var root = qs("#modal-root");
-  root.innerHTML =
-    '<div class="modal-backdrop open" id="modal-backdrop"><div class="modal">'+
-      '<div class="modal-head"><h3>Welcome to Greenlight</h3></div>'+
-      '<form id="modal-form"><div class="modal-body">'+
-        '<p class="helper-text" style="margin:0;">Enter your name to start. Your name will be used to track activity in the audit log.</p>'+
-        '<div class="field"><label for="f-guest-name">Full Name</label><input type="text" id="f-guest-name" placeholder="e.g. Sara Abu Rumman" required></div>'+
-      '</div><div class="modal-foot"><button type="submit" class="btn btn-primary" style="flex:1;justify-content:center;">Continue</button></div></form>'+
-    '</div></div>';
-  setTimeout(function(){ var f = qs("#f-guest-name"); if(f) f.focus(); }, 20);
-  qs("#modal-form").addEventListener("submit", function(e){
-    e.preventDefault();
-    var name = qs("#f-guest-name").value.trim();
-    if(!name){ qs("#f-guest-name").focus(); return; }
-    state.guest = createGuestSession(name);
-    state.blockingModal = false;
-    qs("#modal-root").innerHTML = "";
-    renderTopbarUser();
-  });
-}
-function openChangeUserModal(){
-  var current = state.guest || {};
+// "Which Know the Team entry is you?" — a plain pick-list over the one
+// roster (no typing, no new accounts). Pre-selects the entry whose name
+// matches the signed-in Atlassian name, when there is one. Saving writes the
+// same server-side link as the "This is me" item on a team card.
+function openLinkIdentityModal(){
+  var members = allTeamMembers();
+  if(!members.length){ showToast("Add yourself in Know the Team first."); return; }
+  var linkedId = myLinkedTeamMemberId();
+  var suggestion = suggestedMyTeamMember();
+  var current = linkedId || (suggestion && suggestion.id) || "";
   var body =
-    '<div class="field"><label for="f-guest-name">Full Name</label><input type="text" id="f-guest-name" value="'+escAttr(current.displayName||"")+'" required></div>'+
-    '<p class="helper-text">Existing audit log entries keep the name that was active when they were recorded — only future activity uses the new name.</p>';
+    '<p class="helper-text" style="margin:0 0 10px;">Pick your entry in <b>Know the Team</b>. Tickets and regression assigned to you, your audit trail and your statistics all follow this one choice.</p>'+
+    memberChoiceGroup("link-identity-choice", members, current);
   var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">Save</button>';
-  openModal(modalShell("Change User", body, foot));
+  openModal(modalShell("Who are you?", body, foot));
   qs("#modal-form").addEventListener("submit", function(e){
     e.preventDefault();
-    var name = qs("#f-guest-name").value.trim();
-    if(!name){ qs("#f-guest-name").focus(); return; }
-    state.guest = renameGuestSession(name);
+    var checked = qs('input[name="link-identity-choice"]:checked');
+    if(!checked){ showToast("Pick your name from the list."); return; }
     closeModal();
-    renderTopbarUser();
-    showToast("Now working as "+name);
+    setMyLinkedTeamMember(checked.value, true);
   });
 }
 
@@ -3702,57 +4024,52 @@ function openEditTicketModal(r, ticket){
   });
 }
 
-// QA Assignee(s) for one ticket — a checkbox pill-list (multiChoiceGroup),
-// since "QA Assigned" is a multi-person Jira field: a ticket can genuinely
-// have more than one owner. Sourced from ticketAssigneeOptions (the full
-// Know the Team roster). "Use Jira's assignees" (shown only when there's
-// currently a manual override) clears it (deletes ticket.qaAssignee) and
-// goes back to following Jira's field. A manual choice here always wins
-// over Jira going forward — a re-sync only ever refreshes
-// qaAssignedFromJira, never qaAssignee (see routes/releases.js#upsertTicket
-// and ticketEffectiveAssignees above).
+// QA owner for one ticket — a pick-list of Know the Team members (one person,
+// stored as that member's id) plus Unassigned. "Use Jira's assignee" (shown
+// only while there's a manual choice) removes the manual choice so the ticket
+// goes back to following Jira's QA Assigned field. The assignment audit
+// event (assigned / reassigned / unassigned, with the previous and new
+// member) is written by the server when the release is saved.
 function openTicketAssigneeModal(r, ticket){
-  var names = ticketAssigneeOptions();
+  var members = ticketAssigneeOptions();
   var hasOverride = ticketHasManualAssignee(ticket);
-  var jiraNames = ticketAssigneesArray(ticket.qaAssignedFromJira);
-  var currentSelected = hasOverride ? ticketAssigneesArray(ticket.qaAssignee) : jiraNames.slice();
+  var jiraNames = ticketJiraNames(ticket);
+  var current = ticketAssignedMemberId(ticket);
   var subtitle = hasOverride
-    ? (jiraNames.length ? "Jira's own QA Assigned field currently lists "+jiraNames.join(", ")+". Your manual choice below overrides it until you revert to Jira's assignees."
-                        : "This has a manual override — Jira's QA Assigned field has no one set for this ticket right now.")
-    : (jiraNames.length ? "Currently synced from Jira's QA Assigned field ("+jiraNames.join(", ")+"). Checking names below overrides it just for this ticket."
-                        : "Jira's QA Assigned field has no one set for this ticket yet — check anyone below, or leave it to pick up a value from Jira later.");
+    ? (jiraNames.length ? "Jira's own QA Assigned field lists "+jiraNames.join(", ")+". Your choice below overrides it for this release only."
+                        : "Set for this release only.")
+    : (jiraNames.length ? "Currently following Jira's QA Assigned field ("+jiraNames.join(", ")+"). Picking someone below overrides it for this release only."
+                        : "Nobody is assigned yet. This applies to this release only.");
   var body =
     '<div class="regmod-edit-name">'+esc(ticket.key)+' — '+esc(ticket.title||"Untitled")+'</div>'+
     '<p class="helper-text" style="margin:2px 0 10px;">'+esc(subtitle)+'</p>'+
-    (names.length
-      ? multiChoiceGroup("ticket-assignee-check", names, currentSelected)+'<p class="hint" style="margin-top:8px;">Check as many as apply — leave all unchecked for Unassigned.</p>'
+    (members.length
+      ? memberChoiceGroup("ticket-assignee-choice", members, current, [{value:"", label:"Unassigned", after:true}])
       : '<p class="helper-text" style="margin:0;">No one is in <b>Know the Team</b> yet — add people there first.</p>');
-  var foot = (hasOverride ? '<button type="button" class="btn btn-ghost" id="ticket-assignee-use-jira">Use Jira’s assignees</button>' : '<span></span>')+
+  var foot = (hasOverride ? '<button type="button" class="btn btn-ghost" id="ticket-assignee-use-jira">Use Jira’s assignee</button>' : '<span></span>')+
     '<span style="flex:1"></span><button type="button" class="btn" data-action="close-modal">Cancel</button>'+
-    (names.length ? '<button type="submit" class="btn btn-primary">Save</button>' : '');
-  openModal(modalShell("Assign QA owners", body, foot));
+    (members.length ? '<button type="submit" class="btn btn-primary">Save</button>' : '');
+  openModal(modalShell("Assign QA owner", body, foot));
 
   var useJiraBtn = qs("#ticket-assignee-use-jira");
   if(useJiraBtn) useJiraBtn.addEventListener("click", function(){
-    delete ticket.qaAssignee;
+    delete ticket.assignedTo;
     ticket.updatedAt = new Date().toISOString();
     closeModal();
-    persistRelease(r, function(){
-      logAudit({action:"TICKET_QA_UNASSIGNED", entityType:"Ticket", entityId: ticket.key, details: "Reverted to Jira's QA Assigned field — "+ticket.key});
-    });
+    persistRelease(r);
   });
 
-  if(!names.length) return; // nothing to check, and no Save button to wire up
+  if(!members.length) return; // nothing to pick, and no Save button to wire up
   qs("#modal-form").addEventListener("submit", function(e){
     e.preventDefault();
-    var picked = qsa('input[name="ticket-assignee-check"]:checked').map(function(el){ return el.value; });
-    ticket.qaAssignee = picked; // presence of the key marks this manual, even when picked is []
+    var checked = qs('input[name="ticket-assignee-choice"]:checked');
+    var picked = checked ? checked.value : current;
+    if(picked===current && (hasOverride || !picked)){ closeModal(); return; } // nothing changed
+    ticket.assignedTo = picked || null; // the key being present marks it manual, even when null
     ticket.updatedAt = new Date().toISOString();
     closeModal();
     persistRelease(r, function(){
-      var action = picked.length ? "TICKET_QA_ASSIGNED" : "TICKET_QA_UNASSIGNED";
-      var details = picked.length ? "Assigned "+ticket.key+" to "+picked.join(", ") : "Removed QA assignment from "+ticket.key;
-      logAudit({action:action, entityType:"Ticket", entityId: ticket.key, details: details});
+      showToast(picked ? "✓ "+ticket.key+" assigned to "+memberNameById(picked) : "✓ "+ticket.key+" unassigned");
     });
   });
 }
@@ -3807,99 +4124,147 @@ function openRegressionEntityNotesModal(r, entity){
   });
 }
 
-// Entity-level "who's covering this" — the only level assignment happens
-// at. Reuses statusChoiceGroup (the same pill-radio list the status buttons
-// use, just without status-tone coloring) rather than a new widget, and the
-// names offered come straight from Know the Team (regressionOwnerOptions) —
-// assigning someone here never requires typing a name by hand or adding a
-// new "assignee" concept to the app.
+// Entity-level "who's covering this". Reuses the same pill-radio list the
+// other pickers use (values are Know the Team member IDS, labels are names),
+// so assigning someone never means typing a name or adding a new "assignee"
+// concept. Every module under the entity follows this owner unless it has an
+// owner of its own — which this never overwrites. The assigned / unassigned
+// audit event is written by the server when the release is saved.
 //
 // The write target has to account for a legacy (pre-Entities/Services) row:
 // regressionEntities() wraps one of those as a synthetic single-service
 // entity, and entity._legacy is the real underlying row in that case.
 function openRegressionAssignModal(r, entity){
-  var names = regressionOwnerOptions();
-  var UNASSIGNED = "Unassigned";
-  var current = (entity.owner||"").trim() || UNASSIGNED;
-  var options = names.concat([UNASSIGNED]);
+  var members = regressionOwnerOptions();
+  var current = entity.assignedTo || "";
   var title = entity.name||"Unnamed entity";
-  var subtitle = "Sets the owner for every module in this entity's regression.";
+  var hasServices = (entity.services||[]).length>0 && !entity._legacy;
+  var subtitle = hasServices
+    ? "Sets the owner for every module in this entity that doesn't have its own owner."
+    : "Sets who covers this entity's regression.";
+  var legacyNote = !current && entity.legacyOwner
+    ? '<p class="helper-text" style="margin:0 0 10px;">Previously assigned to “'+esc(entity.legacyOwner)+'”, who isn’t in Know the Team — pick a team member to replace it.</p>' : '';
   var body =
     '<div class="regmod-edit-name">'+esc(title)+'</div>'+
-    '<p class="helper-text" style="margin:2px 0 10px;">'+esc(subtitle)+'</p>'+
-    (names.length ? statusChoiceGroup("reg-owner-choice", options, current, true)
-      : '<p class="helper-text" style="margin:0;">No one is in <b>Know the Team</b> yet — add people there first, or choose Unassigned below.</p>'+statusChoiceGroup("reg-owner-choice", options, current, true));
+    '<p class="helper-text" style="margin:2px 0 10px;">'+esc(subtitle)+'</p>'+legacyNote+
+    (members.length ? "" : '<p class="helper-text" style="margin:0 0 10px;">No one is available in <b>Know the Team</b> yet — add people there first, or choose Unassigned below.</p>')+
+    memberChoiceGroup("reg-owner-choice", members, current, [{value:"", label:"Unassigned", after:true}]);
   var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">Assign</button>';
   openModal(modalShell("Assign Entity regression", body, foot));
   qs("#modal-form").addEventListener("submit", function(e){
     e.preventDefault();
     var checked = qs('input[name="reg-owner-choice"]:checked');
     var picked = checked ? checked.value : current;
+    if(picked===current){ closeModal(); return; }
     var target = entity._legacy || entity;
-    var newOwner = picked===UNASSIGNED ? "" : picked;
-    target.owner = newOwner;
+    target.assignedTo = picked || null;
+    delete target.legacyOwner;
     closeModal();
-    var label = entity.name||"Unnamed entity";
     persistRelease(r, function(){
-      var action = newOwner ? "ENTITY_REGRESSION_ASSIGNED" : "REGRESSION_UNASSIGNED";
-      var details = newOwner ? "Assigned "+label+" regression to "+newOwner : "Removed assignment from "+label+" regression";
-      logAudit({action:action, entityType:"Regression", entityId: entity.id, details: details});
+      showToast(picked ? "✓ "+title+" assigned to "+memberNameById(picked) : "✓ "+title+" unassigned");
     });
   });
 }
 
-// "Assign Regression" — the bulk workflow: assign several Entities to
-// owners in one save. Same underlying write as openRegressionAssignModal
-// above (still just entity.owner, still one persistRelease at the end),
-// just applied to many rows at once from a table of <select>s instead of
-// one radio list per row. Only rows that actually changed get an audit
-// entry or a write; picking the same value a row already had is a no-op,
-// same as never having opened the dropdown.
+// One module's own assignee: a specific team member, Unassigned (deliberately
+// nobody, even if the entity has an owner), or "Use Entity owner" — which
+// removes the module's own choice so it follows the Entity again.
+var REG_USE_ENTITY_OWNER = "__entity__";
+function openRegressionModuleAssignModal(r, entity, service){
+  var members = regressionOwnerOptions();
+  var hasOverride = regressionModuleHasOverride(service);
+  var current = hasOverride ? (service.assignedTo || "") : REG_USE_ENTITY_OWNER;
+  var entityOwner = entity.assignedTo ? memberNameById(entity.assignedTo) : "no one";
+  var body =
+    '<div class="regmod-edit-name">'+esc(entity.name||"Unnamed entity")+' — '+esc(service.name||"Unnamed module")+'</div>'+
+    '<p class="helper-text" style="margin:2px 0 10px;">An owner picked here takes precedence over the Entity owner for this module only.</p>'+
+    memberChoiceGroup("reg-module-owner-choice", members, current, [
+      {value:REG_USE_ENTITY_OWNER, label:"Use Entity owner ("+entityOwner+")"},
+      {value:"", label:"Unassigned", after:true}
+    ]);
+  var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">Assign</button>';
+  openModal(modalShell("Assign module regression", body, foot));
+  qs("#modal-form").addEventListener("submit", function(e){
+    e.preventDefault();
+    var checked = qs('input[name="reg-module-owner-choice"]:checked');
+    var picked = checked ? checked.value : current;
+    if(picked===current){ closeModal(); return; }
+    if(picked===REG_USE_ENTITY_OWNER) delete service.assignedTo;
+    else service.assignedTo = picked || null;
+    closeModal();
+    var label = (entity.name||"Unnamed entity")+" — "+(service.name||"Unnamed module");
+    persistRelease(r, function(){
+      showToast(picked===REG_USE_ENTITY_OWNER ? "✓ "+label+" now follows the Entity owner"
+        : picked ? "✓ "+label+" assigned to "+memberNameById(picked) : "✓ "+label+" unassigned");
+    });
+  });
+}
+
+// "Assign Regression" — the bulk workflow: assign whole Entities AND/OR
+// individual modules to team members in one save, from a table of <select>s.
+// A module row's first choice is "Use Entity owner" (its default), so picking
+// an Entity owner moves every module that follows it and never overwrites a
+// module that was given its own owner. Only rows that actually changed are
+// written (picking what a row already had is a no-op), and the server turns
+// the saved differences into the assignment audit events.
 function openBulkAssignRegressionModal(r){
   var entities = regressionEntities(r);
   if(!entities.length){ showToast("No regression modules on this release yet."); return; }
-  var names = regressionOwnerOptions();
-  var UNASSIGNED_VAL = "__unassigned__";
+  var members = regressionOwnerOptions();
 
   var body =
-    (names.length ? '' : '<p class="helper-text">No one is in <b>Know the Team</b> yet — add people there first to assign by name, or use Unassigned below.</p>')+
+    (members.length ? '' : '<p class="helper-text">No one is available in <b>Know the Team</b> yet — add people there first to assign, or use Unassigned below.</p>')+
     '<div id="bulk-assign-rows"></div>';
   var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">'+iconSave()+' Save</button>';
   openModal(modalShell("Assign Regression", body, foot), {wide:true});
   var rowsEl = qs("#bulk-assign-rows");
 
-  function selectOptionsHtml(currentVal){
+  function optionsHtml(currentVal, extras){
     var opts = [];
-    opts.push('<option value="'+UNASSIGNED_VAL+'"'+(currentVal===""?" selected":"")+'>Unassigned</option>');
-    names.forEach(function(n){ opts.push('<option value="'+escAttr(n)+'"'+(currentVal===n?" selected":"")+'>'+esc(n)+'</option>'); });
+    (extras||[]).forEach(function(x){ opts.push('<option value="'+escAttr(x.value)+'"'+(currentVal===x.value?" selected":"")+'>'+esc(x.label)+'</option>'); });
+    members.forEach(function(m){ opts.push('<option value="'+escAttr(m.id)+'"'+(currentVal===m.id?" selected":"")+'>'+esc(m.name)+'</option>'); });
     return opts.join("");
   }
   rowsEl.innerHTML = '<div class="bulk-assign-table">'+entities.map(function(ent){
-    var cur = (ent.owner||"").trim();
-    return '<div class="bulk-assign-row"><div class="bulk-assign-label">'+esc(ent.name||"Unnamed entity")+'</div>'+
-      '<select class="bulk-assign-select" data-entity-id="'+ent.id+'">'+selectOptionsHtml(cur)+'</select></div>';
+    var cur = ent.assignedTo || "";
+    var entityRow = '<div class="bulk-assign-row bulk-assign-entity"><div class="bulk-assign-label">'+esc(ent.name||"Unnamed entity")+'</div>'+
+      '<select class="bulk-assign-select" data-entity-id="'+escAttr(ent.id)+'" data-kind="entity">'+optionsHtml(cur, [{value:"", label:"Unassigned"}])+'</select></div>';
+    var moduleRows = ent._legacy ? "" : (ent.services||[]).map(function(sv){
+      var curM = regressionModuleHasOverride(sv) ? (sv.assignedTo || "") : REG_USE_ENTITY_OWNER;
+      return '<div class="bulk-assign-row bulk-assign-module"><div class="bulk-assign-label">'+esc(sv.name||"Unnamed module")+'</div>'+
+        '<select class="bulk-assign-select" data-entity-id="'+escAttr(ent.id)+'" data-service-id="'+escAttr(sv.id)+'" data-kind="module">'+
+          optionsHtml(curM, [{value:REG_USE_ENTITY_OWNER, label:"Use Entity owner"}, {value:"", label:"Unassigned"}])+'</select></div>';
+    }).join("");
+    return entityRow+moduleRows;
   }).join("")+'</div>';
 
   qs("#modal-form").addEventListener("submit", function(e){
     e.preventDefault();
-    var changes = [];
+    var changed = 0;
     qsa(".bulk-assign-select", rowsEl).forEach(function(sel){
       var val = sel.value;
       var ent = entities.find(function(x){return x.id===sel.getAttribute("data-entity-id");});
       if(!ent) return;
-      var newOwner = val===UNASSIGNED_VAL ? "" : val;
-      var oldOwner = (ent.owner||"").trim();
-      if(newOwner===oldOwner) return;
-      var target = ent._legacy || ent;
-      target.owner = newOwner;
-      changes.push({action: newOwner ? "ENTITY_REGRESSION_ASSIGNED" : "REGRESSION_UNASSIGNED", entityId: ent.id,
-        details: newOwner ? "Assigned "+(ent.name||"entity")+" regression to "+newOwner : "Removed assignment from "+(ent.name||"entity")+" regression"});
+      if(sel.getAttribute("data-kind")==="entity"){
+        if(val===(ent.assignedTo||"")) return;
+        var target = ent._legacy || ent;
+        target.assignedTo = val || null;
+        delete target.legacyOwner;
+        changed++;
+        return;
+      }
+      var sv = (ent.services||[]).find(function(x){return x.id===sel.getAttribute("data-service-id");});
+      if(!sv) return;
+      var curM = regressionModuleHasOverride(sv) ? (sv.assignedTo || "") : REG_USE_ENTITY_OWNER;
+      if(val===curM) return;
+      if(val===REG_USE_ENTITY_OWNER) delete sv.assignedTo;
+      else sv.assignedTo = val || null;
+      changed++;
     });
-    if(!changes.length){ closeModal(); return; }
     closeModal();
+    if(!changed) return;
     persistRelease(r, function(){
-      changes.forEach(function(c){ logAudit({action:c.action, entityType:"Regression", entityId:c.entityId, details:c.details}); });
-      showToast("✓ Updated "+changes.length+" assignment"+pluralize(changes.length,"","s"));
+      showToast("✓ Updated "+changed+" assignment"+pluralize(changed,"","s"));
     });
   });
 }
@@ -4551,6 +4916,7 @@ document.addEventListener("click", function(e){
     case "nav-home": goTo("#/"); break;
     case "nav-list": goTo("#/releases"); break;
     case "nav-audit": goTo("#/audit"); break;
+    case "nav-statistics": goTo("#/statistics"); break;
     case "nav-team": goTo("#/team"); break;
     case "nav-detail": goTo("#/r/"+id); break;
     case "toggle-sidenav":
@@ -4562,7 +4928,7 @@ document.addEventListener("click", function(e){
       var appBodyClose = qs(".app-body");
       if(appBodyClose) appBodyClose.classList.remove("sidenav-open");
       break;
-    case "change-user": openChangeUserModal(); break;
+    case "link-identity": openLinkIdentityModal(); break;
     case "sign-out":
       authApi.logout().catch(function(){ /* clearing the cookie server-side best-effort either way */ }).then(function(){ location.href = "/"; });
       break;
@@ -4588,6 +4954,13 @@ document.addEventListener("click", function(e){
       if(r){
         var entOwner = regressionEntities(r).find(function(x){return x.id===entityId;});
         if(entOwner) openRegressionAssignModal(r, entOwner);
+      }
+      break;
+    case "edit-regression-module-owner":
+      if(r){
+        var entMo = regressionEntities(r).find(function(x){return x.id===entityId;});
+        var svcMo = entMo && (entMo.services||[]).find(function(x){return x.id===id;});
+        if(entMo && svcMo && !entMo._legacy) openRegressionModuleAssignModal(r, entMo, svcMo);
       }
       break;
     case "open-assign-regression": if(r) openBulkAssignRegressionModal(r); break;
@@ -4761,10 +5134,11 @@ document.addEventListener("change", function(e){
     // display copy — write through to the real object so the save sticks.
     var target4 = ent4._legacy ? ent4._legacy : svc4;
     target4.status = elp.value;
-    var regLabel4 = (ent4.name?ent4.name+" – ":"")+(svc4.name||"Unnamed service");
-    persistRelease(r4, function(){
-      logAudit({action:"REGRESSION_UPDATED", entityType:"Regression", entityId:svc4.id, details: regLabel4+" → "+target4.status});
-    });
+    // The audit event (assignedTo / changedBy / previous + new status) is
+    // written by the server when this save lands; here we only show the
+    // heads-up when the person changing it isn't who it's assigned to.
+    var assignee4 = regressionModuleAssigneeId(ent4, svc4);
+    persistRelease(r4, function(){ warnIfChangedByOther(assignee4); });
   }
   if(elp.matches('[data-action="set-regression-entity-status"]')){
     var r9 = state.releases[state.route.id]; if(!r9) return;
@@ -4772,9 +5146,13 @@ document.addEventListener("change", function(e){
     var ent9 = regressionEntities(r9).find(function(x){return x.id===entId9;});
     if(!ent9) return;
     ent9.status = elp.value;
-    persistRelease(r9, function(){
-      logAudit({action:"REGRESSION_UPDATED", entityType:"Regression", entityId:ent9.id, details: (ent9.name||"Unnamed entity")+" → "+ent9.status});
-    });
+    var assignee9 = ent9.assignedTo || "";
+    persistRelease(r9, function(){ warnIfChangedByOther(assignee9); });
+  }
+  if(elp.matches && elp.matches('[data-stats-field]')){
+    var sf = state.statsFilters || (state.statsFilters = statsDefaultFilters());
+    sf[elp.getAttribute("data-stats-field")] = elp.value;
+    render();
   }
   if(elp.id === "ticket-group-by"){
     state.ticketGroupBy = elp.value;
@@ -4940,21 +5318,15 @@ function initAuthThenBoot(){
   authApi.me().then(function(info){
     state.auth = info;
     renderTopbarUser();
-    if(info.oauthEnabled && !info.authenticated){
+    if(!info.authenticated){
       openSignInModal();
       return; // nothing else loads until they've actually signed in
-    }
-    if(!info.oauthEnabled){
-      state.guest = getGuestSession();
-      if(state.guest) touchGuestSession();
-      if(!state.guest) openWelcomeModal();
     }
     state.route = parseHash();
     boot();
   }).catch(function(){
     // Couldn't even reach /auth/me — the server may be down or unreachable.
-    // There's no guest fallback anymore, so show a plain error instead of
-    // a blank page or a fake logged-out state.
+    // Show a plain error instead of a blank page or a fake logged-out state.
     document.body.innerHTML = '<div style="max-width:32rem;margin:4rem auto;padding:1.5rem;font-family:system-ui,sans-serif;text-align:center;">'+
       '<h2 style="margin:0 0 .5rem;">Can’t reach Greenlight</h2>'+
       '<p style="color:#666;">The server didn’t respond. Check your connection and reload the page.</p>'+

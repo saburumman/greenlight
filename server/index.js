@@ -13,6 +13,8 @@ const authRouter = require("./routes/auth");
 const oauth = require("./auth/atlassianOAuth");
 const { requireAuth } = require("./auth/middleware");
 const pgPool = require("./db/pgPool");
+const db = require("./db");
+const { migrateAllReleases } = require("./migrateAssignments");
 
 // Authentication is mandatory — there is no guest fallback. Refuse to start
 // at all unless every Atlassian login variable is set, rather than silently
@@ -79,4 +81,9 @@ app.listen(PORT, HOST, () => {
   } else {
     console.log(`  Persistence: local JSON file (data/store.json) — set DATABASE_URL to use Postgres/Supabase instead\n`);
   }
+  // Moves any name-based QA assignments (older releases) onto Know the Team
+  // member ids. Idempotent; a no-op once everything is converted.
+  migrateAllReleases(db).then((n) => {
+    if (n) console.log(`  Assignments: migrated ${n} release${n === 1 ? "" : "s"} to Know the Team member ids\n`);
+  });
 });

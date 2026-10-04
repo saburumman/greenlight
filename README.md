@@ -5,7 +5,7 @@ A lightweight QA release-readiness dashboard. It runs happily on your own machin
 ## What it does
 
 - A **landing page** (the home screen, at `/`) welcomes you into the workspace with quick-access cards to every section, an at-a-glance summary of real release data, and a short recent-activity feed — see [Home / Landing page](#home--landing-page) below.
-- A persistent **left sidebar** (a collapsible drawer on small screens) is how you get around — Release Monitor, Test Data, Audit, and Know the Team — with the current section always highlighted.
+- A persistent **left sidebar** (a collapsible drawer on small screens) is how you get around — Release Monitor, Test Data, Statistics, Audit, and Know the Team — with the current section always highlighted.
 - Tracks releases: tickets, regression (by module, against a reusable module list), known bugs, platform status (Web/Android/iOS), release blockers, and optional Performance/Security testing.
 - Gives an AI-style **GO / CONDITIONAL GO / NO-GO** recommendation, built from simple rules over exactly what you've entered (it never invents data).
 - Tickets can be added manually by pasting a Jira URL, or synced automatically from Jira by Fix Version.
@@ -46,11 +46,23 @@ If a ticket lookup fails for any reason (Jira unreachable, a mistyped URL, or yo
 
 **Ticket → status bucket mapping:** Jira status names vary a lot between teams, so Greenlight maps them into 4 buckets (Open/To Do, In QA, Blocked, Completed) using Jira's own "done" classification plus simple keyword matching (anything with "block" in the name → Blocked, anything with "qa"/"test"/"review" → In QA). If your team's workflow uses different naming and the buckets look wrong, this is a one-function edit: `server/statusBucket.js`.
 
-## Identity & the Audit Log
+## Identity, assignment & the Audit Log
 
-Nobody can use the app — view or edit anything — without signing in with an Atlassian account that has access to your configured Jira site (see the next section for setup; the server refuses to even start without it). The Audit Log records your real Atlassian name, and a signed-in session can't spoof another person's identity — the server stamps every audit record from the verified session, ignoring anything the browser sends.
+**Know the Team is the single source of truth for people.** There is no guest mode, no separate users table and no second "assignee" list: the QA identities used for ticket assignment, regression assignment, the Audit Log and Statistics are all Know the Team members, referenced everywhere by their stable `TeamMember.id` (never by name — renaming someone in Know the Team renames them everywhere).
 
-The Audit Log itself (`data/store.json`, or the `audit_log` table on Postgres) is append-only — nobody edits or deletes existing entries from the UI, past entries keep whatever name was active when they were written, and switching identity (signing out and back in as someone else) only changes the name on *future* entries.
+Nobody can use the app without signing in with an Atlassian account that has access to your configured Jira site (the server refuses to start without it). To act *as* a team member, each person links their sign-in to their Know the Team card once — **Link to team** in the top bar, or **This is me** on the card (it stores the Atlassian email on the member as `linkedEmail`). The server resolves the verified Atlassian session to that member and stamps every audit record with the member's id; anything the browser sends about identity is ignored. A signed-in user who hasn't linked yet can still work, but their name is shown as their Atlassian name and they can't be an assignee/"My Regression" until linked.
+
+**Assignments** (all per release — the same Jira key in Release A and Release B is independent):
+
+- Ticket: `ticket.assignedTo` = a team member id or `null`. If the key is absent, the ticket follows Jira's *QA Assigned* field (matched to a member by unique name at read time; nothing about that match is stored as identity).
+- Regression: `entity.assignedTo` (the Entity owner) and an optional `service.assignedTo` per module. Hierarchy: module owner > Entity owner > unassigned. No key on a module = follows the Entity owner; an id = override; `null` = deliberately unassigned. Changing the Entity owner never overwrites a module's explicit assignment. Views: All / My Regression (by member id) / Unassigned.
+- Changing a regression status as someone other than the assignee is allowed; a compact "⚠ status changed by another QA member" note appears and the audit event records `regressionModuleId`, `assignedTo`, `changedBy`, `previousStatus`, `newStatus`.
+
+**The Audit Log** (`data/store.json`, or the `audit_log` table on Postgres) is append-only, simple and chronological. Each entry is `{teamMemberId, userName, action, entityType, entityId, details, meta?, createdAt}`. Assignment and regression-status events are derived **server-side** from what actually changed in a save (so they can't be forged by the browser); opening pages, searching and filtering are never logged. On Postgres the two new columns (`team_member_id`, `meta`) are added automatically on first use; `supabase/migrations/0002_audit_team_member_identity.sql` does the same by hand. Older entries have no member id, so they keep showing the name they were written with and are left out of per-member statistics.
+
+**Statistics** (sidebar → Statistics) is a small dedicated page — cards, three tables and a daily table, filterable by Date (All time / Last 7 / Last 30 days / Custom), Release and QA Member. Everything is computed from real release data and audit events; if nothing matches it says "No data available for the selected filters." It is workload visibility only: no ranking, scoring or productivity measures. Items assigned before this version have no date and only appear under *All time*.
+
+**Upgrading from the name-based model:** on startup (and again on every read/save, idempotently) existing releases are migrated from names to ids: an Entity `owner` that uniquely matches a Know the Team name becomes `assignedTo`; ticket `qaAssignee` names do the same. Anything that can't be matched confidently is never guessed — it's kept as `legacyOwner` / `legacyQaAssignee` and shown as "(not in Know the Team)" until someone reassigns it.
 
 ## Authentication (Sign in with Atlassian)
 
@@ -104,7 +116,7 @@ Regression is module-based, not test-case-based, and organized as **Entity → S
 - Every **new** release takes its own snapshot of the master list at creation time, with every service starting as **NOT TESTED**. Each service row shows its status as inline buttons — **PASS / WARNING / FAIL / NOT TESTED / SKIP** — clicking one saves that service's status immediately, no popup needed.
 - **SKIP** is for a service that genuinely doesn't apply to this release. Skipped services are left out of the overall regression status and out of the AI assessment's regression risk checks entirely (if every tracked service on a release ends up skipped, the assessment notes that transparently rather than reading it as untested or as a pass).
 - Click the note icon on a service row to add or edit that service's notes in a small popup — separate from status, so a click to change status never requires typing anything.
-- Each **entity** can be assigned an **Owner** — click the "Assign owner" button next to its name and type in whoever's covering it. This is free text (not tied to Know the Team), and it's set per release, not on the shared master list — the same entity can have a different owner from one release to the next, and clearing it is just saving the field blank.
+- Each **entity** can be assigned an **Owner** — click the owner button next to its name and pick a Know the Team member (or Unassigned). Each **module** can also have its own owner that takes precedence over the Entity owner (pick **Use Entity owner** to hand it back). **Assign Regression** assigns whole entities and/or individual modules in one save. Owners are set per release, not on the shared master list.
 - Use the **Group by** control in the Regression section to switch the list between **Entity** (the default order) and **Owner** — grouping every entity under whoever it's assigned to, alphabetically, with any entities that don't have an owner yet collected under one **Unassigned** group at the end. Each entity still shows (and lets you edit) its own owner within either view; this only changes how they're arranged on the page.
 - Editing the master list later — adding, renaming, or deleting an entity or a service — only affects releases created **after** that change. Releases that already exist keep exactly the entity/service list (and statuses) they had, so historical release reports never shift under you.
 - Added or deleted an entity or service on the master list and want an **existing** release to catch up? Click **🔄 Sync Modules** in that release's Regression section. It adds what's missing (a new entity, or a new service under one you already track — never touching the status, notes, or owner you've already set on anything that stays) **and** removes any entity or service this release is still tracking that's since been deleted from the master list, taking its recorded status/notes/owner with it. The toast after syncing spells out exactly what was added and removed. A release's older, pre-Entities/Services flat regression rows (from before this feature existed) were never tied to the master list and are left alone either way.
@@ -207,14 +219,14 @@ Import support is CSV-only for now — not raw `.xlsx` — since parsing real Ex
 
 The root URL (`/`) is now a landing page instead of the releases list (which moved to its own explicit `/#/releases` route — every existing "back to releases" link and the sidebar's **Release Monitor** item still take you there). It's intentionally lightweight — an orientation and jumping-off point, not another full dashboard:
 
-- A short welcome section, four quick-access cards straight to Release Monitor, Test Data, Audit, and Know the Team.
+- A short welcome section, quick-access cards straight to Release Monitor, Test Data, Statistics, Audit, and Know the Team.
 - **At a Glance** — Active Releases, Open Blockers, Releases with GO, and Releases with NO-GO, computed live from your existing release data (the same `computeAssessment()` engine used everywhere else) — never invented or hardcoded numbers.
 - **Recent Releases** — the 5 most recently updated releases with their current status, linking straight to each release's page, plus a "View all releases" link.
 - **Recent Activity** — the 5 most recent Audit Log entries, shown only when the Audit Log already has data. Viewing the landing page itself never writes a new audit entry.
 
 ## Know the Team
 
-**Know the Team** (sidebar) introduces the people behind the QA work — name, role, a short bio, QA specialties, tools, and an optional LinkedIn/GitHub link. It is purely informational: no login roles, no permissions, and no connection to guest sessions or accounts. Team members live in one small array at the top of the "KNOW THE TEAM" section in `public/app.js` (`TEAM_MEMBERS`) — edit that array to add, update, or remove a person; a `placeholder: true` entry is shown with a "Placeholder" badge until it's replaced with a real profile.
+**Know the Team** (sidebar) introduces the people behind the QA work — name, role, a short bio, QA specialties, tools, and an optional LinkedIn/GitHub link. It is also the roster used for assignments, the Audit Log and Statistics — still no login roles or permissions. Team members live in one small array at the top of the "KNOW THE TEAM" section in `public/app.js` (`TEAM_MEMBERS`) — edit that array to add, update, or remove a person; a `placeholder: true` entry is shown with a "Placeholder" badge until it's replaced with a real profile.
 
 ## Running with Docker
 
@@ -262,6 +274,9 @@ greenlight-app/
     asyncHandler.js       — wraps async route handlers so a rejected Promise (e.g. a DB error) reaches the error middleware instead of hanging
     jiraClient.js        — the 2 Jira REST calls this app makes (read-only), scoped per-user via jiraClient.forUser(req.authUser)
     statusBucket.js       — Jira status → bucket mapping (edit this to match your workflow)
+    assignmentLogic.js       — team-member-id assignment model: legacy name→id migration, actor resolution, save-diff → audit events
+    auditWriter.js           — builds/writes audit entries (teamMemberId + allow-listed meta)
+    migrateAssignments.js    — startup pass that migrates stored releases to the id-based model
     releaseNotesLogic.js   — Release Notes categorization + rule-based summarizer (server-side twin of the same logic in app.js)
     aiService.js             — thin Google Gemini API client used only for Release Notes item text (see "Release notes" above)
     auth/
@@ -274,13 +289,14 @@ greenlight-app/
       releases.js         — release CRUD + ticket endpoints
       jira.js               — per-user Jira status/lookup endpoints
       regressionModules.js  — the reusable Regression Module master list
-      audit.js                — audit log read/append endpoints
+      audit.js                — audit log read/append endpoints (browser-postable events only; assignment events are server-derived)
       testData.js               — the reusable Test Data library CRUD endpoints
       auth.js                  — /auth/login, /auth/callback, /auth/logout, /auth/me
   public/
     index.html, styles.css, app.js  — the dashboard itself (no build step, no framework)
   data/                    — created automatically when running on the JSON-file backend; your releases, audit log, and every signed-in user's own Jira OAuth tokens live here
   supabase/
+    migrations/             — incremental SQL (0002 adds audit_log.team_member_id / meta; the app also adds them automatically)
     schema.sql              — the Postgres table definitions (run once against a new database — see "Deploying to Render + Supabase" below)
   scripts/
     migrate-json-to-supabase.js  — one-time (safely re-runnable) import of an existing data/store.json into Postgres

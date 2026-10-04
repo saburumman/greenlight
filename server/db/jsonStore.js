@@ -10,7 +10,7 @@
 // about how this behaves has changed.
 //
 // Shape on disk: { releases: { <id>: {...} }, regressionModules: [{id,name,services:[{id,name}]}],
-//                   auditLog: [{id,sessionId,userName,action,entityType,entityId,details,createdAt}],
+//                   auditLog: [{id,teamMemberId,userName,action,entityType,entityId,details,meta?,createdAt}],
 //                   testData: { <id>: {...} }, team: { <id>: {...} },
 //                   atlassianTokens: { <accountId>: {accountId,accessToken,refreshToken,expiresAt,scope,updatedAt} } }
 //
@@ -266,7 +266,7 @@ const regressionModules = {
   },
 };
 
-// Append-only Audit Log — a record of meaningful, guest-attributed actions
+// Append-only Audit Log — a record of meaningful actions attributed to a Know the Team member
 // (see routes/audit.js). Never edited or removed via the app; purely
 // additive, same storage file as everything else.
 const auditLog = {

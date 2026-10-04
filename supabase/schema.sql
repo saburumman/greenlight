@@ -68,11 +68,20 @@ create table if not exists audit_log (
   entity_type text not null default '',
   entity_id text not null default '',
   details text not null default '',
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  -- The Know the Team member who acted (stable team member id; null when the
+  -- signed-in user hasn't linked themselves to a team member yet).
+  team_member_id text,
+  -- Small structured payload for events that carry data (assignedTo,
+  -- changedBy, previousStatus, newStatus, ...). See server/assignmentLogic.js.
+  meta jsonb
 );
+alter table audit_log add column if not exists team_member_id text;
+alter table audit_log add column if not exists meta jsonb;
 comment on table audit_log is 'Append-only record of meaningful actions across the app — see server/routes/audit.js for the allowed action list.';
 create index if not exists idx_audit_log_created_at on audit_log (created_at desc);
 create index if not exists idx_audit_log_entity on audit_log (entity_type, entity_id);
+create index if not exists idx_audit_log_team_member on audit_log (team_member_id);
 
 -- ---------------------------------------------------------------------
 -- test_data — reusable QA test data library, independent of any release.

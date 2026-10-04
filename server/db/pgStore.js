@@ -109,44 +109,88 @@ const regressionModules = {
 // Append-only Audit Log — the one collection whose records were already
 // flat (no nested structure), so this is a normal relational table with
 // typed columns and a real ORDER BY, rather than a JSONB blob.
+//
+// Two columns were added when audit records moved from a guest/session id to
+// stable Know the Team member ids (see supabase/migrations/0002_*.sql):
+//   team_member_id  the team member who acted (null when the signed-in user
+//                   hasn't linked themselves to a team member yet)
+//   meta            small structured JSONB for events that carry data
+//                   (assignedTo / changedBy / previousStatus / newStatus ...)
+// ensureAuditColumns() applies exactly those two idempotent ADD COLUMNs the
+// first time the audit log is touched, so a database provisioned before this
+// change keeps working without a manual step. If the database role isn't
+// allowed to ALTER, the store quietly degrades: reads/writes keep working on
+// the original columns (the member id is then kept in session_id and `meta`
+// is not stored) and the failure is logged once.
+let auditColumnsPromise = null;
+function ensureAuditColumns() {
+  if (!auditColumnsPromise) {
+    auditColumnsPromise = pgPool
+      .query("ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS team_member_id text, ADD COLUMN IF NOT EXISTS meta jsonb")
+      .then(() => true)
+      .catch((e) => {
+        console.error("  audit_log: couldn't add team_member_id/meta columns (" + e.message + ") — run supabase/migrations/0002_audit_team_member_identity.sql. Falling back to the original columns.");
+        return false;
+      });
+  }
+  return auditColumnsPromise;
+}
+
+const AUDIT_BASE_COLS = "id, session_id, user_name, action, entity_type, entity_id, details, created_at";
+const AUDIT_EXT_COLS = AUDIT_BASE_COLS + ", team_member_id, meta";
+
 const auditLog = {
   async list() {
+    const extended = await ensureAuditColumns();
     const { rows } = await pgPool.query(
-      `SELECT id, session_id, user_name, action, entity_type, entity_id, details, created_at
-       FROM audit_log ORDER BY created_at DESC`
+      `SELECT ${extended ? AUDIT_EXT_COLS : AUDIT_BASE_COLS} FROM audit_log ORDER BY created_at DESC`
     );
     return rows.map(rowToAuditEntry);
   },
   async append(entry) {
-    const { rows } = await pgPool.query(
-      `INSERT INTO audit_log (id, session_id, user_name, action, entity_type, entity_id, details, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       ON CONFLICT (id) DO NOTHING
-       RETURNING id, session_id, user_name, action, entity_type, entity_id, details, created_at`,
-      [
-        entry.id,
-        entry.sessionId || null,
-        entry.userName || "Unknown",
-        entry.action,
-        entry.entityType || "",
-        entry.entityId || "",
-        entry.details || "",
-        isoOrNow(entry.createdAt),
-      ]
-    );
+    const extended = await ensureAuditColumns();
+    const base = [
+      entry.id,
+      // Legacy column: only filled in when the new team_member_id column
+      // isn't available, so the member id is never lost.
+      extended ? null : entry.teamMemberId || null,
+      entry.userName || "Unknown",
+      entry.action,
+      entry.entityType || "",
+      entry.entityId || "",
+      entry.details || "",
+      isoOrNow(entry.createdAt),
+    ];
+    const { rows } = extended
+      ? await pgPool.query(
+          `INSERT INTO audit_log (${AUDIT_EXT_COLS})
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+           ON CONFLICT (id) DO NOTHING
+           RETURNING ${AUDIT_EXT_COLS}`,
+          base.concat([entry.teamMemberId || null, entry.meta ? JSON.stringify(entry.meta) : null])
+        )
+      : await pgPool.query(
+          `INSERT INTO audit_log (${AUDIT_BASE_COLS})
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (id) DO NOTHING
+           RETURNING ${AUDIT_BASE_COLS}`,
+          base
+        );
     if (rows.length) return rowToAuditEntry(rows[0]);
     // Idempotency guard, same contract as jsonStore: a retried request with
     // the same id returns the record that's already there instead of
     // duplicating (or erroring on the primary-key conflict).
-    const existing = await pgPool.query(`SELECT id, session_id, user_name, action, entity_type, entity_id, details, created_at FROM audit_log WHERE id = $1`, [entry.id]);
+    const existing = await pgPool.query(
+      `SELECT ${extended ? AUDIT_EXT_COLS : AUDIT_BASE_COLS} FROM audit_log WHERE id = $1`,
+      [entry.id]
+    );
     return existing.rows.length ? rowToAuditEntry(existing.rows[0]) : entry;
   },
 };
 
 function rowToAuditEntry(row) {
-  return {
+  const entry = {
     id: row.id,
-    sessionId: row.session_id,
     userName: row.user_name,
     action: row.action,
     entityType: row.entity_type || "",
@@ -154,6 +198,12 @@ function rowToAuditEntry(row) {
     details: row.details || "",
     createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
   };
+  // team_member_id when the column exists; otherwise (degraded mode) the id
+  // was stored in session_id. Old guest-era session ids simply don't match
+  // any team member and are ignored by the app.
+  entry.teamMemberId = row.team_member_id !== undefined ? row.team_member_id || null : row.session_id || null;
+  if (row.meta) entry.meta = row.meta;
+  return entry;
 }
 
 // Per-user Atlassian OAuth token storage — keyed by accountId, never email

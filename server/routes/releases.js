@@ -7,6 +7,8 @@ const { extractIssueKey } = require("../extractKey");
 const releaseNotesLogic = require("../releaseNotesLogic"); // this route's only AI-related import for Release Notes — see releaseNotesLogic.generateReleaseNotes() for the abstraction boundary; nothing here talks to an AI provider directly
 const mobileReleaseNoteLogic = require("../mobileReleaseNoteLogic"); // same pattern, for the Mobile Release Note section below — see draftEnglishBullets/translateBulletsToArabic
 const incidentLogic = require("../incidentLogic"); // Incidents section — validation/normalization applied in the generic PUT below
+const assignmentLogic = require("../assignmentLogic"); // QA assignment by Know the Team member id — legacy-name migration + the save diff that produces assignment/status audit events
+const { recordEvents } = require("../auditWriter");
 const { asyncHandler } = require("../asyncHandler");
 
 const router = express.Router();
@@ -37,7 +39,7 @@ function newReleaseDoc(name, version, date, qaOwner, regressionModules) {
         id: crypto.randomUUID(),
         entityId: entity.id,
         name: entity.name,
-        owner: "", // who's covering this entity's regression, for this release only — set from the UI, never copied from the master list
+        assignedTo: null, // Know the Team member id covering this entity's regression, for this release only — set from the UI, never copied from the master list
         services,
       };
       // No services under this entity (e.g. a page not broken into
@@ -77,12 +79,32 @@ function newReleaseDoc(name, version, date, qaOwner, regressionModules) {
   };
 }
 
+// One release by id, with any name-based assignments (older data) converted to
+// Know the Team member ids in memory. Every handler below that reads a release
+// goes through this, so what they return — and what they write back — always
+// carries ids only.
+async function getReleaseMigrated(id) {
+  const r = await db.releases.get(id);
+  if (r) assignmentLogic.migrateReleaseAssignments(r, await db.team.list());
+  return r;
+}
+
 function notFound(res) {
   return res.status(404).json({ error: "Release not found." });
 }
 
+// Releases saved before assignments moved from names to Know the Team member
+// ids are converted on the way out too (in memory only — the stored copy is
+// converted the next time the release is saved), so the browser only ever
+// sees ids no matter when a release was last written.
+async function withAssignmentsMigrated(releases) {
+  const team = await db.team.list();
+  for (const r of releases) assignmentLogic.migrateReleaseAssignments(r, team);
+  return releases;
+}
+
 router.get("/", asyncHandler(async (req, res) => {
-  res.json(await db.releases.list());
+  res.json(await withAssignmentsMigrated(await db.releases.list()));
 }));
 
 router.post("/", asyncHandler(async (req, res) => {
@@ -98,7 +120,7 @@ router.post("/", asyncHandler(async (req, res) => {
 }));
 
 router.get("/:id", asyncHandler(async (req, res) => {
-  const r = await db.releases.get(req.params.id);
+  const r = await getReleaseMigrated(req.params.id);
   if (!r) return notFound(res);
   res.json(r);
 }));
@@ -107,7 +129,7 @@ router.get("/:id", asyncHandler(async (req, res) => {
 // (adding a bug, editing a platform, etc.) and PUTs the whole thing back.
 // Kept deliberately simple and generic, matching every non-ticket section.
 router.put("/:id", asyncHandler(async (req, res) => {
-  const existing = await db.releases.get(req.params.id);
+  const existing = await getReleaseMigrated(req.params.id);
   if (!existing) return notFound(res);
   const incoming = req.body || {};
   // Incidents are the one section validated server-side on this otherwise
@@ -123,20 +145,37 @@ router.put("/:id", asyncHandler(async (req, res) => {
   } catch (e) {
     return res.status(e.status || 400).json({ error: e.message });
   }
-  const merged = { ...incoming, incidents, _id: req.params.id, updatedAt: new Date().toISOString() };
+  const now = new Date().toISOString();
+  const merged = { ...incoming, incidents, _id: req.params.id, updatedAt: now };
+
+  // Assignments are Know the Team member ids. Bring BOTH copies to that
+  // shape first (a stored release, or an old browser tab, may still carry
+  // name-based owner/qaAssignee), then diff them: what changed becomes
+  // stamped who/when fields on the release plus audit events (ticket
+  // assigned/reassigned, regression assigned/unassigned, and regression
+  // status changes with assignedTo/changedBy/previous/new status). The
+  // actor is the verified session resolved to a team member — never
+  // anything the browser says about itself.
+  const team = await db.team.list();
+  assignmentLogic.migrateReleaseAssignments(existing, team);
+  assignmentLogic.migrateReleaseAssignments(merged, team);
+  const actor = assignmentLogic.resolveActor(req.authUser, team);
+  const events = assignmentLogic.diffReleaseActivity(existing, merged, { actor, team, now });
+
   await db.releases.set(req.params.id, merged);
+  await recordEvents(db, actor, events, now);
   res.json(merged);
 }));
 
 router.delete("/:id", asyncHandler(async (req, res) => {
-  const existing = await db.releases.get(req.params.id);
+  const existing = await getReleaseMigrated(req.params.id);
   if (!existing) return notFound(res);
   await db.releases.delete(req.params.id);
   res.json({ ok: true });
 }));
 
 router.post("/:id/duplicate", asyncHandler(async (req, res) => {
-  const existing = await db.releases.get(req.params.id);
+  const existing = await getReleaseMigrated(req.params.id);
   if (!existing) return notFound(res);
   const id = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -149,6 +188,16 @@ router.post("/:id/duplicate", asyncHandler(async (req, res) => {
   // Incidents belong to exactly one release — a duplicate is a different
   // release, so it starts with none rather than inheriting the original's.
   clone.incidents = [];
+  // Assignments (who covers what) carry over like every other field, but the
+  // "when/by whom" activity stamps belong to the original release's history —
+  // dropping them keeps Statistics from counting the same activity twice.
+  for (const t of clone.tickets || []) { delete t.assignedAt; delete t.assignedBy; }
+  for (const row of clone.regression || []) {
+    delete row.assignedAt; delete row.assignedBy; delete row.lastChange;
+    for (const sv of Array.isArray(row.services) ? row.services : []) {
+      delete sv.assignedAt; delete sv.assignedBy; delete sv.lastChange;
+    }
+  }
   clone.jira = { lastSyncedAt: null };
   clone.createdAt = now;
   clone.updatedAt = now;
@@ -182,7 +231,7 @@ function upsertTicket(tickets, ticket, source) {
 // If Jira is connected, fields are auto-filled from a live lookup;
 // otherwise the caller supplies title/status/issueType/priority.
 router.post("/:id/tickets", asyncHandler(async (req, res) => {
-  const release = await db.releases.get(req.params.id);
+  const release = await getReleaseMigrated(req.params.id);
   if (!release) return notFound(res);
 
   const { url, title, status, issueType, priority } = req.body || {};
@@ -236,7 +285,7 @@ function bucketFromManualStatus(status) {
 }
 
 router.delete("/:id/tickets/:key", asyncHandler(async (req, res) => {
-  const release = await db.releases.get(req.params.id);
+  const release = await getReleaseMigrated(req.params.id);
   if (!release) return notFound(res);
   release.tickets = (release.tickets || []).filter((t) => t.key !== req.params.key);
   release.updatedAt = new Date().toISOString();
@@ -253,7 +302,7 @@ router.delete("/:id/tickets/:key", asyncHandler(async (req, res) => {
 // matched by a Fix Version search, keeps source "Manual" (see upsertTicket)
 // and is never touched by this removal — only Jira-confirmed tickets are.
 router.post("/:id/jira-sync", asyncHandler(async (req, res) => {
-  const release = await db.releases.get(req.params.id);
+  const release = await getReleaseMigrated(req.params.id);
   if (!release) return notFound(res);
 
   const fixVersion = (release.version || "").trim();
@@ -324,7 +373,7 @@ router.post("/:id/jira-sync", asyncHandler(async (req, res) => {
 // the one place provider config (a single API key) actually lives.
 
 router.post("/:id/release-notes/generate", asyncHandler(async (req, res) => {
-  const release = await db.releases.get(req.params.id);
+  const release = await getReleaseMigrated(req.params.id);
   if (!release) return notFound(res);
 
   const fixVersion = (release.version || "").trim();
@@ -441,7 +490,7 @@ router.post("/:id/release-notes/generate", asyncHandler(async (req, res) => {
 // every other section on a release (see handleSaveMobileNote in app.js).
 
 router.post("/:id/mobile-release-note/draft-en", asyncHandler(async (req, res) => {
-  const release = await db.releases.get(req.params.id);
+  const release = await getReleaseMigrated(req.params.id);
   if (!release) return notFound(res);
 
   // Optional: specific ticket keys to draft from (see the "Draft From
@@ -469,7 +518,7 @@ router.post("/:id/mobile-release-note/draft-en", asyncHandler(async (req, res) =
 }));
 
 router.post("/:id/mobile-release-note/translate-ar", asyncHandler(async (req, res) => {
-  const release = await db.releases.get(req.params.id);
+  const release = await getReleaseMigrated(req.params.id);
   if (!release) return notFound(res);
 
   const lines = mobileReleaseNoteLogic.linesToBullets(req.body && req.body.enUS);
@@ -507,7 +556,7 @@ router.post("/:id/mobile-release-note/translate-ar", asyncHandler(async (req, re
 // service existed pick it up later, and a release tracking one that's
 // since been deleted drop it, both on demand rather than automatically.
 router.post("/:id/regression-sync", asyncHandler(async (req, res) => {
-  const release = await db.releases.get(req.params.id);
+  const release = await getReleaseMigrated(req.params.id);
   if (!release) return notFound(res);
 
   const masterEntities = await db.regressionModules.list();
@@ -530,7 +579,7 @@ router.post("/:id/regression-sync", asyncHandler(async (req, res) => {
         id: crypto.randomUUID(),
         entityId: masterEntity.id,
         name: masterEntity.name,
-        owner: "",
+        assignedTo: null,
         services: newServices,
       };
       // No services under this entity — give it its own status/notes (see

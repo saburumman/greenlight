@@ -100,12 +100,12 @@ a{color:inherit;}
   .shell{max-width:100%;}
 }
 
-/* ================= GUEST IDENTITY / TOPBAR RIGHT ================= */
+/* ================= TOPBAR IDENTITY ================= */
 .topbar-right{display:flex;align-items:center;gap:8px;flex-shrink:0;margin-left:auto;}
 .topbar-user{display:flex;align-items:center;gap:6px;}
-.guest-badge{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:700;color:var(--ink-soft);background:var(--surface-alt);border:1px solid var(--border);border-radius:100px;padding:6px 12px 6px 10px;white-space:nowrap;}
-.guest-badge svg{width:12px;height:12px;}
-.guest-avatar{width:16px;height:16px;border-radius:50%;object-fit:cover;flex-shrink:0;}
+.user-badge{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:700;color:var(--ink-soft);background:var(--surface-alt);border:1px solid var(--border);border-radius:100px;padding:6px 12px 6px 10px;white-space:nowrap;}
+.user-badge svg{width:12px;height:12px;}
+.user-avatar{width:16px;height:16px;border-radius:50%;object-fit:cover;flex-shrink:0;}
 @media (max-width:640px){.brand-sub{display:none;}}
 
 .btn{appearance:none;border:1px solid var(--border-strong);background:var(--surface);color:var(--ink);font-weight:600;font-size:13.5px;padding:9px 14px;border-radius:var(--radius-sm);cursor:pointer;display:inline-flex;align-items:center;gap:7px;line-height:1.2;transition:background .12s ease, border-color .12s ease, transform .05s ease;white-space:nowrap;}
@@ -705,3 +705,42 @@ a{color:inherit;}
 .incident-view-grid{display:grid;grid-template-columns:110px 1fr;gap:8px 14px;font-size:13px;}
 .incident-view-grid dt{color:var(--ink-faint);font-weight:700;font-size:12px;}
 .incident-view-grid dd{margin:0;color:var(--ink);white-space:pre-wrap;word-break:break-word;}
+
+/* ================= QA ASSIGNMENT + STATISTICS ================= */
+/* Per-module assignee button: the same ghost button as the entity owner,
+   dimmer when it merely follows the Entity owner and marked when the module
+   carries an owner of its own. */
+.regression-module-owner{font-size:12px;font-weight:600;}
+.regression-module-owner:not(.is-override).has-owner{color:var(--ink-soft);}
+.regression-module-owner.is-override{color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent);}
+/* "Changed by another QA member" — a collapsed one-line note under a module.
+   Informational, deliberately quiet. */
+.reg-change-note{margin-top:6px;font-size:12px;color:var(--ink-soft);}
+.reg-change-note summary{cursor:pointer;color:var(--warn-fg);font-weight:600;list-style:none;display:inline-flex;align-items:center;gap:4px;}
+.reg-change-note summary::-webkit-details-marker{display:none;}
+.reg-change-note[open] summary{margin-bottom:4px;}
+.reg-change-note div{line-height:1.5;}
+/* Bulk assign: module rows sit indented under their entity row. */
+.bulk-assign-entity .bulk-assign-label{color:var(--ink);font-weight:700;}
+.bulk-assign-module{margin-left:18px;border-style:dashed;}
+/* Audit page: the compact status-change-by-another-member detail. */
+.audit-row-warn{margin-top:4px;font-size:12px;color:var(--ink-soft);line-height:1.5;}
+.audit-row-warn .audit-warn-head{color:var(--warn-fg);font-weight:700;}
+/* Statistics page */
+.stats-filters{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end;margin-bottom:16px;}
+.stats-filters .field{margin:0;min-width:150px;}
+.stats-filters select,.stats-filters input[type=date]{border:1px solid var(--border-strong);border-radius:7px;padding:7px 10px;font-size:13px;font-family:inherit;background:var(--surface);color:var(--ink);width:100%;}
+.stats-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:18px;}
+.stats-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px 14px;}
+.stats-card .num{font-size:24px;font-weight:800;line-height:1.1;}
+.stats-card .label{font-size:12px;color:var(--ink-soft);margin-top:4px;font-weight:600;}
+.stats-section{margin-bottom:18px;}
+.stats-section h2{font-size:15px;margin:0 0 8px;}
+.stats-table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:12px;background:var(--surface);}
+.stats-table{width:100%;border-collapse:collapse;font-size:13px;}
+.stats-table th,.stats-table td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--border);white-space:nowrap;}
+.stats-table th{font-size:11.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--ink-soft);background:var(--surface-alt);}
+.stats-table td.num,.stats-table th.num{text-align:right;font-variant-numeric:tabular-nums;}
+.stats-table tr:last-child td{border-bottom:0;}
+.stats-note{font-size:12px;color:var(--ink-faint);margin:8px 2px 0;line-height:1.5;}
+.stats-empty{padding:18px;color:var(--ink-soft);font-size:13px;text-align:center;border:1px dashed var(--border-strong);border-radius:12px;}
