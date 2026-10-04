@@ -1533,8 +1533,13 @@ function statsDayKey(ms){
 function statsReleaseItems(r){
   var items = [];
   (r.tickets||[]).forEach(function(t){
-    items.push({kind:"ticket", releaseId:r._id, assignee:ticketAssignedMemberId(t), ts:statsTime(t.assignedAt),
-      blocked:t.bucket==="Blocked", completed:t.bucket==="Completed"});
+    // A ticket with several QA owners is one item per owner (so each person's
+    // row counts it); `ticketKey` lets the cards count the ticket only once.
+    var ids = ticketAssignedMemberIds(t);
+    (ids.length ? ids : [""]).forEach(function(id){
+      items.push({kind:"ticket", releaseId:r._id, ticketKey:t.key, assignee:id, ts:statsTime(t.assignedAt),
+        blocked:t.bucket==="Blocked", completed:t.bucket==="Completed"});
+    });
   });
   regressionEntities(r).forEach(function(entity){
     var real = entity._legacy || entity;
@@ -1564,10 +1569,10 @@ function statsQaIds(){
   regressionOwnerOptions().forEach(function(m){ o[m.id] = true; });
   return o;
 }
-function statsEmptyRow(){ return {tickets:0, regression:0, passed:0, failed:0, blocked:0}; }
+function statsEmptyRow(){ return {tickets:0, regression:0, passed:0, failed:0, notTested:0, skipped:0, blocked:0}; }
 function statsAddItem(row, it){
   if(it.kind==="ticket"){ row.tickets++; if(it.blocked) row.blocked++; }
-  else if(it.kind==="regression"){ row.regression++; if(it.status==="PASS") row.passed++; else if(it.status==="FAIL") row.failed++; }
+  else if(it.kind==="regression"){ row.regression++; if(it.status==="PASS") row.passed++; else if(it.status==="FAIL") row.failed++; else if(it.status==="NOT TESTED") row.notTested++; else if(it.status==="SKIP") row.skipped++; }
   else if(it.kind==="blocker"){ row.blocked++; }
 }
 // The whole page's numbers for a set of filters: {f:{range,from,to,releaseId,memberId}}.
@@ -1588,24 +1593,32 @@ function computeStatistics(f, now){
       items.push(it);
     });
   });
-  var cards = {ticketsAssigned:0, regressionAssigned:0, completed:0, passed:0, failed:0, blocked:0};
+  var cards = {ticketsAssigned:0, regressionAssigned:0, completed:0, passed:0, failed:0, notTested:0, skipped:0, blocked:0};
   var byMember = {}; // assignee id ("" = nobody) -> row
   var byRelease = {};
+  var seenTickets = {}; // a ticket with several QA owners counts once in the cards / release table
   items.forEach(function(it){
+    var firstOfTicket = true;
     if(it.kind==="ticket"){
-      if(it.assignee) cards.ticketsAssigned++;
-      if(it.completed) cards.completed++;
-      if(it.blocked) cards.blocked++;
+      var tk = it.releaseId+"\u0000"+it.ticketKey;
+      firstOfTicket = !seenTickets[tk]; seenTickets[tk] = true;
+      if(firstOfTicket){
+        if(it.assignee) cards.ticketsAssigned++;
+        if(it.completed) cards.completed++;
+        if(it.blocked) cards.blocked++;
+      }
     } else if(it.kind==="regression"){
       if(it.assignee) cards.regressionAssigned++;
       if(it.status==="PASS"||it.status==="FAIL"||it.status==="WARNING") cards.completed++;
       if(it.status==="PASS") cards.passed++;
       if(it.status==="FAIL") cards.failed++;
+      if(it.status==="NOT TESTED") cards.notTested++;
+      if(it.status==="SKIP") cards.skipped++;
     } else if(it.kind==="blocker"){
       cards.blocked++;
     }
     statsAddItem(byMember[it.assignee] = byMember[it.assignee] || statsEmptyRow(), it);
-    statsAddItem(byRelease[it.releaseId] = byRelease[it.releaseId] || statsEmptyRow(), it);
+    if(firstOfTicket) statsAddItem(byRelease[it.releaseId] = byRelease[it.releaseId] || statsEmptyRow(), it);
   });
 
   // ---- audit events with structured data (what happened, when) ----
@@ -1631,8 +1644,10 @@ function computeStatistics(f, now){
       else if(m.newStatus==="NOT TESTED") d.notTested++;
       actRow(m.changedBy).statusChanges++;
       if(m.assignedTo && qa[m.assignedTo] && m.changedBy!==m.assignedTo) actRow(m.assignedTo).changedByOthers++;
-    } else if(STATS_ASSIGN_ACTIONS.indexOf(e.action)>-1 && m.assignedTo && qa[m.assignedTo] && m.scope!=="module-inherit"){
-      if(f.memberId && m.assignedTo!==f.memberId) return;
+    } else if(STATS_ASSIGN_ACTIONS.indexOf(e.action)>-1 && m.scope!=="module-inherit"){
+      var assignedIds = (Array.isArray(m.assignedTo) ? m.assignedTo : (m.assignedTo ? [m.assignedTo] : [])).filter(function(id){ return qa[id]; });
+      if(!assignedIds.length) return;
+      if(f.memberId && assignedIds.indexOf(f.memberId)===-1) return;
       eventCount++;
       dayRow(ts).assigned++;
     }
@@ -1648,7 +1663,7 @@ function computeStatistics(f, now){
     hasData: items.length>0 || eventCount>0
   };
 }
-function statsRowIsEmpty(row){ return !row || (!row.tickets && !row.regression && !row.passed && !row.failed && !row.blocked); }
+function statsRowIsEmpty(row){ return !row || (!row.tickets && !row.regression && !row.passed && !row.failed && !row.notTested && !row.skipped && !row.blocked); }
 function statsMemberLabel(id){ return id ? memberNameById(id) : "Unassigned"; }
 // Member ids that appear in a keyed map, ordered by display name with
 // "Unassigned" last (alphabetical — never ordered by any number).
@@ -1701,15 +1716,15 @@ function renderStatistics(){
   function card(n, label){ return '<div class="stats-card"><div class="num">'+n+'</div><div class="label">'+esc(label)+'</div></div>'; }
   var cardsHtml = '<div class="stats-cards">'+
     card(c.ticketsAssigned,"Tickets Assigned")+card(c.regressionAssigned,"Regression Assigned")+card(c.completed,"Completed Work")+
-    card(c.passed,"Passed Regression")+card(c.failed,"Failed Regression")+card(c.blocked,"Blocked Items")+'</div>';
+    card(c.passed,"Passed Regression")+card(c.failed,"Failed Regression")+card(c.notTested,"Not Tested Regression")+card(c.skipped,"Skipped Regression")+card(c.blocked,"Blocked Items")+'</div>';
 
   var memberRows = statsOrderedIds(st.byMember).map(function(id){
     var r = st.byMember[id]; if(statsRowIsEmpty(r)) return "";
-    return '<tr><td>'+esc(statsMemberLabel(id))+'</td>'+statsNumCell(r.tickets)+statsNumCell(r.regression)+statsNumCell(r.passed)+statsNumCell(r.failed)+statsNumCell(r.blocked)+'</tr>';
+    return '<tr><td>'+esc(statsMemberLabel(id))+'</td>'+statsNumCell(r.tickets)+statsNumCell(r.regression)+statsNumCell(r.passed)+statsNumCell(r.failed)+statsNumCell(r.notTested)+statsNumCell(r.skipped)+statsNumCell(r.blocked)+'</tr>';
   }).join("");
   var releaseRows = (state.releaseOrder||[]).filter(function(id){ return st.byRelease[id] && !statsRowIsEmpty(st.byRelease[id]); }).map(function(id){
     var r = st.byRelease[id];
-    return '<tr><td>'+esc(releaseLabel(state.releases[id]))+'</td>'+statsNumCell(r.tickets)+statsNumCell(r.regression)+statsNumCell(r.passed)+statsNumCell(r.failed)+statsNumCell(r.blocked)+'</tr>';
+    return '<tr><td>'+esc(releaseLabel(state.releases[id]))+'</td>'+statsNumCell(r.tickets)+statsNumCell(r.regression)+statsNumCell(r.passed)+statsNumCell(r.failed)+statsNumCell(r.notTested)+statsNumCell(r.skipped)+statsNumCell(r.blocked)+'</tr>';
   }).join("");
   var dayRows = st.days.map(function(d){
     return '<tr><td>'+esc(fmtDate(d.date))+'</td>'+statsNumCell(d.assigned)+statsNumCell(d.passed)+statsNumCell(d.failed)+statsNumCell(d.warning)+statsNumCell(d.notTested)+'</tr>';
@@ -1721,8 +1736,8 @@ function renderStatistics(){
   }).join("");
 
   return head+filtersHtml+cardsHtml+
-    '<div class="stats-section"><h2>By QA member</h2>'+statsTable(["QA Member","Tickets","Regression","Passed","Failed","Blocked"], memberRows)+'</div>'+
-    '<div class="stats-section"><h2>By release</h2>'+statsTable(["Release","Tickets","Regression","Passed","Failed","Blocked"], releaseRows)+'</div>'+
+    '<div class="stats-section"><h2>By QA member</h2>'+statsTable(["QA Member","Tickets","Regression","Passed","Failed","Not Tested","Skipped","Blocked"], memberRows)+'</div>'+
+    '<div class="stats-section"><h2>By release</h2>'+statsTable(["Release","Tickets","Regression","Passed","Failed","Not Tested","Skipped","Blocked"], releaseRows)+'</div>'+
     '<div class="stats-section"><h2>Activity by date</h2>'+statsTable(["Date","Assigned","Passed","Failed","Warning","Not Tested"], dayRows)+
       '<p class="stats-note">Counts regression assignments and status changes recorded in the Audit Log, per day.</p></div>'+
     '<div class="stats-section"><h2>Assignment vs. activity</h2>'+statsTable(["QA Member","Assigned","Status Changes","Changed By Others"], actRows)+
@@ -2884,55 +2899,58 @@ function ticketLegacyNames(ticket){
   var v = ticket && ticket.legacyQaAssignee;
   return (Array.isArray(v) ? v : []).map(function(x){ return (x||"").toString().trim(); }).filter(Boolean);
 }
-// Names on a ticket that still don't resolve to anyone in Know the Team.
-function ticketUnmatchedNames(ticket){
-  var manual = ticketHasManualAssignee(ticket);
-  if(manual && ticket.assignedTo) return [];
-  var names = manual ? ticketLegacyNames(ticket) : ticketJiraNames(ticket);
-  return names.filter(function(n){ return !memberIdForJiraName(n); });
+// A ticket can have MORE THAN ONE QA owner (Jira's "QA Assigned" is a
+// multi-person field). `ticket.assignedTo` holds one member id, or an array
+// of ids when there are several; null / [] = deliberately nobody.
+function ticketAssignedIdsRaw(ticket){
+  var v = ticket && ticket.assignedTo;
+  var list = Array.isArray(v) ? v : (v ? [v] : []);
+  var seen = {};
+  return list.filter(function(id){ if(typeof id!=="string" || !id || seen[id]) return false; seen[id]=true; return true; });
 }
-function ticketJiraMemberId(ticket){
-  var names = ticketJiraNames(ticket);
-  for(var i=0;i<names.length;i++){
-    var id = memberIdForJiraName(names[i]);
-    if(id) return id;
+// Everyone a ticket is effectively assigned to, as [{id, label}]:
+//  - a manual choice (assignedTo key present) always wins: those members, plus
+//    any old name that still matches nobody (shown as typed);
+//  - otherwise Jira's QA Assigned names: the matching member's name when
+//    there is one (see memberIdForJiraName), else the name exactly as Jira
+//    gives it — so a person who isn't in Know the Team is still shown.
+function ticketAssigneeEntries(ticket){
+  var out = [], seen = {};
+  function add(id, label){
+    var key = id ? "id:"+id : "n:"+compactName(label);
+    if(!label || seen[key]) return;
+    seen[key] = true; out.push({id:id||"", label:label});
   }
-  return "";
-}
-// The team member a ticket is effectively assigned to ("" = nobody).
-function ticketAssignedMemberId(ticket){
-  if(!ticket) return "";
+  if(!ticket) return out;
   if(ticketHasManualAssignee(ticket)){
-    if(ticket.assignedTo) return ticket.assignedTo;
-    // Assigned by name before ids existed and not matched back then — try
-    // again now (a member may have been renamed or given a Jira name since).
-    var legacy = ticketLegacyNames(ticket);
-    for(var i=0;i<legacy.length;i++){ var lid = memberIdForJiraName(legacy[i]); if(lid) return lid; }
-    return "";
-  }
-  return ticketJiraMemberId(ticket);
-}
-// Short display text: the member's name, or — only when Jira names someone
-// who isn't in Know the Team — that name marked as coming from Jira.
-function ticketAssigneeLabel(ticket){
-  var id = ticketAssignedMemberId(ticket);
-  if(id) return memberNameById(id);
-  if(!ticketHasManualAssignee(ticket)){
-    var names = ticketJiraNames(ticket);
-    if(names.length) return names.join(", ")+" (Jira)";
+    ticketAssignedIdsRaw(ticket).forEach(function(id){ add(id, memberNameById(id)); });
+    ticketLegacyNames(ticket).forEach(function(n){
+      var id = memberIdForJiraName(n);
+      if(id) add(id, memberNameById(id)); else add("", n);
+    });
   } else {
-    var old = ticketLegacyNames(ticket);
-    if(old.length) return old.join(", ")+" (not in Know the Team)";
+    ticketJiraNames(ticket).forEach(function(n){
+      var id = memberIdForJiraName(n);
+      if(id) add(id, memberNameById(id)); else add("", n);
+    });
   }
-  return "";
+  return out;
+}
+// Just the Know the Team member ids among them ([] = nobody).
+function ticketAssignedMemberIds(ticket){
+  return ticketAssigneeEntries(ticket).filter(function(e){ return e.id; }).map(function(e){ return e.id; });
+}
+function ticketAssigneeLabel(ticket){
+  return ticketAssigneeEntries(ticket).map(function(e){ return e.label; }).join(", ");
 }
 function renderTicketAssigneeBtn(t){
-  var label = ticketAssigneeLabel(t);
+  var label = ticketAssigneeLabel(t) || "Unassigned";
+  var has = !!ticketAssigneeEntries(t).length;
   var manual = ticketHasManualAssignee(t);
   var title = manual
-    ? (label ? "QA owner — click to change" : "Explicitly set to Unassigned — click to change")
-    : (label ? "From Jira's QA Assigned field — click to change" : "Assign a QA owner");
-  return '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn'+(label?" has-owner":"")+'" data-action="edit-ticket-assignee" data-key="'+escAttr(t.key)+'" title="'+escAttr(title)+'">'+iconUser()+' '+(label ? 'QA: '+esc(label) : 'Assign QA')+'</button>';
+    ? (has ? "Manually assigned — click to change" : "Explicitly set to Unassigned — click to change")
+    : (has ? "Synced from Jira's QA Assigned field — click to override" : "Assign a QA owner");
+  return '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn'+(has?" has-owner":"")+'" data-action="edit-ticket-assignee" data-key="'+escAttr(t.key)+'" title="'+escAttr(title)+'">'+iconUser()+' '+esc(label)+'</button>';
 }
 function groupTickets(tickets, mode){
   if(mode==="None"){
@@ -2940,11 +2958,17 @@ function groupTickets(tickets, mode){
   }
   var buckets = {};
   if(mode==="QA Assignee"){
-    // One QA owner per ticket; a ticket with nobody effectively assigned
-    // lands in Unassigned.
+    // A ticket can have more than one QA owner — it's filed under EVERY one
+    // of its assignees (not just the first), so a ticket assigned to two
+    // people shows up in both of their buckets. A ticket with nobody
+    // assigned lands in Unassigned instead.
     tickets.forEach(function(t){
-      var label = ticketAssigneeLabel(t) || "Unassigned";
-      (buckets[label] = buckets[label]||[]).push(t);
+      var entries = ticketAssigneeEntries(t);
+      if(!entries.length){
+        (buckets["Unassigned"] = buckets["Unassigned"]||[]).push(t);
+      } else {
+        entries.forEach(function(e){ (buckets[e.label] = buckets[e.label]||[]).push(t); });
+      }
     });
   } else {
     var field = mode==="Status" ? "bucket" : mode==="Priority" ? "priority" : "issueType";
@@ -4102,71 +4126,71 @@ function openEditTicketModal(r, ticket){
 // goes back to following Jira's QA Assigned field. The assignment audit
 // event (assigned / reassigned / unassigned, with the previous and new
 // member) is written by the server when the release is saved.
-// Saves an extra Jira display name on a Know the Team member (so tickets
-// Jira assigns under that spelling match them) — same PUT the Edit modal uses.
-function addJiraNameToMember(memberId, jiraName){
-  var m = state.team && state.team[memberId];
-  if(!m || !jiraName) return Promise.resolve();
-  var names = (Array.isArray(m.jiraNames) ? m.jiraNames : []).slice();
-  if(names.indexOf(jiraName)===-1) names.push(jiraName);
-  var payload = {name:m.name, role:m.role||"", department:m.department||"", bio:m.bio||"", specialties:m.specialties||[], tools:m.tools||[],
-    linkedin:m.linkedin||"", github:m.github||"", photo:m.photo||"", regression:m.regression!==false, jiraNames:names};
-  if(typeof m.statisticsAccess==="boolean") payload.statisticsAccess = m.statisticsAccess;
-  return api.updateTeamMember(memberId, payload).then(function(saved){
-    state.team[saved.id] = saved;
-    render();
-    showToast("✓ “"+jiraName+"” now counts as "+saved.name);
-  }).catch(function(err){ showToast((err && err.message) || "Couldn't save the Jira name."); });
+// Check-box pills of Know the Team members, each carrying the member's ID as
+// its value (the label is the name) — several can be ticked.
+function memberMultiChoiceGroup(name, members, selectedIds){
+  var sel = selectedIds || [];
+  return '<div class="status-choice">'+members.map(function(m, i){
+    var id = name+"-"+i;
+    return '<input type="checkbox" name="'+name+'" id="'+id+'" value="'+escAttr(m.id)+'" '+(sel.indexOf(m.id)!==-1?"checked":"")+'><label for="'+id+'">'+esc(m.name)+'</label>';
+  }).join("")+'</div>';
 }
+// QA owners for one ticket — a checkbox pill-list of Know the Team members
+// ("QA Assigned" is a multi-person Jira field: a ticket can genuinely have
+// more than one owner). Stored as member ids: one id, or an array of ids when
+// several are ticked, [] -> null for nobody. "Use Jira's assignees" (shown
+// only while there's a manual choice) removes the manual choice so the ticket
+// goes back to following Jira's QA Assigned field. A manual choice always
+// wins over Jira — a re-sync only refreshes qaAssignedFromJira. The assignment
+// audit event is written by the server when the release is saved.
 function openTicketAssigneeModal(r, ticket){
   var members = ticketAssigneeOptions();
   var hasOverride = ticketHasManualAssignee(ticket);
   var jiraNames = ticketJiraNames(ticket);
-  var current = ticketAssignedMemberId(ticket);
-  var unmatched = ticketUnmatchedNames(ticket);
+  var entries = ticketAssigneeEntries(ticket);
+  var current = ticketAssignedMemberIds(ticket);
+  var outsiders = entries.filter(function(e){ return !e.id; }).map(function(e){ return e.label; });
   var subtitle = hasOverride
-    ? (jiraNames.length ? "Jira's own QA Assigned field lists "+jiraNames.join(", ")+". Your choice below overrides it for this release only."
-                        : "Set for this release only.")
-    : (jiraNames.length ? "Currently following Jira's QA Assigned field ("+jiraNames.join(", ")+"). Picking someone below overrides it for this release only."
-                        : "Nobody is assigned yet. This applies to this release only.");
+    ? (jiraNames.length ? "Jira's own QA Assigned field currently lists "+jiraNames.join(", ")+". Your manual choice below overrides it until you revert to Jira's assignees."
+                        : "This has a manual choice — Jira's QA Assigned field has no one set for this ticket right now.")
+    : (jiraNames.length ? "Currently synced from Jira's QA Assigned field ("+jiraNames.join(", ")+"). Checking names below overrides it just for this ticket."
+                        : "Jira's QA Assigned field has no one set for this ticket yet — check anyone below, or leave it to pick up a value from Jira later.");
   var body =
     '<div class="regmod-edit-name">'+esc(ticket.key)+' — '+esc(ticket.title||"Untitled")+'</div>'+
     '<p class="helper-text" style="margin:2px 0 10px;">'+esc(subtitle)+'</p>'+
     (members.length
-      ? memberChoiceGroup("ticket-assignee-choice", members, current, [{value:"", label:"Unassigned", after:true}])
-      : '<p class="helper-text" style="margin:0;">No one is in <b>Know the Team</b> yet — add people there first.</p>')+
-    (unmatched.length && members.length
-      ? '<label class="helper-text" style="display:flex;gap:6px;align-items:flex-start;margin:12px 0 0;"><input type="checkbox" id="ticket-remember-alias" style="margin-top:3px;"> <span>Also remember “'+esc(unmatched[0])+'” as this person’s Jira name — every ticket with that name (in any release) then counts for them.</span></label>'
-      : '');
-  var foot = (hasOverride ? '<button type="button" class="btn btn-ghost" id="ticket-assignee-use-jira">Use Jira’s assignee</button>' : '<span></span>')+
+      ? memberMultiChoiceGroup("ticket-assignee-check", members, current)+'<p class="hint" style="margin-top:8px;">Check as many as apply — leave all unchecked for Unassigned.'+
+        (outsiders.length ? ' '+esc(outsiders.join(", "))+(outsiders.length>1?' aren’t':' isn’t')+' in Know the Team, so can’t be ticked here (add '+(outsiders.length>1?'them':'them')+' there, or put the spelling Jira uses in their “Jira name(s)”).' : '')+'</p>'
+      : '<p class="helper-text" style="margin:0;">No one is in <b>Know the Team</b> yet — add people there first.</p>');
+  var foot = (hasOverride ? '<button type="button" class="btn btn-ghost" id="ticket-assignee-use-jira">Use Jira’s assignees</button>' : '<span></span>')+
     '<span style="flex:1"></span><button type="button" class="btn" data-action="close-modal">Cancel</button>'+
     (members.length ? '<button type="submit" class="btn btn-primary">Save</button>' : '');
-  openModal(modalShell("Assign QA owner", body, foot));
+  openModal(modalShell("Assign QA owners", body, foot));
 
   var useJiraBtn = qs("#ticket-assignee-use-jira");
   if(useJiraBtn) useJiraBtn.addEventListener("click", function(){
     delete ticket.assignedTo;
+    delete ticket.legacyQaAssignee;
     ticket.updatedAt = new Date().toISOString();
     closeModal();
     persistRelease(r);
   });
 
-  if(!members.length) return; // nothing to pick, and no Save button to wire up
+  if(!members.length) return; // nothing to check, and no Save button to wire up
   qs("#modal-form").addEventListener("submit", function(e){
     e.preventDefault();
-    var checked = qs('input[name="ticket-assignee-choice"]:checked');
-    var picked = checked ? checked.value : current;
-    if(picked===current && (hasOverride || !picked)){ closeModal(); return; } // nothing changed
-    ticket.assignedTo = picked || null; // the key being present marks it manual, even when null
+    var picked = qsa('input[name="ticket-assignee-check"]:checked').map(function(el){ return el.value; });
+    var same = picked.length===current.length && picked.every(function(id){ return current.indexOf(id)!==-1; });
+    if(same && !outsiders.length && (hasOverride || !picked.length)){ closeModal(); return; } // nothing changed
+    // presence of the key marks this manual, even when nobody is picked
+    ticket.assignedTo = picked.length===0 ? null : picked.length===1 ? picked[0] : picked;
     delete ticket.legacyQaAssignee; // resolved by this choice
     ticket.updatedAt = new Date().toISOString();
-    var remember = qs("#ticket-remember-alias");
-    var rememberName = picked && remember && remember.checked ? unmatched[0] : "";
     closeModal();
     persistRelease(r, function(){
-      showToast(picked ? "✓ "+ticket.key+" assigned to "+memberNameById(picked) : "✓ "+ticket.key+" unassigned");
+      var names = picked.map(memberNameById).join(", ");
+      showToast(picked.length ? "✓ "+ticket.key+" assigned to "+names : "✓ "+ticket.key+" unassigned");
     });
-    if(rememberName) addJiraNameToMember(picked, rememberName);
   });
 }
 

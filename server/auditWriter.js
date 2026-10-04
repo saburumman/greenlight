@@ -25,6 +25,10 @@ function cleanMeta(meta) {
     if (v === null) out[k] = null;
     else if (typeof v === "boolean") out[k] = v;
     else if (typeof v === "string") out[k] = v.slice(0, 200);
+    else if (Array.isArray(v) && (k === "assignedTo" || k === "previousAssignedTo")) {
+      // a ticket can have several QA owners: a short list of member ids
+      out[k] = v.filter((x) => typeof x === "string" && x).slice(0, 20).map((x) => x.slice(0, 200));
+    }
   }
   return Object.keys(out).length ? out : undefined;
 }

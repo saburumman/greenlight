@@ -5,7 +5,7 @@
 // assignment in a release stores a team member's stable `id` (`assignedTo`),
 // never a display name:
 //
-//   ticket.assignedTo      member id | null.  The KEY being present at all
+//   ticket.assignedTo      member id | [member ids] (several QA owners) | null.  The KEY being present at all
 //                          marks a manual choice (null = explicitly
 //                          unassigned); a ticket with no `assignedTo` key
 //                          simply follows Jira's own "QA Assigned" field
@@ -67,6 +67,21 @@ function resolveNameToId(name, index) {
   return key && index.byName.has(key) ? index.byName.get(key) : null;
 }
 
+// A ticket's assignedTo is one member id, an array of ids (several QA
+// owners) or null. These two normalize any of those shapes.
+function idList(value) {
+  const list = Array.isArray(value) ? value : value ? [value] : [];
+  const out = [];
+  for (const v of list) {
+    const id = cleanId(v);
+    if (id && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+function shapeIds(ids) {
+  return ids.length === 0 ? null : ids.length === 1 ? ids[0] : ids;
+}
+
 function cleanId(value) {
   if (typeof value !== "string") return null;
   const v = value.trim();
@@ -112,18 +127,39 @@ function migrateReleaseAssignments(release, team) {
         const names = (Array.isArray(t.qaAssignee) ? t.qaAssignee : t.qaAssignee ? [t.qaAssignee] : [])
           .map((n) => String(n || "").trim())
           .filter(Boolean);
-        const ids = names.map((n) => resolveNameToId(n, index));
-        t.assignedTo = ids.find(Boolean) || null;
-        if (names.length > 1 || ids.some((id) => !id)) {
-          if (names.length) t.legacyQaAssignee = names;
+        const ids = [];
+        const unmatched = [];
+        for (const n of names) {
+          const id = resolveNameToId(n, index);
+          if (id) { if (!ids.includes(id)) ids.push(id); } else unmatched.push(n);
         }
+        t.assignedTo = shapeIds(ids);
+        if (unmatched.length) t.legacyQaAssignee = unmatched;
       }
       delete t.qaAssignee;
       changed = true;
     }
     if (hasOwn(t, "assignedTo")) {
-      const clean = cleanId(t.assignedTo);
-      if (clean !== t.assignedTo) { t.assignedTo = clean; changed = true; }
+      const clean = shapeIds(idList(t.assignedTo));
+      if (JSON.stringify(clean) !== JSON.stringify(t.assignedTo)) { t.assignedTo = clean; changed = true; }
+      // Names kept from an earlier pass (more than one owner, or a spelling
+      // that matched nobody then): add whoever matches now — e.g. after a
+      // member was given a "Jira name" — and keep only what still matches
+      // no one. Idempotent.
+      if (Array.isArray(t.legacyQaAssignee)) {
+        const have = idList(t.assignedTo);
+        const left = [];
+        for (const n of t.legacyQaAssignee) {
+          const id = resolveNameToId(n, index);
+          if (id) { if (!have.includes(id)) have.push(id); } else left.push(n);
+        }
+        const next = shapeIds(have);
+        if (JSON.stringify(next) !== JSON.stringify(t.assignedTo)) { t.assignedTo = next; changed = true; }
+        if (left.length !== t.legacyQaAssignee.length) {
+          if (left.length) t.legacyQaAssignee = left; else delete t.legacyQaAssignee;
+          changed = true;
+        }
+      }
     }
   }
 
@@ -195,7 +231,13 @@ function memberName(id, index) {
 }
 
 function ticketOwn(t) {
-  return hasOwn(t, "assignedTo") ? t.assignedTo || null : UNSET;
+  return hasOwn(t, "assignedTo") ? idList(t.assignedTo) : UNSET;
+}
+function sameIds(a, b) {
+  return a.length === b.length && a.every((x) => b.includes(x));
+}
+function namesOf(ids, index) {
+  return ids.map((id) => memberName(id, index)).join(", ");
 }
 
 // Compares the release as stored (`before`) with the release being saved
@@ -220,27 +262,29 @@ function diffReleaseActivity(before, after, { actor, team, now }) {
     if (!prior) continue; // a brand-new ticket is TICKET_ADDED, not an assignment change
     const prev = ticketOwn(prior);
     const next = ticketOwn(t);
-    if (prev === next) continue;
-    const prevId = prev === UNSET ? null : prev;
-    const nextId = next === UNSET ? null : next;
+    if (prev === UNSET && next === UNSET) continue;
+    if (prev !== UNSET && next !== UNSET && sameIds(prev, next)) continue;
+    const prevIds = prev === UNSET ? [] : prev;
+    const nextIds = next === UNSET ? [] : next;
     if (next !== UNSET) { t.assignedAt = stamp; t.assignedBy = actor.id; }
     let action, details;
     if (next === UNSET) {
       action = "TICKET_UNASSIGNED";
-      details = t.key + " back to Jira's QA Assigned field" + (prevId ? " (was " + memberName(prevId, index) + ")" : "");
-    } else if (nextId && prevId) {
+      details = t.key + " back to Jira's QA Assigned field" + (prevIds.length ? " (was " + namesOf(prevIds, index) + ")" : "");
+    } else if (nextIds.length && prevIds.length) {
       action = "TICKET_REASSIGNED";
-      details = t.key + " reassigned from " + memberName(prevId, index) + " to " + memberName(nextId, index);
-    } else if (nextId) {
+      details = t.key + " reassigned from " + namesOf(prevIds, index) + " to " + namesOf(nextIds, index);
+    } else if (nextIds.length) {
       action = "TICKET_ASSIGNED";
-      details = "Jira ticket " + t.key + " assigned to " + memberName(nextId, index);
+      details = "Jira ticket " + t.key + " assigned to " + namesOf(nextIds, index);
     } else {
       action = "TICKET_UNASSIGNED";
-      details = t.key + " unassigned" + (prevId ? " from " + memberName(prevId, index) : "");
+      details = t.key + " unassigned" + (prevIds.length ? " from " + namesOf(prevIds, index) : "");
     }
+    const asMeta = (ids) => (ids.length === 0 ? null : ids.length === 1 ? ids[0] : ids);
     events.push({
       action, entityType: "Ticket", entityId: t.key, details,
-      meta: { releaseId, ticketKey: t.key, assignedTo: nextId, previousAssignedTo: prevId },
+      meta: { releaseId, ticketKey: t.key, assignedTo: asMeta(nextIds), previousAssignedTo: asMeta(prevIds) },
     });
   }
 
