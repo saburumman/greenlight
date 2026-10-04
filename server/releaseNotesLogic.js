@@ -248,6 +248,135 @@ async function generateReleaseNotes(jiraIssues) {
   };
 }
 
+// ---- Incidents section ----------------------------------------------------
+//
+// Same shape as the ticket pipeline above, for the "Incidents" section of the
+// generated notes: try AI (when configured) for ONE short summary per
+// incident, validate it, and fall back per-incident to a safe rule-based line
+// for anything AI didn't validly cover. Which ticket an incident belongs to,
+// its scope, severity and status are always taken from the stored incident /
+// release data and attached here — they are never read from the AI response,
+// so the model cannot invent or drop a ticket reference.
+//
+// The result is snapshotted into release.releaseNotes.incidentItems at
+// generation time (see routes/releases.js). Because the client renders the
+// section from that snapshot, adding or editing an incident afterwards never
+// changes notes that were already generated — only an explicit "Generate
+// Release Notes" does.
+
+const JIRA_KEY_TOKEN_RE = /\b[A-Z][A-Z0-9]+-\d+\b/g;
+
+function ensureSentenceEnd(text) {
+  const t = String(text || "").trim();
+  if (!t) return "";
+  return /[.!?…]$/.test(t) ? t : t + ".";
+}
+
+// Attaches the (factual) linked-ticket info to each incident, read from the
+// release's own tickets. A ticket-level incident whose ticket has since left
+// the release keeps its key — only the title is unavailable.
+function enrichIncidents(incidents, tickets) {
+  const byKey = new Map((tickets || []).filter((t) => t && t.key).map((t) => [t.key, t]));
+  return (incidents || []).filter((i) => i && i.id).map((i) => {
+    const isTicket = i.scope === "TICKET" && !!i.ticketId;
+    const ticket = isTicket ? byKey.get(i.ticketId) : null;
+    return {
+      ...i,
+      ticketKey: isTicket ? i.ticketId : null,
+      ticketTitle: ticket ? ticket.title || "" : "",
+    };
+  });
+}
+
+// Non-AI path: pure extraction from what the person already wrote, plus a
+// sentence derived only from the incident's status — nothing generated.
+function ruleBasedIncidentSummary(incident) {
+  const first = ensureSentenceEnd(firstSentences(incident.description, 1, 180)) || ensureSentenceEnd(incident.title) || "Incident recorded.";
+  let second = "";
+  if (incident.status === "Resolved") {
+    const res = ensureSentenceEnd(firstSentences(incident.resolution, 1, 160));
+    second = res ? "Resolved: " + res : "This incident has been resolved.";
+  } else if (incident.status === "Investigating") {
+    second = "Currently under investigation.";
+  } else {
+    second = "Still open.";
+  }
+  return first + " " + second;
+}
+
+// Validates the AI's raw response against the real incident list:
+//   - an unknown/invented incident id is dropped
+//   - only "summary" is ever read off an entry (never any metadata)
+//   - a summary that mentions a Jira-style key other than this incident's own
+//     linked ticket is rejected as invented, and falls back
+//   - empty/non-string summaries fall back
+function mapIncidentAiResponse(enriched, rawAiResponse) {
+  const byId = new Map(enriched.map((i) => [i.id, i]));
+  const aiById = new Map();
+  if (Array.isArray(rawAiResponse)) {
+    for (const entry of rawAiResponse) {
+      if (!entry || typeof entry !== "object") continue;
+      const inc = byId.get(entry.id);
+      if (!inc) continue; // invented/unknown id — reject
+      const summary = sanitizeGeneratedText(entry.summary, 400);
+      if (!summary) continue;
+      const stray = (summary.match(JIRA_KEY_TOKEN_RE) || []).some((k) => k !== inc.ticketKey);
+      if (stray) continue; // mentions a ticket this incident isn't linked to — treat as invented
+      aiById.set(inc.id, summary);
+    }
+  }
+
+  let fallbackCount = 0;
+  const items = enriched.map((inc) => {
+    const ai = aiById.get(inc.id);
+    if (!ai) fallbackCount++;
+    return {
+      incidentId: inc.id,
+      scope: inc.scope, // factual
+      ticketKey: inc.ticketKey, // factual
+      ticketTitle: inc.ticketTitle, // factual
+      severity: inc.severity, // factual
+      status: inc.status, // factual
+      summary: ai || ruleBasedIncidentSummary(inc),
+      engine: ai ? aiService.PROVIDER_NAME || "ai" : "rule_based",
+    };
+  });
+  return { items, aiUsedCount: aiById.size, fallbackCount };
+}
+
+// Returns { items, aiConfigured, aiUsedCount, fallbackCount, warnings } —
+// items is [] when the release has no incidents (and no AI call is made).
+async function generateIncidentNotes(incidents, tickets) {
+  const enriched = enrichIncidents(incidents, tickets);
+  const aiConfigured = aiService.isConfigured();
+  if (!enriched.length) return { items: [], aiConfigured, aiUsedCount: 0, fallbackCount: 0, warnings: [] };
+
+  let rawAiResponse = null;
+  let aiErrorMessage = null;
+  if (aiConfigured) {
+    try {
+      rawAiResponse = await aiService.generateIncidentSummaries(enriched);
+      if (!Array.isArray(rawAiResponse)) {
+        aiErrorMessage = "The AI response for incidents wasn't a list — used the existing rule-based incident summaries instead.";
+        rawAiResponse = null;
+      }
+    } catch (e) {
+      aiErrorMessage = "Incident summaries: " + ((e && e.message) || "AI generation failed") + " — used the existing rule-based incident summaries instead.";
+    }
+  }
+
+  const mapped = mapIncidentAiResponse(enriched, rawAiResponse);
+  const fallbackCount = aiConfigured ? mapped.fallbackCount : 0;
+  const warnings = [];
+  if (aiErrorMessage) warnings.push(aiErrorMessage);
+  if (aiConfigured && fallbackCount && !aiErrorMessage) {
+    warnings.push(
+      fallbackCount + " incident" + (fallbackCount === 1 ? "" : "s") + " fell back to a rule-based summary (the AI response for " + (fallbackCount === 1 ? "it" : "them") + " was missing or invalid)."
+    );
+  }
+  return { items: mapped.items, aiConfigured, aiUsedCount: mapped.aiUsedCount, fallbackCount, warnings };
+}
+
 module.exports = {
   CATEGORIES,
   categorizeTicket,
@@ -258,4 +387,8 @@ module.exports = {
   dedupeByKey,
   mapAiResponseToItems,
   generateReleaseNotes,
+  enrichIncidents,
+  ruleBasedIncidentSummary,
+  mapIncidentAiResponse,
+  generateIncidentNotes,
 };

@@ -1,15 +1,16 @@
 // A thin client for the Google Gemini API (generativelanguage.googleapis.com)
-// — used for three things, each with its own system prompt: writing the
+// — used for four things, each with its own system prompt: writing the
 // human-readable title/description for each Release Notes item
-// (generateSummaries), drafting short store-facing bullets for the Mobile
-// Release Note section (generateMobileBullets), and translating those
-// bullets to Arabic (translateToArabic). Nothing else in this app calls out
-// to an LLM.
+// (generateSummaries), writing the short per-incident lines for the
+// Incidents section of Release Notes (generateIncidentSummaries), drafting
+// short store-facing bullets for the Mobile Release Note section
+// (generateMobileBullets), and translating those bullets to Arabic
+// (translateToArabic). Nothing else in this app calls out to an LLM.
 //
 // Deliberately narrow, matching this project's existing "thin client" style
 // (see jiraClient.js, atlassianOAuth.js): one function in, one function out
 // per task, hand-rolled with the built-in fetch — no SDK dependency added.
-// All three share one request/response plumbing function (callGemini,
+// All of them share one request/response plumbing function (callGemini,
 // below) — only the system prompt and the input payload differ.
 //
 // IMPORTANT — what this file is not responsible for: it does not decide
@@ -250,11 +251,68 @@ async function translateToArabic(lines) {
   return callGemini(TRANSLATE_AR_SYSTEM_PROMPT, buildTranslateUserMessage(lines));
 }
 
+// ---- Incidents — one short release-note line per incident (new) ----------
+//
+// Used by releaseNotesLogic.generateIncidentNotes (the only caller) to write
+// the "Incidents" section of generated Release Notes. Like every other task
+// here, the model only ever writes prose: which ticket an incident belongs to,
+// its scope/severity/status are factual data supplied by the app and are
+// attached to the result by the caller — never read back from this response.
+
+const INCIDENT_SYSTEM_PROMPT = `You write the "Incidents" section of a software release's Release Notes, from incident records entered by a QA team.
+
+You will be given a JSON array of incidents. Each has: "id", "scope" ("Ticket-level" or "Release-level"), optionally "ticket" ({key, title}), "title", "severity", "status" ("Open", "Investigating" or "Resolved"), "description", "impact", "resolution".
+
+For EVERY incident in the array, return one object with exactly these two fields:
+- "id": the incident's id, copied EXACTLY as given — never alter it.
+- "summary": ONE or TWO short sentences (at most about 220 characters in total) written for a business reader of the release notes.
+
+Strict rules:
+- Summarize and rephrase. Do NOT copy the description verbatim, and do not just repeat the title.
+- Use ONLY facts present in the supplied incident. Never invent causes, fixes, dates, durations, affected users, or outcomes. If the incident gives little to go on, write a short, honest, generic line based on its title.
+- Describe the resolution ONLY if the status is "Resolved" AND a resolution was actually provided. If the status is "Open" or "Investigating", say plainly that it is still open or being investigated — never imply it was fixed.
+- Do NOT include internal-only details: hostnames, server or class names, stack traces, file paths, ticket/Jira keys, or the names of people.
+- Do NOT write the ticket reference, the words "Release-level"/"Ticket-level", or the severity as a prefix — those are added separately by the app. Write only the summary sentence(s).
+- Return content only for incidents actually present in the input. Do not add incidents, and do not skip any.
+- Output ONLY a raw JSON array of objects with exactly the fields "id", "summary" — no surrounding prose, no markdown code fences, no extra fields.`;
+
+function buildIncidentUserMessage(incidents) {
+  const payload = incidents.map((i) => {
+    const o = {
+      id: i.id,
+      scope: i.scope === "TICKET" ? "Ticket-level" : "Release-level",
+      title: i.title || "",
+      severity: i.severity || "",
+      status: i.status || "",
+      description: i.description || "",
+      impact: i.impact || "",
+      resolution: i.resolution || "",
+    };
+    if (i.scope === "TICKET" && i.ticketKey) o.ticket = { key: i.ticketKey, title: i.ticketTitle || "" };
+    return o;
+  });
+  return (
+    "Here are the incidents. Return the JSON array described in your instructions, one entry per incident, in any order:\n\n" +
+    JSON.stringify(payload, null, 2)
+  );
+}
+
+// Returns the model's raw parsed [{id, summary}, ...] — not validated against
+// the real incident list yet; releaseNotesLogic.mapIncidentAiResponse does
+// that. Throws AIError on any failure; the caller falls back to a rule-based
+// summary per incident.
+async function generateIncidentSummaries(incidents) {
+  if (!isConfigured()) throw new AIError("AI generation isn't configured (GEMINI_API_KEY not set).", 500);
+  if (!incidents || !incidents.length) return [];
+  return callGemini(INCIDENT_SYSTEM_PROMPT, buildIncidentUserMessage(incidents));
+}
+
 module.exports = {
   AIError,
   isConfigured,
   generateSummaries,
   generateMobileBullets,
+  generateIncidentSummaries,
   translateToArabic,
   extractJsonArray,
   PROVIDER_NAME,

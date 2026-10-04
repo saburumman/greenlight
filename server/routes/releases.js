@@ -6,6 +6,7 @@ const atlassianTokens = require("../auth/atlassianTokens");
 const { extractIssueKey } = require("../extractKey");
 const releaseNotesLogic = require("../releaseNotesLogic"); // this route's only AI-related import for Release Notes — see releaseNotesLogic.generateReleaseNotes() for the abstraction boundary; nothing here talks to an AI provider directly
 const mobileReleaseNoteLogic = require("../mobileReleaseNoteLogic"); // same pattern, for the Mobile Release Note section below — see draftEnglishBullets/translateBulletsToArabic
+const incidentLogic = require("../incidentLogic"); // Incidents section — validation/normalization applied in the generic PUT below
 const { asyncHandler } = require("../asyncHandler");
 
 const router = express.Router();
@@ -59,6 +60,10 @@ function newReleaseDoc(name, version, date, qaOwner, regressionModules) {
       ios: { status: "NOT TESTED", notes: "" },
     },
     blockers: [],
+    // Incidents recorded against THIS release only — see incidentLogic.js for
+    // the shape and rules. Older releases created before this existed simply
+    // have no `incidents` key; everything reads it as `|| []`.
+    incidents: [],
     performance: { enabled: false, status: "PASS", responseTime: "", concurrentUsers: "", errorRate: "", sla: "", notes: "" },
     security: { enabled: false, status: "PASS", critical: 0, high: 0, medium: 0, low: 0, notes: "" },
     releaseNotes: { html: "", edited: false, savedAt: null },
@@ -105,7 +110,20 @@ router.put("/:id", asyncHandler(async (req, res) => {
   const existing = await db.releases.get(req.params.id);
   if (!existing) return notFound(res);
   const incoming = req.body || {};
-  const merged = { ...incoming, _id: req.params.id, updatedAt: new Date().toISOString() };
+  // Incidents are the one section validated server-side on this otherwise
+  // generic save: each must be well-formed, and a ticket-level incident may
+  // only point at a ticket that belongs to this release. An older client that
+  // doesn't send `incidents` at all leaves the stored ones untouched.
+  let incidents;
+  try {
+    incidents = incidentLogic.prepareIncidentsForSave(incoming.incidents, existing, {
+      releaseId: req.params.id,
+      authUser: req.authUser,
+    });
+  } catch (e) {
+    return res.status(e.status || 400).json({ error: e.message });
+  }
+  const merged = { ...incoming, incidents, _id: req.params.id, updatedAt: new Date().toISOString() };
   await db.releases.set(req.params.id, merged);
   res.json(merged);
 }));
@@ -128,6 +146,9 @@ router.post("/:id/duplicate", asyncHandler(async (req, res) => {
   clone.date = "";
   clone.releaseNotes = { html: "", edited: false, savedAt: null };
   clone.mobileReleaseNote = { enUS: "", ar: "", savedAt: null };
+  // Incidents belong to exactly one release — a duplicate is a different
+  // release, so it starts with none rather than inheriting the original's.
+  clone.incidents = [];
   clone.jira = { lastSyncedAt: null };
   clone.createdAt = now;
   clone.updatedAt = now;
@@ -382,8 +403,16 @@ router.post("/:id/release-notes/generate", asyncHandler(async (req, res) => {
 
   const allItems = items.concat(manualItems);
 
+  // ---- Incidents section — one short summary per incident recorded on
+  // this release (AI when configured, rule-based fallback otherwise; see
+  // releaseNotesLogic.generateIncidentNotes). Snapshotted next to the ticket
+  // items so notes that were already generated don't change when an incident
+  // is added or edited later — only clicking Generate again refreshes this.
+  const incidentNotes = await releaseNotesLogic.generateIncidentNotes(release.incidents || [], release.tickets || []);
+
   release.releaseNotes = release.releaseNotes || { html: "", edited: false, savedAt: null };
   release.releaseNotes.items = allItems;
+  release.releaseNotes.incidentItems = incidentNotes.items;
   release.releaseNotes.lastGeneratedAt = now;
   release.updatedAt = now;
   await db.releases.set(req.params.id, release);
@@ -395,7 +424,9 @@ router.post("/:id/release-notes/generate", asyncHandler(async (req, res) => {
     aiConfigured: generated.aiConfigured,
     aiUsed: generated.aiUsed,
     aiUsedCount: generated.aiUsedCount,
-    warnings: generated.warnings,
+    incidentCount: incidentNotes.items.length,
+    incidentAiUsedCount: incidentNotes.aiUsedCount,
+    warnings: generated.warnings.concat(incidentNotes.warnings),
   });
 }));
 

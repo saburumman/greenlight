@@ -9,6 +9,12 @@ var BUG_SEVERITIES = ["Critical","High","Medium","Low"];
 var BUG_STATUSES = ["Open","Resolved","Deferred"];
 var PLATFORM_STATUSES = ["PASS","WARNING","FAIL","NOT TESTED"];
 var BLOCKER_STATUSES = ["Open","In Progress","Resolved"];
+var INCIDENT_SEVERITIES = ["Critical","High","Medium","Low"];
+var INCIDENT_STATUSES = ["Open","Investigating","Resolved"];
+// Labels for the Incident Type choice in the Add/Edit modal — mapped to the
+// stored scope ("TICKET" / "RELEASE") by incidentScopeFromType below.
+var INCIDENT_TYPE_TICKET = "Related to a ticket";
+var INCIDENT_TYPE_RELEASE = "Release-level incident";
 var PERF_STATUSES = ["PASS","WARNING","FAIL"];
 var SEC_STATUSES = ["PASS","WARNING","FAIL"];
 var PLATFORM_LABELS = {web:"Web", android:"Android", ios:"iOS"};
@@ -22,7 +28,7 @@ function toneForStatus(s){
   // NOT TESTED=blue, SKIP=grey (the default "neutral" tone) — used both for
   // pills and for the checked state of status-choice buttons.
   if(s==="PASS"||s==="GO"||s==="Resolved"||s==="Completed") return "go";
-  if(s==="WARNING"||s==="CONDITIONAL GO"||s==="In Progress"||s==="Deferred"||s==="High") return "warn";
+  if(s==="WARNING"||s==="CONDITIONAL GO"||s==="In Progress"||s==="Investigating"||s==="Deferred"||s==="High") return "warn";
   if(s==="FAIL"||s==="NO-GO"||s==="Open"||s==="Critical"||s==="Blocked") return "danger";
   if(s==="Medium"||s==="In QA"||s==="NOT TESTED") return "info";
   return "neutral"; // includes SKIP
@@ -253,6 +259,7 @@ var state = {
   ticketCollapsed: {}, // groupKey -> true if collapsed
   regressionGroupBy: "Entity", // "Entity" (default list) or "Owner" (bucketed by assignee, see sectionRegression)
   regressionView: "All", // "All" | "Mine" | "Unassigned" — see filterRegressionEntitiesForView
+  incidentFilters: {}, // releaseId -> {scope:"All"|"TICKET"|"RELEASE", severity, status} — the Incidents section's lightweight filters (see incidentFilterFor)
   pendingScrollTo: null, // section id to scroll to right after the next detail render (e.g. from a search result)
   searchQuery: "",
   searchResults: [],
@@ -311,8 +318,19 @@ function computeAssessment(r){
   var secCriticalOpen = secOn && num(r.security.critical) > 0;
   var secHighOpen = secOn && num(r.security.high) > 0;
   var secFailStatus = secOn && r.security.status==="FAIL";
+  // Incidents are a risk signal, never a verdict on their own: an unresolved
+  // Critical one is a NO-GO factor (like an open critical bug), an unresolved
+  // High one a conditional factor, and anything already Resolved — or any
+  // unresolved Medium/Low — is only mentioned for context. "Unresolved" means
+  // not Resolved, so an incident that's still being Investigated counts.
+  var incidents = r.incidents||[];
+  var incActive = incidents.filter(incidentIsUnresolved);
+  var incCriticalActive = incActive.filter(function(i){return i.severity==="Critical";});
+  var incHighActive = incActive.filter(function(i){return i.severity==="High";});
+  var incMinorActive = incActive.filter(function(i){return i.severity!=="Critical" && i.severity!=="High";});
+  var incSevereResolved = incidents.filter(function(i){return !incidentIsUnresolved(i) && (i.severity==="Critical"||i.severity==="High");});
 
-  var hasAnyData = regItems.length || regSkipped || (r.bugs||[]).length || (r.blockers||[]).length ||
+  var hasAnyData = regItems.length || regSkipped || (r.bugs||[]).length || (r.blockers||[]).length || incidents.length ||
     tickets.length || perfOn || secOn ||
     ["web","android","ios"].some(function(k){return r.platforms[k].status!=="NOT TESTED";});
 
@@ -336,6 +354,22 @@ function computeAssessment(r){
   if(bugsHighOpen.length){
     factors.conditional.push("bugsHigh");
     risks.push({tone:"warn", text: bugsHighOpen.length+" high-severity bug"+pluralize(bugsHighOpen.length,"","s")+" open"});
+  }
+
+  // ---- 2b. Incidents ----
+  if(incCriticalActive.length){
+    factors.nogo.push("incidentCritical");
+    risks.push({tone:"danger", text: incCriticalActive.length+" critical incident"+pluralize(incCriticalActive.length,"","s")+" unresolved: "+incidentTitlesText(r, incCriticalActive)});
+  }
+  if(incHighActive.length){
+    factors.conditional.push("incidentHigh");
+    risks.push({tone:"warn", text: incHighActive.length+" high-severity incident"+pluralize(incHighActive.length,"","s")+" unresolved: "+incidentTitlesText(r, incHighActive)});
+  }
+  if(incSevereResolved.length){
+    risks.push({tone:"neutral", text: incSevereResolved.length+" critical/high incident"+pluralize(incSevereResolved.length,"","s")+" resolved before release: "+incidentTitlesText(r, incSevereResolved)});
+  }
+  if(incMinorActive.length){
+    risks.push({tone:"neutral", text: incMinorActive.length+" medium/low incident"+pluralize(incMinorActive.length,"","s")+" still unresolved"});
   }
 
   // ---- 3. Regression ----
@@ -408,7 +442,8 @@ function computeAssessment(r){
 
   var summary = buildSummary(r, recommendation, factors, {
     blockersOpen:blockersOpen, blockersProgress:blockersProgress, bugsCriticalOpen:bugsCriticalOpen,
-    bugsHighOpen:bugsHighOpen, regFail:regFail, regWarn:regWarn, regNotTested:regNotTested,
+    bugsHighOpen:bugsHighOpen, incCriticalActive:incCriticalActive, incHighActive:incHighActive,
+    regFail:regFail, regWarn:regWarn, regNotTested:regNotTested,
     regSkipped:regSkipped, regItemsCount:regItems.length,
     blockedTickets:blockedTickets, platFail:platFail, platWarn:platWarn, hasAnyData:hasAnyData
   });
@@ -441,6 +476,11 @@ function buildSummary(r, recommendation, factors, d){
   }
   if(d.bugsHighOpen.length){
     sentences.push(d.bugsHighOpen.length+" high-severity known bug"+pluralize(d.bugsHighOpen.length,"","s")+" remain"+(d.bugsHighOpen.length===1?"s":"")+" open.");
+  }
+  if(d.incCriticalActive.length){
+    sentences.push(d.incCriticalActive.length+" critical incident"+pluralize(d.incCriticalActive.length,"","s")+" remain"+(d.incCriticalActive.length===1?"s":"")+" unresolved.");
+  } else if(d.incHighActive.length){
+    sentences.push(d.incHighActive.length+" high-severity incident"+pluralize(d.incHighActive.length,"","s")+" remain"+(d.incHighActive.length===1?"s":"")+" unresolved.");
   }
   if(d.regSkipped){
     // Marked not required — no narrative sentence needed, already surfaced as a risk line.
@@ -862,6 +902,26 @@ function generateReleaseNotesHtml(r){
     ? "<table><thead><tr><th>Jira</th><th>Description</th><th>Impact</th></tr></thead><tbody>"+bugFixRows.join("")+"</tbody></table>"
     : "<p>No bug fixes included in this release.</p>";
 
+  // ---- Incidents — only when the release has any. Rendered from the
+  // snapshot taken when the notes were generated (r.releaseNotes.incidentItems,
+  // see routes/releases.js), NOT from live r.incidents, so adding or editing
+  // an incident never rewrites notes that already exist — only Generate
+  // Release Notes refreshes it. Ticket-level lines lead with the ticket
+  // reference; release-level ones are labeled "Release-level". The section is
+  // inserted after Bug Fixes, so every later heading shifts down by one — but
+  // only when it's present, leaving the numbering of a release with no
+  // incidents exactly as it was.
+  var incidentItems = (r.releaseNotes && r.releaseNotes.incidentItems) || [];
+  var secOff = incidentItems.length ? 1 : 0;
+  var incidentsSectionHtml = incidentItems.length
+    ? "<h2>5. Incidents</h2><ul>"+incidentItems.map(function(it){
+        var label = it.scope==="TICKET" && it.ticketKey
+          ? it.ticketKey+(it.ticketTitle? " — "+it.ticketTitle : "")
+          : "Release-level";
+        return "<li><strong>"+esc(label)+":</strong> "+esc(it.summary)+"</li>";
+      }).join("")+"</ul><hr>"
+    : "";
+
   // ---- 5. Known Issues — open/deferred Known Bugs, plus flagged platform and regression results ----
   var openIssues = (r.bugs||[]).filter(function(b){return b.status==="Open" || b.status==="Deferred";});
   var platformIssues = ["web","android","ios"].filter(function(k){return r.platforms[k].status==="FAIL" || r.platforms[k].status==="WARNING";})
@@ -925,16 +985,17 @@ function generateReleaseNotesHtml(r){
     "<hr>"+
     "<h2>4. Bug Fixes</h2>"+bugFixesHtml+
     "<hr>"+
-    "<h2>5. Known Issues</h2>"+knownIssuesHtml+
+    incidentsSectionHtml+
+    "<h2>"+(5+secOff)+". Known Issues</h2>"+knownIssuesHtml+
     "<hr>"+
-    "<h2>6. QA Validation</h2>"+qaValidationHtml+
+    "<h2>"+(6+secOff)+". QA Validation</h2>"+qaValidationHtml+
     "<h3>QA Notes</h3>"+qaNotesHtml+
     "<hr>"+
-    "<h2>7. Deployment Notes</h2>"+
+    "<h2>"+(7+secOff)+". Deployment Notes</h2>"+
     "<h3>Deployment Requirements</h3>"+deploymentRequirementsHtml+
     "<h3>Post-Deployment Validation</h3>"+postDeploymentValidationHtml+
     "<hr>"+
-    "<h2>8. Important Notes</h2>"+importantNotesHtml+
+    "<h2>"+(8+secOff)+". Important Notes</h2>"+importantNotesHtml+
     "<hr>"+
     "<h2>Release Approval</h2>"+approvalHtml;
 }
@@ -1305,6 +1366,9 @@ var AUDIT_ACTION_LABELS = {
   KNOWN_BUG_UPDATED: "Updated Known Bug",
   BLOCKER_ADDED: "Added Blocker",
   BLOCKER_UPDATED: "Updated Blocker",
+  INCIDENT_CREATED: "Added Incident",
+  INCIDENT_UPDATED: "Updated Incident",
+  INCIDENT_DELETED: "Deleted Incident",
   PLATFORM_UPDATED: "Updated Platform",
   PERFORMANCE_UPDATED: "Updated Performance",
   SECURITY_UPDATED: "Updated Security",
@@ -2264,8 +2328,8 @@ function renderDetail(r){
   '</div>';
 
   html += '<nav class="quicknav">'+
-    ['tickets','regression','bugs','platforms','blockers','performance','security','notes','mobile','publish'].map(function(s){
-      var labels={tickets:"Tickets",regression:"Regression",bugs:"Bugs",platforms:"Platforms",blockers:"Blockers",performance:"Performance",security:"Security",notes:"Release Notes",mobile:"Mobile Release Note",publish:"Publish"};
+    ['tickets','regression','bugs','incidents','platforms','blockers','performance','security','notes','mobile','publish'].map(function(s){
+      var labels={tickets:"Tickets",regression:"Regression",bugs:"Bugs",incidents:"Incidents",platforms:"Platforms",blockers:"Blockers",performance:"Performance",security:"Security",notes:"Release Notes",mobile:"Mobile Release Note",publish:"Publish"};
       return '<a data-scroll="sec-'+s+'">'+labels[s]+'</a>';
     }).join("")+
   '</nav>';
@@ -2280,6 +2344,7 @@ function renderDetail(r){
   html += sectionTickets(r);
   html += sectionRegression(r);
   html += sectionBugs(r);
+  html += sectionIncidents(r);
   html += sectionPlatforms(r);
   html += sectionBlockers(r);
   html += sectionPerformance(r);
@@ -2799,6 +2864,283 @@ function sectionBugs(r){
   '</section>';
 }
 
+/* ---- Incidents ----
+   Small, release-scoped records of things that went wrong around a release —
+   either tied to ONE of this release's tickets (scope "TICKET") or about the
+   release as a whole (scope "RELEASE"). Stored on the release itself
+   (r.incidents[], same as r.bugs / r.blockers) and saved through the same
+   full-document PUT; the server re-validates every save (see
+   server/incidentLogic.js), including that a ticket-level incident only
+   points at a ticket from this very release. ticketId is the ticket's Jira
+   key — tickets here have no other id. Deliberately lightweight: a card list
+   with a summary line and three filters, nothing more. */
+function incidentIsUnresolved(inc){ return !!inc && inc.status!=="Resolved"; }
+function findIncident(r, id){ return (r.incidents||[]).find(function(x){return x.id===id;}) || null; }
+function incidentTicket(r, inc){
+  if(!inc || inc.scope!=="TICKET" || !inc.ticketId) return null;
+  return (r.tickets||[]).find(function(t){return t.key===inc.ticketId;}) || null;
+}
+function incidentScopeFromType(typeLabel){
+  return typeLabel===INCIDENT_TYPE_TICKET ? "TICKET" : (typeLabel===INCIDENT_TYPE_RELEASE ? "RELEASE" : "");
+}
+// "Payment service timeout (MOJ-1240)" / "Production deployment delay" — used
+// in assessment risk lines, where the reader needs to know what and where.
+function incidentTitleWithRef(inc){
+  return (inc.title||"Untitled incident")+(inc.scope==="TICKET" && inc.ticketId ? " ("+inc.ticketId+")" : "");
+}
+// HTML-escaped, capped to two names so a long list can't flood the AI card.
+function incidentTitlesText(r, list){
+  var shown = list.slice(0,2).map(function(i){ return esc(incidentTitleWithRef(i)); }).join(", ");
+  return shown + (list.length>2 ? " +"+(list.length-2)+" more" : "");
+}
+// What the Audit Log shows: "MOJ-1240 — Payment service timeout" for a
+// ticket-level incident, just the title for a release-level one.
+function incidentAuditDetails(inc){
+  return (inc.scope==="TICKET" && inc.ticketId ? inc.ticketId+" — " : "")+(inc.title||"Untitled incident");
+}
+function incidentCounts(incidents){
+  var c = {total:incidents.length, open:0, investigating:0, resolved:0};
+  incidents.forEach(function(i){
+    if(i.status==="Resolved") c.resolved++;
+    else if(i.status==="Investigating") c.investigating++;
+    else c.open++;
+  });
+  return c;
+}
+// "3 incidents · 1 open · 2 resolved" — only non-zero buckets are listed.
+function incidentSummaryLine(incidents){
+  var c = incidentCounts(incidents);
+  var parts = [c.total+" incident"+pluralize(c.total,"","s")];
+  if(c.open) parts.push(c.open+" open");
+  if(c.investigating) parts.push(c.investigating+" investigating");
+  if(c.resolved) parts.push(c.resolved+" resolved");
+  return parts.join(" · ");
+}
+function incidentSeverityDot(sev){
+  return (sev==="Critical"||sev==="High") ? "🔴" : (sev==="Medium" ? "🟠" : "🟡");
+}
+function incidentFilterFor(r){
+  var f = state.incidentFilters[r._id] || {};
+  return {scope:f.scope||"All", severity:f.severity||"", status:f.status||""};
+}
+function filterIncidents(incidents, f){
+  return incidents.filter(function(i){
+    if(f.scope==="TICKET" && i.scope!=="TICKET") return false;
+    if(f.scope==="RELEASE" && i.scope!=="RELEASE") return false;
+    if(f.severity && i.severity!==f.severity) return false;
+    if(f.status && i.status!==f.status) return false;
+    return true;
+  });
+}
+// Filters only re-render this one section (not the whole page), so changing
+// one never throws away unsaved edits in the Release Notes editor below.
+function setIncidentFilter(r, key, value){
+  var f = incidentFilterFor(r);
+  f[key] = value;
+  state.incidentFilters[r._id] = f;
+  var sec = qs("#sec-incidents");
+  if(sec) sec.outerHTML = sectionIncidents(r);
+  else render();
+}
+function incidentCardHtml(r, inc){
+  var ticket = incidentTicket(r, inc);
+  var flagged = incidentIsUnresolved(inc) && (inc.severity==="Critical"||inc.severity==="High");
+  var scopeHtml;
+  if(inc.scope==="TICKET"){
+    scopeHtml = '🎫 '+(ticket ? jiraKeyHtml(ticket) : esc(inc.ticketId||""))+
+      (ticket && ticket.title ? ' — '+esc(ticket.title) : '')+
+      (ticket ? '' : ' <span class="hint">(no longer in this release)</span>');
+  } else {
+    scopeHtml = 'Release-level incident';
+  }
+  var id = esc(inc.id);
+  return '<div class="incident-card'+(flagged?' is-flagged':'')+'" data-incident-id="'+id+'">'+
+    '<div class="incident-card-head">'+
+      '<div class="incident-card-title"><span class="incident-sev-dot" aria-hidden="true">'+incidentSeverityDot(inc.severity)+'</span><span>'+esc(inc.title||"Untitled incident")+'</span></div>'+
+      '<div class="incident-card-actions">'+
+        '<button class="btn btn-sm btn-icon" data-action="toggle-incident-menu" data-id="'+id+'" aria-label="More actions">'+iconDots()+'</button>'+
+        '<div class="menu" id="incident-menu-'+id+'">'+
+          '<button data-action="view-incident" data-id="'+id+'">'+iconEye()+' View</button>'+
+          '<button data-action="edit-incident" data-id="'+id+'">'+iconEdit()+' Edit</button>'+
+          '<button class="danger" data-action="delete-incident" data-id="'+id+'">'+iconTrash()+' Delete</button>'+
+        '</div>'+
+      '</div>'+
+    '</div>'+
+    '<div class="incident-card-scope">'+scopeHtml+'</div>'+
+    '<div class="incident-card-meta">'+pill(inc.severity||"Medium", toneForStatus(inc.severity), "pill-sm")+pill(inc.status||"Open", toneForStatus(inc.status), "pill-sm")+'</div>'+
+    '<div class="incident-card-desc">'+esc(inc.description||"")+'</div>'+
+  '</div>';
+}
+function sectionIncidents(r){
+  var all = r.incidents||[];
+  var f = incidentFilterFor(r);
+  var visible = filterIncidents(all, f).slice().sort(function(a,b){
+    return String(b.createdAt||"").localeCompare(String(a.createdAt||"")); // newest first
+  });
+  var scopeLabels = {All:"All", TICKET:"Ticket Incidents", RELEASE:"Release Incidents"};
+  var controls = all.length
+    ? '<div class="incident-controls">'+
+        ["All","TICKET","RELEASE"].map(function(k){
+          return '<button type="button" class="btn btn-sm view-tab'+(f.scope===k?" active":"")+'" data-action="set-incident-scope" data-scope="'+k+'">'+scopeLabels[k]+'</button>';
+        }).join("")+
+        '<span class="incident-filter-spacer"></span>'+
+        '<select data-action="set-incident-filter" data-filter="severity" aria-label="Filter by severity"><option value="">Severity: All</option>'+
+          INCIDENT_SEVERITIES.map(function(v){return '<option value="'+v+'"'+(f.severity===v?" selected":"")+'>'+v+'</option>';}).join("")+'</select>'+
+        '<select data-action="set-incident-filter" data-filter="status" aria-label="Filter by status"><option value="">Status: All</option>'+
+          INCIDENT_STATUSES.map(function(v){return '<option value="'+v+'"'+(f.status===v?" selected":"")+'>'+v+'</option>';}).join("")+'</select>'+
+      '</div>'
+    : '';
+  var listHtml = !all.length
+    ? '<div class="empty-row">No incidents recorded for this release.</div>'
+    : (visible.length
+        ? '<div class="incident-list">'+visible.map(function(i){ return incidentCardHtml(r, i); }).join("")+'</div>'
+        : '<div class="empty-row">No incidents match these filters.</div>');
+  return '<section class="card section-card" id="sec-incidents">'+
+    '<div class="section-head"><div class="section-title"><span class="emoji">🚨</span> Incidents</div>'+
+      '<div class="section-actions"><button class="btn btn-sm" data-action="add-incident">'+iconPlus()+' Add Incident</button></div></div>'+
+    '<div class="section-body">'+
+      '<div class="incident-summary" style="margin-bottom:12px;">'+esc(incidentSummaryLine(all))+'</div>'+
+      controls+listHtml+
+    '</div>'+
+  '</section>';
+}
+// Shared by the Add/Edit modal and unit-testable on its own. Returns an error
+// message, or "" when valid. A ticket-level incident must link to one of THIS
+// release's own tickets — the only exception is an existing incident that
+// keeps its current link even though Jira sync has since dropped that ticket
+// (so editing its status doesn't force a re-link). Mirrors the server rules.
+function validateIncidentInput(r, existing, v){
+  if(!v.scope) return "Choose an incident type.";
+  if(v.scope==="TICKET"){
+    if(!v.ticketId) return "Select the release ticket this incident is related to.";
+    var inRelease = (r.tickets||[]).some(function(t){ return t.key===v.ticketId; });
+    var keptLink = !!existing && existing.scope==="TICKET" && existing.ticketId===v.ticketId;
+    if(!inRelease && !keptLink) return "That ticket isn't part of this release.";
+  }
+  if(!v.title) return "Incident title is required.";
+  if(!v.description) return "Description is required.";
+  return "";
+}
+// Saves a new incidents array through the normal full-release PUT, and — unlike
+// the older sections — rolls the local copy back if the server rejects it, so
+// a rejected save never leaves a ghost incident on screen.
+function persistIncidents(r, nextIncidents, onSaved){
+  var prev = r.incidents;
+  r.incidents = nextIncidents;
+  return api.saveRelease(r._id, r).then(function(updated){
+    state.releases[r._id] = updated;
+    render();
+    if(onSaved) onSaved();
+  }).catch(function(e){
+    r.incidents = prev;
+    showToast((e && e.message) || "Couldn't save the incident.");
+    var sec = qs("#sec-incidents");
+    if(sec) sec.outerHTML = sectionIncidents(r);
+  });
+}
+function openIncidentModal(r, existing){
+  var inc = existing || {scope:"", ticketId:"", title:"", severity:"Medium", status:"Open", description:"", impact:"", resolution:""};
+  var tickets = r.tickets||[];
+  var currentType = inc.scope==="TICKET" ? INCIDENT_TYPE_TICKET : (inc.scope==="RELEASE" ? INCIDENT_TYPE_RELEASE : "");
+  var ticketOptions = '<option value="">Select ticket…</option>'+tickets.map(function(t){
+    return '<option value="'+escAttr(t.key)+'"'+(t.key===inc.ticketId?' selected':'')+'>'+esc(t.key+(t.title? " — "+t.title : ""))+'</option>';
+  }).join("");
+  // An existing incident whose ticket has since left the release keeps its
+  // link visible (and selected) instead of silently dropping it.
+  if(inc.scope==="TICKET" && inc.ticketId && !tickets.some(function(t){return t.key===inc.ticketId;})){
+    ticketOptions += '<option value="'+escAttr(inc.ticketId)+'" selected>'+esc(inc.ticketId+" — (no longer in this release)")+'</option>';
+  }
+  var body =
+    '<div class="field"><label>Incident Type *</label>'+statusChoiceGroup("incident-type", [INCIDENT_TYPE_TICKET, INCIDENT_TYPE_RELEASE], currentType, true)+'</div>'+
+    '<div class="field" id="incident-ticket-field" style="'+(currentType===INCIDENT_TYPE_TICKET?'':'display:none;')+'">'+
+      '<label for="f-ticket">Release Ticket *</label><select id="f-ticket">'+ticketOptions+'</select>'+
+      (tickets.length ? '' : '<span class="helper-text">This release has no tickets yet — add a ticket first, or choose “Release-level incident”.</span>')+
+    '</div>'+
+    '<div class="field"><label for="f-title">Incident Title *</label><input type="text" id="f-title" maxlength="200" value="'+escAttr(inc.title)+'" placeholder="Short summary of what happened"></div>'+
+    '<div class="field"><label>Severity</label>'+statusChoiceGroup("incident-severity", INCIDENT_SEVERITIES, inc.severity)+'</div>'+
+    '<div class="field"><label>Status</label>'+statusChoiceGroup("incident-status", INCIDENT_STATUSES, inc.status)+'</div>'+
+    '<div class="field"><label for="f-desc">Description *</label><textarea id="f-desc" rows="3" maxlength="2000" placeholder="What happened?">'+esc(inc.description||"")+'</textarea></div>'+
+    '<div class="field"><label for="f-impact">Impact <span class="hint">(optional)</span></label><textarea id="f-impact" rows="2" maxlength="1000" placeholder="Who or what was affected?">'+esc(inc.impact||"")+'</textarea></div>'+
+    '<div class="field"><label for="f-resolution">Resolution <span class="hint">(optional)</span></label><textarea id="f-resolution" rows="2" maxlength="1000" placeholder="How was it resolved?">'+esc(inc.resolution||"")+'</textarea></div>'+
+    '<div id="incident-form-error"></div>';
+  var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">Save Incident</button>';
+  openModal(modalShell(existing? "Edit incident" : "Add incident", body, foot));
+  var form = qs("#modal-form");
+  // The ticket picker only exists for "Related to a ticket".
+  form.addEventListener("change", function(e){
+    if(!e.target || e.target.name!=="incident-type") return;
+    var tf = qs("#incident-ticket-field");
+    if(tf) tf.style.display = e.target.value===INCIDENT_TYPE_TICKET ? "" : "none";
+  });
+  form.addEventListener("submit", function(e){
+    e.preventDefault();
+    var v = {
+      scope: incidentScopeFromType((qs('input[name="incident-type"]:checked')||{}).value||""),
+      ticketId: "",
+      title: qs("#f-title").value.trim(),
+      severity: (qs('input[name="incident-severity"]:checked')||{}).value || "Medium",
+      status: (qs('input[name="incident-status"]:checked')||{}).value || "Open",
+      description: qs("#f-desc").value.trim(),
+      impact: qs("#f-impact").value.trim(),
+      resolution: qs("#f-resolution").value.trim()
+    };
+    if(v.scope==="TICKET") v.ticketId = (qs("#f-ticket").value||"").trim();
+    var err = validateIncidentInput(r, existing, v);
+    var errEl = qs("#incident-form-error");
+    if(err){
+      if(errEl) errEl.innerHTML = '<div class="incident-form-error">'+esc(err)+'</div>';
+      return;
+    }
+    var now = new Date().toISOString();
+    var fields = {
+      scope:v.scope, ticketId: v.scope==="TICKET" ? v.ticketId : null, // release-level never keeps a ticket link
+      title:v.title, severity:v.severity, status:v.status,
+      description:v.description, impact:v.impact, resolution:v.resolution
+    };
+    var isNew = !existing;
+    var saved = isNew
+      ? Object.assign({id:crypto.randomUUID(), releaseId:r._id}, fields, {createdBy:currentPreparerName(), createdAt:now, updatedAt:now})
+      : Object.assign({}, existing, fields, {updatedAt:now});
+    var current = r.incidents||[];
+    var next = isNew ? current.concat([saved]) : current.map(function(x){ return x.id===existing.id ? saved : x; });
+    closeModal();
+    persistIncidents(r, next, function(){
+      logAudit({action: isNew ? "INCIDENT_CREATED" : "INCIDENT_UPDATED", entityType:"Incident", entityId:saved.id, details:incidentAuditDetails(saved)});
+    });
+  });
+}
+function openIncidentViewModal(r, inc){
+  var ticket = incidentTicket(r, inc);
+  var ticketHtml = inc.scope==="TICKET"
+    ? (ticket ? jiraKeyHtml(ticket)+(ticket.title? " — "+esc(ticket.title) : "") : esc(inc.ticketId||"")+' <span class="hint">(no longer in this release)</span>')
+    : "";
+  function row(label, valueHtml){ return '<dt>'+label+'</dt><dd>'+valueHtml+'</dd>'; }
+  var body = '<dl class="incident-view-grid">'+
+    row("Title", esc(inc.title||"Untitled incident"))+
+    row("Type", inc.scope==="TICKET" ? "Ticket-level incident" : "Release-level incident")+
+    (inc.scope==="TICKET" ? row("Ticket", ticketHtml) : "")+
+    row("Severity", pill(inc.severity||"Medium", toneForStatus(inc.severity), "pill-sm"))+
+    row("Status", pill(inc.status||"Open", toneForStatus(inc.status), "pill-sm"))+
+    row("Description", esc(inc.description||"—"))+
+    row("Impact", esc(inc.impact||"—"))+
+    row("Resolution", esc(inc.resolution||"—"))+
+    row("Reported by", esc(inc.createdBy||"—"))+
+    row("Created", esc(fmtDateTime(inc.createdAt)||"—"))+
+    row("Last updated", esc(fmtDateTime(inc.updatedAt)||"—"))+
+  '</dl>';
+  var foot = '<span style="flex:1"></span><button type="button" class="btn" data-action="close-modal">Close</button>'+
+    '<button type="button" class="btn btn-primary" data-action="edit-incident" data-id="'+esc(inc.id)+'">'+iconEdit()+' Edit</button>';
+  openModal(modalShell("Incident details", body, foot));
+}
+function confirmDeleteIncident(r, inc){
+  openConfirm("Delete this incident?", "<b>"+esc(inc.title||"Untitled incident")+"</b> will be removed from this release.", "Delete", function(){
+    var next = (r.incidents||[]).filter(function(x){ return x.id!==inc.id; });
+    persistIncidents(r, next, function(){
+      logAudit({action:"INCIDENT_DELETED", entityType:"Incident", entityId:inc.id, details:incidentAuditDetails(inc)});
+    });
+  }, true);
+}
+
 /* ---- Platforms ---- */
 function sectionPlatforms(r){
   var tiles = ["web","android","ios"].map(function(k){
@@ -3064,6 +3406,7 @@ function sectionPublish(r, assessment){
 function pill(text, tone, extraClass){ return '<span class="pill '+(extraClass||"")+' tone-'+tone+'"><span class="pill-dot"></span>'+esc(text)+'</span>'; }
 function iconPlus(){ return '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>'; }
 function iconEdit(){ return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>'; }
+function iconEye(){ return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>'; }
 function iconTrash(){ return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>'; }
 function iconCopy(){ return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>'; }
 function iconDots(){ return '<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>'; }
@@ -3893,7 +4236,8 @@ function handleGenerateNotes(r){
       updateNotesStatus(r);
 
       var detail = "Release "+(r.version||r.name||"Untitled")+
-        (result.aiUsed ? " — AI-assisted ("+result.aiUsedCount+" ticket"+pluralize(result.aiUsedCount,"","s")+")" : " — rule-based summaries");
+        (result.aiUsed ? " — AI-assisted ("+result.aiUsedCount+" ticket"+pluralize(result.aiUsedCount,"","s")+")" : " — rule-based summaries")+
+        (result.incidentCount ? ", "+result.incidentCount+" incident"+pluralize(result.incidentCount,"","s") : "");
       logAudit({action:"RELEASE_NOTES_GENERATED", entityType:"Release", entityId:r._id, details:detail});
 
       (result.warnings||[]).forEach(function(w){ showToast(w); });
@@ -3924,7 +4268,8 @@ function handleSaveNotes(r){
     });
   }
   r.releaseNotes = { html: html, edited: isManualEdit, savedAt: new Date().toISOString(),
-    items: items, lastGeneratedAt: r.releaseNotes ? r.releaseNotes.lastGeneratedAt : null };
+    items: items, lastGeneratedAt: r.releaseNotes ? r.releaseNotes.lastGeneratedAt : null,
+    incidentItems: (r.releaseNotes && r.releaseNotes.incidentItems) || [] };
   state.notesDirty = false;
   persistRelease(r, function(){
     showToast("Release notes saved");
@@ -4183,7 +4528,7 @@ document.addEventListener("click", function(e){
   // Closes the release-detail "⋮" menu and every per-row Test Data "⋮" menu
   // (there's normally at most one open at a time) whenever the click wasn't
   // on one of their own toggle buttons.
-  var menuBtn = e.target.closest('[data-action="toggle-release-menu"], [data-action="toggle-td-menu"], [data-action="toggle-team-menu"]');
+  var menuBtn = e.target.closest('[data-action="toggle-release-menu"], [data-action="toggle-td-menu"], [data-action="toggle-team-menu"], [data-action="toggle-incident-menu"]');
   var openMenus = qsa(".menu.open");
   if(openMenus.length && !menuBtn) openMenus.forEach(function(m){ m.classList.remove("open"); });
   if(!e.target.closest(".search-wrap")) closeSearchDropdown();
@@ -4250,6 +4595,18 @@ document.addEventListener("click", function(e){
     case "edit-bug": if(r){ var bu=(r.bugs||[]).find(function(x){return x.id===id;}); if(bu) openBugModal(r,bu); } break;
     case "delete-bug": if(r){ r.bugs=(r.bugs||[]).filter(function(x){return x.id!==id;}); persistRelease(r); } break;
     case "edit-platform": if(r) openPlatformModal(r, el2.getAttribute("data-key")); break;
+    case "add-incident": if(r) openIncidentModal(r, null); break;
+    case "toggle-incident-menu":
+      e.stopPropagation();
+      var incMenu = document.getElementById("incident-menu-"+id);
+      if(incMenu) incMenu.classList.toggle("open");
+      break;
+    case "view-incident": if(r){ var vInc=findIncident(r,id); if(vInc) openIncidentViewModal(r, vInc); } break;
+    case "edit-incident": if(r){ var eInc=findIncident(r,id); if(eInc) openIncidentModal(r, eInc); } break;
+    case "delete-incident": if(r){ var dInc=findIncident(r,id); if(dInc) confirmDeleteIncident(r, dInc); } break;
+    case "set-incident-scope":
+      if(r){ setIncidentFilter(r, "scope", el2.getAttribute("data-scope")||"All"); }
+      break;
     case "add-blocker": if(r) openBlockerModal(r, null); break;
     case "edit-blocker": if(r){ var bl=(r.blockers||[]).find(function(x){return x.id===id;}); if(bl) openBlockerModal(r,bl); } break;
     case "delete-blocker": if(r){ r.blockers=(r.blockers||[]).filter(function(x){return x.id!==id;}); persistRelease(r); } break;
@@ -4380,6 +4737,10 @@ document.addEventListener("change", function(e){
   if(elp.matches('[data-action="toggle-security"]')){
     var r2 = state.releases[state.route.id]; if(!r2) return;
     r2.security.enabled = elp.checked; persistRelease(r2);
+  }
+  if(elp.matches('[data-action="set-incident-filter"]')){
+    var rInc = state.releases[state.route.id]; if(!rInc) return;
+    setIncidentFilter(rInc, elp.getAttribute("data-filter"), elp.value);
   }
   if(elp.matches('[data-action="toggle-regression-skip"]')){
     var r3 = state.releases[state.route.id]; if(!r3) return;
