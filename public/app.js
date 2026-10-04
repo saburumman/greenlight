@@ -648,17 +648,19 @@ function filterRegressionEntitiesForView(entities, view){
 // itself was never blocked. Shown only while the status still equals the
 // change it describes, so it doesn't linger after the status moves on.
 function regressionChangeNoteHtml(holder, currentStatus){
+  if(!canViewStatistics()) return ""; // only people with Statistics access see who changed what
   var c = holder && holder.lastChange;
   if(!c || !c.byOther || c.newStatus!==(currentStatus||"NOT TESTED")) return "";
   var assignee = memberNameById(c.assignedTo);
   var by = c.changedBy ? memberNameById(c.changedBy) : (c.changedByName || "someone not on the team list");
-  return '<details class="reg-change-note"><summary>⚠ Status changed by another QA member</summary>'+
+  return '<details class="reg-change-note"><summary>⚠ Status changed by '+esc(by)+'</summary>'+
     '<div>This regression is assigned to <b>'+esc(assignee)+'</b>, but the status was changed by <b>'+esc(by)+'</b> ('+esc(c.previousStatus||"")+' → '+esc(c.newStatus||"")+(c.at?', '+esc(fmtDateTime(c.at)):'')+').</div></details>';
 }
 // Shown right after a status change is saved when the person who made it
 // isn't the one it's assigned to. A heads-up only: the change already went
 // through, and nothing here asks for confirmation.
 function warnIfChangedByOther(assigneeId){
+  if(!canViewStatistics()) return; // same audience as the change note: people with Statistics access
   if(!assigneeId || assigneeId===currentMemberId()) return;
   var who = (currentMember() && currentMember().name) || currentPreparerName() || "someone else";
   showToast("⚠ Regression status changed by another QA member — assigned to "+memberNameById(assigneeId)+", changed by "+who+".");
@@ -1441,6 +1443,7 @@ function auditActorName(e){
 // row, only for the changes that actually warrant it.
 function auditStatusChangeWarnHtml(e){
   var m = e && e.meta;
+  if(!canViewStatistics()) return ""; // same audience as the change note
   if(!m || !m.byOther || e.action!=="REGRESSION_UPDATED") return "";
   var by = m.changedBy ? memberNameById(m.changedBy) : auditActorName(e);
   return '<div class="audit-row-warn"><span class="audit-warn-head">⚠ '+esc(by)+' changed regression status</span><br>'+
