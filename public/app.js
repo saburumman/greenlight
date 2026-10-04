@@ -2969,6 +2969,7 @@ function incidentCardHtml(r, inc){
     '<div class="incident-card-scope">'+scopeHtml+'</div>'+
     '<div class="incident-card-meta">'+pill(inc.severity||"Medium", toneForStatus(inc.severity), "pill-sm")+pill(inc.status||"Open", toneForStatus(inc.status), "pill-sm")+'</div>'+
     '<div class="incident-card-desc">'+esc(inc.description||"")+'</div>'+
+    (inc.impact ? '<div class="incident-card-impact"><span class="incident-card-impact-label">Impact:</span> '+esc(inc.impact)+'</div>' : '')+
   '</div>';
 }
 function sectionIncidents(r){

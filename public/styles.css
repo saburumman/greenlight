@@ -699,6 +699,8 @@ a{color:inherit;}
 .incident-card-scope .hint{font-weight:500;color:var(--ink-faint);}
 .incident-card-meta{display:flex;gap:6px;flex-wrap:wrap;}
 .incident-card-desc{color:var(--ink-soft);font-size:12.5px;line-height:1.5;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;}
+.incident-card-impact{color:var(--ink-soft);font-size:12.5px;line-height:1.5;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;}
+.incident-card-impact-label{font-weight:700;color:var(--ink);}
 .incident-form-error{color:var(--danger-fg);background:var(--danger-bg);border:1px solid var(--danger-border);border-radius:8px;padding:8px 12px;font-size:12.5px;font-weight:600;}
 .incident-view-grid{display:grid;grid-template-columns:110px 1fr;gap:8px 14px;font-size:13px;}
 .incident-view-grid dt{color:var(--ink-faint);font-weight:700;font-size:12px;}
