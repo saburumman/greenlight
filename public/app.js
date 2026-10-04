@@ -1493,7 +1493,6 @@ function renderAuditLog(){
    This is workload visibility for the QA workflow — deliberately no ranking,
    scoring or comparison between people.
    ============================================================ */
-var STATS_ASSIGN_ACTIONS = ["TICKET_ASSIGNED","TICKET_REASSIGNED","REGRESSION_ASSIGNED","ENTITY_REGRESSION_ASSIGNED"];
 var STATS_RANGES = [
   {value:"all", label:"All time"},
   {value:"7d", label:"Last 7 days"},
@@ -1523,10 +1522,6 @@ function statsInRange(ts, bounds, f){
 }
 function statsTime(iso){ var t = iso ? new Date(iso).getTime() : NaN; return isNaN(t) ? null : t; }
 function statsMaxTime(a, b){ return a==null ? b : (b==null ? a : Math.max(a,b)); }
-function statsDayKey(ms){
-  var d = new Date(ms);
-  return d.getFullYear()+"-"+("0"+(d.getMonth()+1)).slice(-2)+"-"+("0"+d.getDate()).slice(-2);
-}
 // Every ticket / regression module / open blocker of one release as a flat
 // item with its effective assignee, current status and (when known) the time
 // of its latest dated activity.
@@ -1621,36 +1616,26 @@ function computeStatistics(f, now){
     if(firstOfTicket) statsAddItem(byRelease[it.releaseId] = byRelease[it.releaseId] || statsEmptyRow(), it);
   });
 
-  // ---- audit events with structured data (what happened, when) ----
-  var days = {}; // yyyy-mm-dd -> counts
+  // ---- audit events with structured data (who changed whose regression) ----
+  // Each regression status change is credited to the person it is ASSIGNED
+  // to: if they changed it themselves it's one of their "Status Changes";
+  // if anyone else changed it (assignedTo != changedBy) it's one of their
+  // "Changed By Others" — and is NOT counted as a status change of the
+  // person who made it. A change to an unassigned module belongs to no one.
   var activity = {}; // member id -> {assigned, statusChanges, changedByOthers}
-  var unlinkedChanges = 0, eventCount = 0;
-  function dayRow(ms){ var k = statsDayKey(ms); return days[k] = days[k] || {date:k, assigned:0, passed:0, failed:0, warning:0, notTested:0}; }
+  var eventCount = 0;
   function actRow(id){ return activity[id] = activity[id] || {assigned:0, statusChanges:0, changedByOthers:0}; }
   (state.auditLog||[]).forEach(function(e){
     var m = e && e.meta;
-    if(!m) return;
+    if(!m || e.action!=="REGRESSION_UPDATED" || !m.newStatus) return;
     if(f.releaseId && m.releaseId!==f.releaseId) return;
-    var ts = statsTime(e.createdAt);
-    if(!statsInRange(ts, bounds, f)) return;
-    if(e.action==="REGRESSION_UPDATED" && m.newStatus){
-      if(!m.changedBy || !qa[m.changedBy]) return; // only QA team members' activity
-      if(f.memberId && m.changedBy!==f.memberId) return;
-      eventCount++;
-      var d = dayRow(ts);
-      if(m.newStatus==="PASS") d.passed++;
-      else if(m.newStatus==="FAIL") d.failed++;
-      else if(m.newStatus==="WARNING") d.warning++;
-      else if(m.newStatus==="NOT TESTED") d.notTested++;
-      actRow(m.changedBy).statusChanges++;
-      if(m.assignedTo && qa[m.assignedTo] && m.changedBy!==m.assignedTo) actRow(m.assignedTo).changedByOthers++;
-    } else if(STATS_ASSIGN_ACTIONS.indexOf(e.action)>-1 && m.scope!=="module-inherit"){
-      var assignedIds = (Array.isArray(m.assignedTo) ? m.assignedTo : (m.assignedTo ? [m.assignedTo] : [])).filter(function(id){ return qa[id]; });
-      if(!assignedIds.length) return;
-      if(f.memberId && assignedIds.indexOf(f.memberId)===-1) return;
-      eventCount++;
-      dayRow(ts).assigned++;
-    }
+    if(!statsInRange(statsTime(e.createdAt), bounds, f)) return;
+    var owner = typeof m.assignedTo==="string" ? m.assignedTo : "";
+    if(!owner || !qa[owner]) return; // only QA team members' own regression
+    if(f.memberId && owner!==f.memberId) return;
+    eventCount++;
+    if(m.changedBy===owner) actRow(owner).statusChanges++;
+    else actRow(owner).changedByOthers++;
   });
   // "Assigned" in the assignment-vs-activity table = regression modules
   // currently assigned to the member (same items as above).
@@ -1658,8 +1643,7 @@ function computeStatistics(f, now){
 
   return {
     filters: f, cards: cards, byMember: byMember, byRelease: byRelease,
-    days: Object.keys(days).sort().reverse().map(function(k){ return days[k]; }),
-    activity: activity, unlinkedChanges: unlinkedChanges,
+    activity: activity,
     hasData: items.length>0 || eventCount>0
   };
 }
@@ -1726,9 +1710,6 @@ function renderStatistics(){
     var r = st.byRelease[id];
     return '<tr><td>'+esc(releaseLabel(state.releases[id]))+'</td>'+statsNumCell(r.tickets)+statsNumCell(r.regression)+statsNumCell(r.passed)+statsNumCell(r.failed)+statsNumCell(r.notTested)+statsNumCell(r.skipped)+statsNumCell(r.blocked)+'</tr>';
   }).join("");
-  var dayRows = st.days.map(function(d){
-    return '<tr><td>'+esc(fmtDate(d.date))+'</td>'+statsNumCell(d.assigned)+statsNumCell(d.passed)+statsNumCell(d.failed)+statsNumCell(d.warning)+statsNumCell(d.notTested)+'</tr>';
-  }).join("");
   var actIds = statsOrderedIds(st.activity).filter(function(id){ return id!==""; });
   var actRows = actIds.map(function(id){
     var a = st.activity[id]; if(!a.assigned && !a.statusChanges && !a.changedByOthers) return "";
@@ -1738,10 +1719,8 @@ function renderStatistics(){
   return head+filtersHtml+cardsHtml+
     '<div class="stats-section"><h2>By QA member</h2>'+statsTable(["QA Member","Tickets","Regression","Passed","Failed","Not Tested","Skipped","Blocked"], memberRows)+'</div>'+
     '<div class="stats-section"><h2>By release</h2>'+statsTable(["Release","Tickets","Regression","Passed","Failed","Not Tested","Skipped","Blocked"], releaseRows)+'</div>'+
-    '<div class="stats-section"><h2>Activity by date</h2>'+statsTable(["Date","Assigned","Passed","Failed","Warning","Not Tested"], dayRows)+
-      '<p class="stats-note">Counts regression assignments and status changes recorded in the Audit Log, per day.</p></div>'+
     '<div class="stats-section"><h2>Assignment vs. activity</h2>'+statsTable(["QA Member","Assigned","Status Changes","Changed By Others"], actRows)+
-      '<p class="stats-note">Assigned = regression modules currently assigned · Status Changes = regression statuses the member changed · Changed By Others = changes to the member’s assigned regression made by someone else. This is for QA workflow visibility only — not a measure of anyone’s performance.</p></div>'+
+      '<p class="stats-note">Assigned = regression modules currently assigned · Status Changes = changes the member made to their own assigned regression · Changed By Others = changes to the member’s assigned regression made by someone else (counted for the assignee only, not as the other person’s status change). This is for QA workflow visibility only — not a measure of anyone’s performance.</p></div>'+
     '<p class="stats-note">Items assigned before assignment dates were recorded have no date, so they appear under “All time” only. Only QA team members (Know the Team members available for regression assignment) are included — unassigned work, other assignees and release-level blockers are not.</p>';
 }
 
