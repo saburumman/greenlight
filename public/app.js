@@ -1485,14 +1485,18 @@ function renderAuditLog(){
    Definitions (the same everywhere on the page):
      Tickets Assigned     tickets whose QA owner is a team member
      Regression Assigned  regression modules whose effective owner is a member
-     Completed Work       regression modules tested (PASS / FAIL / WARNING)
-                          + tickets in the Completed bucket
-     Passed / Failed      regression modules currently PASS / FAIL
-     Blocked              tickets in the Blocked bucket + open release blockers
-                          (release blockers belong to the release, not a member)
+     Completed            modules with a result (Passed / Warning / Failed),
+                          out of the modules that aren't skipped
+     Passed / Warning / Failed / Not Tested / Skipped
+                          regression modules currently in that status
+     Blocked              tickets in the Blocked bucket assigned to a QA member
      Status Changes       regression status changes a member made
      Changed By Others    changes to a member's assigned regression made by
                           someone else (assignedTo != changedBy)
+   The page is a small dashboard — summary cards, an over-time column chart,
+   a status donut, per-member and per-release bars and a recent-activity
+   timeline — drawn with plain HTML/SVG (no chart library). Every section
+   shows an empty state instead of a chart when it has no data.
    This is workload visibility for the QA workflow — deliberately no ranking,
    scoring or comparison between people.
    ============================================================ */
@@ -1536,7 +1540,7 @@ function statsReleaseItems(r){
     var ids = ticketAssignedMemberIds(t);
     (ids.length ? ids : [""]).forEach(function(id){
       items.push({kind:"ticket", releaseId:r._id, ticketKey:t.key, assignee:id, ts:statsTime(t.assignedAt),
-        blocked:t.bucket==="Blocked", completed:t.bucket==="Completed"});
+        blocked:t.bucket==="Blocked"});
     });
   });
   regressionEntities(r).forEach(function(entity){
@@ -1567,16 +1571,80 @@ function statsQaIds(){
   regressionOwnerOptions().forEach(function(m){ o[m.id] = true; });
   return o;
 }
-function statsEmptyRow(){ return {tickets:0, regression:0, passed:0, failed:0, notTested:0, skipped:0, blocked:0}; }
+function statsEmptyRow(){ return {tickets:0, regression:0, passed:0, warning:0, failed:0, notTested:0, skipped:0, blocked:0}; }
 function statsAddItem(row, it){
   if(it.kind==="ticket"){ row.tickets++; if(it.blocked) row.blocked++; }
-  else if(it.kind==="regression"){ row.regression++; if(it.status==="PASS") row.passed++; else if(it.status==="FAIL") row.failed++; else if(it.status==="NOT TESTED") row.notTested++; else if(it.status==="SKIP") row.skipped++; }
+  else if(it.kind==="regression"){
+    row.regression++;
+    if(it.status==="PASS") row.passed++; else if(it.status==="WARNING") row.warning++; else if(it.status==="FAIL") row.failed++;
+    else if(it.status==="NOT TESTED") row.notTested++; else if(it.status==="SKIP") row.skipped++;
+  }
   else if(it.kind==="blocker"){ row.blocked++; }
+}
+// The regression statuses, in the one fixed order every chart on the page
+// uses. Colour is never the only cue: each status carries a glyph and a label.
+var STATS_STATUS = [
+  {key:"PASS", label:"Passed", glyph:"✓", cls:"pass", field:"passed"},
+  {key:"WARNING", label:"Warning", glyph:"!", cls:"warn", field:"warning"},
+  {key:"FAIL", label:"Failed", glyph:"✕", cls:"fail", field:"failed"},
+  {key:"NOT TESTED", label:"Not Tested", glyph:"○", cls:"none", field:"notTested"},
+  {key:"SKIP", label:"Skipped", glyph:"⊘", cls:"skip", field:"skipped"}
+];
+function statsStatusMeta(key){
+  for(var i=0;i<STATS_STATUS.length;i++) if(STATS_STATUS[i].key===key) return STATS_STATUS[i];
+  return null;
+}
+function statsPct(n, d){ return d>0 ? Math.round(n*100/d) : 0; }
+// Bucket start (ms) for a timestamp at the chart's granularity.
+function statsBucketStart(t, unit){
+  var d = new Date(t);
+  if(unit==="month") return new Date(d.getFullYear(), d.getMonth(), 1).getTime();
+  var day = statsStartOfDay(d.getTime());
+  if(unit==="week"){ var x = new Date(day); x.setDate(x.getDate()-((x.getDay()+6)%7)); return x.getTime(); }
+  return day;
+}
+function statsNextBucket(t, unit){
+  var d = new Date(t);
+  if(unit==="month") return new Date(d.getFullYear(), d.getMonth()+1, 1).getTime();
+  d.setDate(d.getDate()+(unit==="week"?7:1));
+  return d.getTime();
+}
+var STATS_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+function statsBucketLabel(t, unit){
+  var d = new Date(t);
+  return unit==="month" ? STATS_MONTHS[d.getMonth()]+" "+d.getFullYear() : d.getDate()+" "+STATS_MONTHS[d.getMonth()];
+}
+// Regression status changes over time, bucketed by day (≤ a month), week or
+// month, each bucket split by the status it was changed TO. null when there
+// is nothing dated to chart.
+function statsBuildTimeline(events, bounds, f, now){
+  var dated = events.filter(function(e){ return e.t!=null; });
+  if(!dated.length) return null;
+  var min = Math.min.apply(null, dated.map(function(e){ return e.t; }));
+  var end = bounds.to!=null ? bounds.to : now;
+  var start = bounds.from!=null ? bounds.from : min;
+  if(end<start) end = start;
+  var spanDays = Math.ceil((end-start)/86400000)+1;
+  var unit = spanDays<=31 ? "day" : (spanDays<=210 ? "week" : "month");
+  var buckets = [], map = {};
+  for(var t = statsBucketStart(start, unit), guard = 0; t<=end && guard<400; t = statsNextBucket(t, unit), guard++){
+    var b = {start:t, label:statsBucketLabel(t, unit), counts:{}, total:0};
+    buckets.push(b); map[t] = b;
+  }
+  if(buckets.length>36) buckets = buckets.slice(buckets.length-36);
+  dated.forEach(function(e){
+    var b = map[statsBucketStart(e.t, unit)];
+    if(!b || buckets.indexOf(b)<0) return;
+    b.counts[e.status] = (b.counts[e.status]||0)+1; b.total++;
+  });
+  var max = 0; buckets.forEach(function(b){ if(b.total>max) max = b.total; });
+  return {unit:unit, buckets:buckets, max:max};
 }
 // The whole page's numbers for a set of filters: {f:{range,from,to,releaseId,memberId}}.
 function computeStatistics(f, now){
   f = Object.assign(statsDefaultFilters(), f||{});
   var bounds = statsRangeBounds(f, now);
+  var nowMs = now ? new Date(now).getTime() : Date.now();
   var relIds = (state.releaseOrder||[]).filter(function(id){ return state.releases[id] && (!f.releaseId || id===f.releaseId); });
   var qa = statsQaIds();
 
@@ -1591,7 +1659,7 @@ function computeStatistics(f, now){
       items.push(it);
     });
   });
-  var cards = {ticketsAssigned:0, regressionAssigned:0, completed:0, passed:0, failed:0, notTested:0, skipped:0, blocked:0};
+  var cards = {ticketsAssigned:0, regressionAssigned:0, passed:0, warning:0, failed:0, notTested:0, skipped:0, blocked:0, completed:0, testable:0};
   var byMember = {}; // assignee id ("" = nobody) -> row
   var byRelease = {};
   var seenTickets = {}; // a ticket with several QA owners counts once in the cards / release table
@@ -1602,13 +1670,12 @@ function computeStatistics(f, now){
       firstOfTicket = !seenTickets[tk]; seenTickets[tk] = true;
       if(firstOfTicket){
         if(it.assignee) cards.ticketsAssigned++;
-        if(it.completed) cards.completed++;
         if(it.blocked) cards.blocked++;
       }
     } else if(it.kind==="regression"){
       if(it.assignee) cards.regressionAssigned++;
-      if(it.status==="PASS"||it.status==="FAIL"||it.status==="WARNING") cards.completed++;
       if(it.status==="PASS") cards.passed++;
+      if(it.status==="WARNING") cards.warning++;
       if(it.status==="FAIL") cards.failed++;
       if(it.status==="NOT TESTED") cards.notTested++;
       if(it.status==="SKIP") cards.skipped++;
@@ -1618,6 +1685,10 @@ function computeStatistics(f, now){
     statsAddItem(byMember[it.assignee] = byMember[it.assignee] || statsEmptyRow(), it);
     if(firstOfTicket) statsAddItem(byRelease[it.releaseId] = byRelease[it.releaseId] || statsEmptyRow(), it);
   });
+  // Completed = regression modules that have a result (Passed, Warning or
+  // Failed) out of the modules that are actually to be tested (not skipped).
+  cards.completed = cards.passed+cards.warning+cards.failed;
+  cards.testable = cards.regressionAssigned-cards.skipped;
 
   // ---- audit events with structured data (who changed whose regression) ----
   // Each regression status change is credited to the person it is ASSIGNED
@@ -1626,31 +1697,41 @@ function computeStatistics(f, now){
   // "Changed By Others" — and is NOT counted as a status change of the
   // person who made it. A change to an unassigned module belongs to no one.
   var activity = {}; // member id -> {assigned, statusChanges, changedByOthers}
-  var eventCount = 0;
+  var events = []; // the same credited events, for the over-time chart and the recent list
   function actRow(id){ return activity[id] = activity[id] || {assigned:0, statusChanges:0, changedByOthers:0}; }
   (state.auditLog||[]).forEach(function(e){
     var m = e && e.meta;
     if(!m || e.action!=="REGRESSION_UPDATED" || !m.newStatus) return;
     if(f.releaseId && m.releaseId!==f.releaseId) return;
-    if(!statsInRange(statsTime(e.createdAt), bounds, f)) return;
+    var t = statsTime(e.createdAt);
+    if(!statsInRange(t, bounds, f)) return;
     var owner = typeof m.assignedTo==="string" ? m.assignedTo : "";
     if(!owner || !qa[owner]) return; // only QA team members' own regression
     if(f.memberId && owner!==f.memberId) return;
-    eventCount++;
-    if(m.changedBy===owner) actRow(owner).statusChanges++;
+    var byOther = m.changedBy!==owner;
+    events.push({t:t, status:m.newStatus, owner:owner, byOther:byOther, entry:e});
+    if(!byOther) actRow(owner).statusChanges++;
     else actRow(owner).changedByOthers++;
   });
   // "Assigned" in the assignment-vs-activity table = regression modules
   // currently assigned to the member (same items as above).
   items.forEach(function(it){ if(it.kind==="regression" && it.assignee) actRow(it.assignee).assigned++; });
 
+  var recent = events.slice().sort(function(a,b){
+    if(a.t==null) return b.t==null ? 0 : 1;
+    if(b.t==null) return -1;
+    return b.t-a.t;
+  }).slice(0, 8);
+
   return {
     filters: f, cards: cards, byMember: byMember, byRelease: byRelease,
-    activity: activity,
-    hasData: items.length>0 || eventCount>0
+    activity: activity, eventCount: events.length,
+    timeline: statsBuildTimeline(events, bounds, f, nowMs),
+    recent: recent,
+    hasData: items.length>0 || events.length>0
   };
 }
-function statsRowIsEmpty(row){ return !row || (!row.tickets && !row.regression && !row.passed && !row.failed && !row.notTested && !row.skipped && !row.blocked); }
+function statsRowIsEmpty(row){ return !row || (!row.tickets && !row.regression && !row.passed && !row.warning && !row.failed && !row.notTested && !row.skipped && !row.blocked); }
 function statsMemberLabel(id){ return id ? memberNameById(id) : "Unassigned"; }
 // Member ids that appear in a keyed map, ordered by display name with
 // "Unassigned" last (alphabetical — never ordered by any number).
@@ -1670,7 +1751,7 @@ function statsFiltersHtml(f){
   var releases = (state.releaseOrder||[]).map(function(id){ return state.releases[id]; }).filter(Boolean);
   var members = regressionOwnerOptions();
   return '<div class="stats-filters">'+
-    '<div class="field"><label for="stats-range">Date</label><select id="stats-range" data-stats-field="range">'+
+    '<div class="field"><label for="stats-range">Date Range</label><select id="stats-range" data-stats-field="range">'+
       STATS_RANGES.map(function(o){ return '<option value="'+o.value+'"'+(f.range===o.value?" selected":"")+'>'+esc(o.label)+'</option>'; }).join("")+'</select></div>'+
     (f.range==="custom" ? '<div class="field"><label for="stats-from">From</label><input type="date" id="stats-from" data-stats-field="from" value="'+escAttr(f.from)+'"></div>'+
       '<div class="field"><label for="stats-to">To</label><input type="date" id="stats-to" data-stats-field="to" value="'+escAttr(f.to)+'"></div>' : '')+
@@ -1685,47 +1766,249 @@ function renderStatisticsNoAccess(){
   var why = !me
     ? 'Link your sign-in to your <b>Know the Team</b> entry first (top bar → Link to team), then ask a teammate who has access to turn on <b>Statistics access</b> for you.'
     : 'Your Know the Team entry doesn’t have <b>Statistics access</b>. Ask a teammate who has it to turn it on in Know the Team → Edit.';
-  return '<div class="list-head"><div><h1>Statistics</h1></div></div>'+
+  return '<div class="list-head"><div><h1>QA Statistics</h1></div></div>'+
     '<div class="empty-state"><h3>You don’t have access to Statistics</h3><p>'+why+'</p></div>';
 }
+
+/* ---- Statistics: visual building blocks (plain HTML/SVG, no libraries) ---- */
+var STATS_EMPTY_TEXT = "No data available for the selected filters.";
+function statsEmptyHtml(){ return '<div class="sv-empty"><span class="sv-empty-ico" aria-hidden="true">◌</span><span>'+STATS_EMPTY_TEXT+'</span></div>'; }
+function statsSection(title, sub, body, cls){
+  return '<section class="sv-panel'+(cls?" "+cls:"")+'"><div class="sv-panel-head"><h2>'+esc(title)+'</h2>'+(sub?'<p>'+esc(sub)+'</p>':'')+'</div>'+body+'</section>';
+}
+function statsBreakdownText(row){
+  return STATS_STATUS.filter(function(s){ return row[s.field]; }).map(function(s){ return s.label+" "+row[s.field]; }).join(" · ");
+}
+function statsLegendHtml(statuses){
+  return '<ul class="sv-legend">'+statuses.map(function(s){
+    return '<li><span class="sv-key sv-'+s.cls+'" aria-hidden="true"></span><span class="sv-glyph sv-g-'+s.cls+'" aria-hidden="true">'+s.glyph+'</span>'+esc(s.label)+'</li>';
+  }).join("")+'</ul>';
+}
+// A horizontal stacked bar of one row's regression statuses. `widthPct` < 100
+// scales it against the largest bar on the page so lengths compare workload.
+function statsStackBar(row, widthPct){
+  var segs = STATS_STATUS.map(function(s){
+    var n = row[s.field]||0; if(!n) return "";
+    return '<span class="sv-seg sv-'+s.cls+'" style="flex-grow:'+n+'"></span>';
+  }).join("");
+  return '<div class="sv-track"><div class="sv-bar" style="width:'+Math.max(2, widthPct)+'%">'+segs+'</div></div>';
+}
+// Smallest "round" even axis maximum (2, 4, 6, 8, 10, 20, 40 …) that fits n.
+function statsNiceMax(n){
+  var base = [2,4,6,8,10];
+  for(var p=1; p<=1e7; p*=10) for(var i=0;i<base.length;i++){ if(base[i]*p>=n) return base[i]*p; }
+  return n;
+}
+function statsKpiHtml(c, st){
+  var releasesWithTickets = Object.keys(st.byRelease).filter(function(id){ return st.byRelease[id].tickets>0; }).length;
+  var releasesWithReg = Object.keys(st.byRelease).filter(function(id){ return st.byRelease[id].regression>0; }).length;
+  var donePct = statsPct(c.completed, c.testable);
+  function card(cls, glyph, label, value, foot, extra){
+    return '<div class="sv-kpi sv-kpi-'+cls+'"><div class="sv-kpi-top"><span class="sv-kpi-ico" aria-hidden="true">'+glyph+'</span><span class="sv-kpi-label">'+esc(label)+'</span></div>'+
+      '<div class="sv-kpi-num">'+value+'</div>'+(extra||"")+'<div class="sv-kpi-foot">'+foot+'</div></div>';
+  }
+  var meter = '<div class="sv-meter" role="img" aria-label="'+donePct+'% of testable regression has a result"><span style="width:'+donePct+'%"></span></div>';
+  return '<div class="sv-kpis">'+
+    card("tix","▤","Tickets Assigned", c.ticketsAssigned, c.ticketsAssigned ? 'across '+releasesWithTickets+' '+pluralize(releasesWithTickets,"release") : 'none in this view')+
+    card("reg","◫","Regression Assigned", c.regressionAssigned, c.regressionAssigned ? 'modules across '+releasesWithReg+' '+pluralize(releasesWithReg,"release") : 'none in this view')+
+    card("done","◔","Completed", c.completed, c.testable ? 'of '+c.testable+' testable · '+donePct+'%' : 'no testable modules', c.testable ? meter : "")+
+    card("pass","✓","Passed", c.passed, c.regressionAssigned ? statsPct(c.passed, c.regressionAssigned)+'% of regression' : '—')+
+    card("fail","✕","Failed", c.failed, c.regressionAssigned ? statsPct(c.failed, c.regressionAssigned)+'% of regression' : '—')+
+    card("block","⊗","Blocked", c.blocked, c.blocked ? pluralize(c.blocked,"ticket")+' in Blocked' : 'no blocked tickets')+
+  '</div>';
+}
+// QA activity over time: stacked columns, split by the status changed TO.
+function statsActivityChartHtml(tl){
+  if(!tl || !tl.max) return statsEmptyHtml();
+  var nice = statsNiceMax(tl.max);
+  var seen = {};
+  tl.buckets.forEach(function(b){ Object.keys(b.counts).forEach(function(k){ seen[k] = true; }); });
+  var used = STATS_STATUS.filter(function(s){ return seen[s.key]; });
+  var every = Math.max(1, Math.ceil(tl.buckets.length/8));
+  var unitWord = tl.unit==="day" ? "Day" : (tl.unit==="week" ? "Week of" : "Month");
+  var cols = tl.buckets.map(function(b, i){
+    var segs = STATS_STATUS.map(function(s){
+      var n = b.counts[s.key]||0; if(!n) return "";
+      return '<span class="sv-vseg sv-'+s.cls+'" style="height:'+(n/nice*100)+'%"></span>';
+    }).join("");
+    var tip = unitWord+" "+b.label+"\n"+(b.total ? b.total+" status "+pluralize(b.total,"change")+"\n"+STATS_STATUS.filter(function(s){return b.counts[s.key];}).map(function(s){ return s.label+" "+b.counts[s.key]; }).join(" · ") : "No status changes");
+    return '<div class="sv-col" data-tip="'+escAttr(tip)+'" tabindex="0"><div class="sv-stack">'+segs+'</div>'+
+      '<span class="sv-xl">'+(i%every===0 ? esc(b.label) : "")+'</span></div>';
+  }).join("");
+  var ticks = [nice, nice/2, 0].map(function(v){ return '<span>'+v+'</span>'; }).join("");
+  return '<div class="sv-chart" role="group" aria-label="Regression status changes over time">'+
+    '<div class="sv-yaxis" aria-hidden="true">'+ticks+'</div>'+
+    '<div class="sv-plot"><div class="sv-grid" aria-hidden="true"><i></i><i></i><i></i></div><div class="sv-cols">'+cols+'</div></div></div>'+
+    statsLegendHtml(used);
+}
+// Regression status mix: a donut (5 segments at most) with a labelled legend.
+function statsRegressionOverviewHtml(c){
+  var total = c.regressionAssigned;
+  if(!total) return statsEmptyHtml();
+  var segs = STATS_STATUS.map(function(s){ return {s:s, n:c[s.field]||0}; }).filter(function(x){ return x.n>0; });
+  var R = 15.9155, off = 25, circles = "";
+  segs.forEach(function(x){
+    var len = x.n/total*100, gap = segs.length>1 ? Math.min(0.8, len/3) : 0;
+    var tip = x.s.label+": "+x.n+" of "+total+" ("+statsPct(x.n,total)+"%)";
+    circles += '<circle class="sv-arc sv-arc-'+x.s.cls+'" cx="21" cy="21" r="'+R+'" fill="none" stroke-width="5.2" stroke-dasharray="'+(len-gap).toFixed(3)+' '+(100-len+gap).toFixed(3)+'" stroke-dashoffset="'+off.toFixed(3)+'" data-tip="'+escAttr(tip)+'" tabindex="0"></circle>';
+    off -= len;
+  });
+  var svg = '<svg class="sv-donut" viewBox="0 0 42 42" role="img" aria-label="Regression status breakdown">'+
+    '<circle cx="21" cy="21" r="'+R+'" fill="none" class="sv-donut-track" stroke-width="5.2"></circle>'+circles+'</svg>';
+  var rows = STATS_STATUS.map(function(s){
+    var n = c[s.field]||0;
+    return '<li class="'+(n?"":"is-zero")+'"><span class="sv-key sv-'+s.cls+'" aria-hidden="true"></span><span class="sv-glyph sv-g-'+s.cls+'" aria-hidden="true">'+s.glyph+'</span>'+
+      '<span class="sv-lg-name">'+esc(s.label)+'</span><span class="sv-lg-n">'+n+'</span><span class="sv-lg-p">'+statsPct(n,total)+'%</span></li>';
+  }).join("");
+  return '<div class="sv-reg"><div class="sv-donut-wrap">'+svg+'<div class="sv-donut-mid"><b>'+total+'</b><span>'+pluralize(total,"module")+'</span></div></div>'+
+    '<ul class="sv-lg-list">'+rows+'</ul></div>';
+}
+function statsMemberActivityHtml(st){
+  var ids = statsOrderedIds(st.byMember).filter(function(id){ return id!=="" && !statsRowIsEmpty(st.byMember[id]); });
+  Object.keys(st.activity).forEach(function(id){
+    var a = st.activity[id];
+    if(id && (a.statusChanges||a.changedByOthers) && ids.indexOf(id)<0) ids.push(id);
+  });
+  ids = ids.sort(function(a,b){ return statsMemberLabel(a).localeCompare(statsMemberLabel(b)); });
+  if(!ids.length) return statsEmptyHtml();
+  var maxWork = 0, maxAct = 0;
+  ids.forEach(function(id){
+    var r = st.byMember[id]; if(r && r.regression>maxWork) maxWork = r.regression;
+    var a = st.activity[id]; if(a && (a.statusChanges+a.changedByOthers)>maxAct) maxAct = a.statusChanges+a.changedByOthers;
+  });
+  var rows = ids.map(function(id){
+    var r = st.byMember[id] || statsEmptyRow();
+    var a = st.activity[id] || {assigned:0, statusChanges:0, changedByOthers:0};
+    var name = statsMemberLabel(id);
+    var m = state.team && state.team[id];
+    var avatar = m && m.photo ? '<img src="'+escAttr(m.photo)+'" alt="">' : esc(initials(name));
+    var actTotal = a.statusChanges+a.changedByOthers;
+    var work = r.regression
+      ? '<div class="sv-m-bar" data-tip="'+escAttr(name+"\n"+r.regression+" regression "+pluralize(r.regression,"module")+"\n"+statsBreakdownText(r))+'" tabindex="0">'+statsStackBar(r, maxWork ? r.regression/maxWork*100 : 0)+'</div><span class="sv-m-val">'+r.regression+'</span>'
+      : '<span class="sv-m-none">No regression assigned</span>';
+    var act = actTotal
+      ? '<div class="sv-m-bar" data-tip="'+escAttr(name+"\n"+a.statusChanges+" own status "+pluralize(a.statusChanges,"change")+"\n"+a.changedByOthers+" changed by others")+'" tabindex="0"><div class="sv-track"><div class="sv-bar" style="width:'+Math.max(2, actTotal/maxAct*100)+'%">'+
+          (a.statusChanges?'<span class="sv-seg sv-own" style="flex-grow:'+a.statusChanges+'"></span>':'')+(a.changedByOthers?'<span class="sv-seg sv-others" style="flex-grow:'+a.changedByOthers+'"></span>':'')+
+        '</div></div></div><span class="sv-m-val">'+actTotal+'</span>'
+      : '<span class="sv-m-none">No status changes</span>';
+    var tix = r.tickets ? r.tickets+' '+pluralize(r.tickets,"ticket")+(r.blocked?' <span class="sv-chip sv-chip-block">'+r.blocked+' blocked</span>':'') : '<span class="sv-m-none">No tickets</span>';
+    return '<div class="sv-member"><div class="sv-m-name"><span class="sv-avatar">'+avatar+'</span><span class="sv-m-label">'+esc(name)+'</span></div>'+
+      '<div class="sv-m-cell" data-label="Assigned regression">'+work+'</div>'+
+      '<div class="sv-m-cell" data-label="Status changes">'+act+'</div>'+
+      '<div class="sv-m-cell sv-m-tix" data-label="Tickets">'+tix+'</div></div>';
+  }).join("");
+  var legend = statsLegendHtml(STATS_STATUS)+
+    '<ul class="sv-legend sv-legend-act"><li><span class="sv-key sv-own" aria-hidden="true"></span>Own status changes</li><li><span class="sv-key sv-others" aria-hidden="true"></span>Changed by others</li></ul>';
+  return '<div class="sv-members"><div class="sv-member sv-member-head" aria-hidden="true"><span>QA member</span><span>Assigned regression by status</span><span>Status changes in period</span><span>Tickets</span></div>'+rows+'</div>'+
+    '<div class="sv-legends">'+legend+'</div>';
+}
+function statsReleaseOverviewHtml(st){
+  var ids = (state.releaseOrder||[]).filter(function(id){ return st.byRelease[id] && !statsRowIsEmpty(st.byRelease[id]); });
+  if(!ids.length) return statsEmptyHtml();
+  var rows = ids.map(function(id){
+    var r = st.byRelease[id];
+    var testable = r.regression-r.skipped, done = r.passed+r.warning+r.failed;
+    var bar = r.regression
+      ? '<div class="sv-m-bar" data-tip="'+escAttr(releaseLabel(state.releases[id])+"\n"+r.regression+" regression "+pluralize(r.regression,"module")+"\n"+statsBreakdownText(r))+'" tabindex="0">'+statsStackBar(r, 100)+'</div>'
+      : '<span class="sv-m-none">No regression assigned</span>';
+    var prog = r.regression ? (testable ? done+' of '+testable+' tested · '+statsPct(done,testable)+'%' : 'Nothing to test') : '';
+    return '<div class="sv-rel"><div class="sv-rel-name">'+esc(releaseLabel(state.releases[id]))+'</div>'+
+      '<div class="sv-rel-bar">'+bar+'<div class="sv-rel-prog">'+prog+'</div></div>'+
+      '<div class="sv-rel-meta"><span>'+r.tickets+' '+pluralize(r.tickets,"ticket")+'</span>'+(r.blocked?'<span class="sv-chip sv-chip-block">'+r.blocked+' blocked</span>':'')+'</div></div>';
+  }).join("");
+  return '<div class="sv-rels">'+rows+'</div>'+statsLegendHtml(STATS_STATUS);
+}
+function statsRecentHtml(st){
+  if(!st.recent.length) return statsEmptyHtml();
+  return '<ol class="sv-timeline">'+st.recent.map(function(ev){
+    var e = ev.entry, m = e.meta||{}, s = statsStatusMeta(ev.status);
+    var rel = state.releases[m.releaseId];
+    var actor = auditActorName(e);
+    var owner = memberNameById(ev.owner);
+    var who = ev.byOther ? '<b>'+esc(actor)+'</b> changed '+esc(owner)+'’s regression' : '<b>'+esc(actor)+'</b> updated their regression';
+    return '<li class="sv-tl-item"><span class="sv-tl-dot sv-g-'+(s?s.cls:"none")+'" aria-hidden="true">'+(s?s.glyph:"•")+'</span>'+
+      '<div class="sv-tl-body"><div class="sv-tl-text">'+who+(s?' <span class="sv-pill sv-p-'+s.cls+'">'+s.glyph+' '+esc(s.label)+'</span>':'')+'</div>'+
+      '<div class="sv-tl-sub">'+esc(e.details||"")+(rel?' · '+esc(releaseLabel(rel)):'')+'</div></div>'+
+      '<time class="sv-tl-time" datetime="'+escAttr(e.createdAt||"")+'" title="'+escAttr(fmtDateTime(e.createdAt)||"")+'">'+esc(fmtRelativeTime(e.createdAt)||"")+'</time></li>';
+  }).join("")+'</ol>';
+}
+function statsTablesHtml(st){
+  var H = ["Tickets","Regression","Passed","Warning","Failed","Not Tested","Skipped","Blocked"];
+  function cells(r){ return statsNumCell(r.tickets)+statsNumCell(r.regression)+statsNumCell(r.passed)+statsNumCell(r.warning)+statsNumCell(r.failed)+statsNumCell(r.notTested)+statsNumCell(r.skipped)+statsNumCell(r.blocked); }
+  var memberRows = statsOrderedIds(st.byMember).map(function(id){
+    var r = st.byMember[id]; if(statsRowIsEmpty(r)) return "";
+    return '<tr><td>'+esc(statsMemberLabel(id))+'</td>'+cells(r)+'</tr>';
+  }).join("");
+  var releaseRows = (state.releaseOrder||[]).filter(function(id){ return st.byRelease[id] && !statsRowIsEmpty(st.byRelease[id]); }).map(function(id){
+    return '<tr><td>'+esc(releaseLabel(state.releases[id]))+'</td>'+cells(st.byRelease[id])+'</tr>';
+  }).join("");
+  var actRows = statsOrderedIds(st.activity).filter(function(id){ return id!==""; }).map(function(id){
+    var a = st.activity[id]; if(!a.assigned && !a.statusChanges && !a.changedByOthers) return "";
+    return '<tr><td>'+esc(memberNameById(id))+'</td>'+statsNumCell(a.assigned)+statsNumCell(a.statusChanges)+statsNumCell(a.changedByOthers)+'</tr>';
+  }).join("");
+  return '<details class="sv-tables"><summary>View the numbers as tables</summary>'+
+    '<h3>By QA member</h3>'+statsTable(["QA Member"].concat(H), memberRows)+
+    '<h3>By release</h3>'+statsTable(["Release"].concat(H), releaseRows)+
+    '<h3>Assignment vs. activity</h3>'+statsTable(["QA Member","Assigned","Status Changes","Changed By Others"], actRows)+
+    '<p class="stats-note">Assigned = regression modules currently assigned · Status Changes = changes the member made to their own assigned regression · Changed By Others = changes to the member’s assigned regression made by someone else (counted for the assignee only, not as the other person’s status change).</p>'+
+  '</details>';
+}
 function renderStatistics(){
-  if(!state.teamReady) return '<div class="list-head"><div><h1>Statistics</h1></div></div><div class="empty-state"><h3>Loading…</h3></div>';
+  if(!state.teamReady) return '<div class="list-head"><div><h1>QA Statistics</h1></div></div><div class="empty-state"><h3>Loading…</h3></div>';
   if(!canViewStatistics()) return renderStatisticsNoAccess();
-  var head = '<div class="list-head"><div><h1>Statistics</h1><p>Workload and QA activity of the QA team across releases — for visibility only, not a performance measure.</p></div></div>';
+  var head = '<div class="list-head sv-head"><div><h1>QA Statistics</h1><p>QA activity and release readiness insights.</p></div></div>';
   if(!state.listReady || !state.auditReady) return head+'<div class="empty-state"><h3>Loading statistics…</h3></div>';
   var f = state.statsFilters || (state.statsFilters = statsDefaultFilters());
   var st = computeStatistics(f);
   var filtersHtml = statsFiltersHtml(f);
   if(!st.hasData){
-    return head+filtersHtml+'<div class="stats-empty">No data available for the selected filters.</div>';
+    return head+filtersHtml+'<div class="sv-panel">'+statsEmptyHtml()+'</div>';
   }
   var c = st.cards;
-  function card(n, label){ return '<div class="stats-card"><div class="num">'+n+'</div><div class="label">'+esc(label)+'</div></div>'; }
-  var cardsHtml = '<div class="stats-cards">'+
-    card(c.ticketsAssigned,"Tickets Assigned")+card(c.regressionAssigned,"Regression Assigned")+card(c.completed,"Completed Work")+
-    card(c.passed,"Passed Regression")+card(c.failed,"Failed Regression")+card(c.notTested,"Not Tested Regression")+card(c.skipped,"Skipped Regression")+card(c.blocked,"Blocked Items")+'</div>';
-
-  var memberRows = statsOrderedIds(st.byMember).map(function(id){
-    var r = st.byMember[id]; if(statsRowIsEmpty(r)) return "";
-    return '<tr><td>'+esc(statsMemberLabel(id))+'</td>'+statsNumCell(r.tickets)+statsNumCell(r.regression)+statsNumCell(r.passed)+statsNumCell(r.failed)+statsNumCell(r.notTested)+statsNumCell(r.skipped)+statsNumCell(r.blocked)+'</tr>';
-  }).join("");
-  var releaseRows = (state.releaseOrder||[]).filter(function(id){ return st.byRelease[id] && !statsRowIsEmpty(st.byRelease[id]); }).map(function(id){
-    var r = st.byRelease[id];
-    return '<tr><td>'+esc(releaseLabel(state.releases[id]))+'</td>'+statsNumCell(r.tickets)+statsNumCell(r.regression)+statsNumCell(r.passed)+statsNumCell(r.failed)+statsNumCell(r.notTested)+statsNumCell(r.skipped)+statsNumCell(r.blocked)+'</tr>';
-  }).join("");
-  var actIds = statsOrderedIds(st.activity).filter(function(id){ return id!==""; });
-  var actRows = actIds.map(function(id){
-    var a = st.activity[id]; if(!a.assigned && !a.statusChanges && !a.changedByOthers) return "";
-    return '<tr><td>'+esc(memberNameById(id))+'</td>'+statsNumCell(a.assigned)+statsNumCell(a.statusChanges)+statsNumCell(a.changedByOthers)+'</tr>';
-  }).join("");
-
-  return head+filtersHtml+cardsHtml+
-    '<div class="stats-section"><h2>By QA member</h2>'+statsTable(["QA Member","Tickets","Regression","Passed","Failed","Not Tested","Skipped","Blocked"], memberRows)+'</div>'+
-    '<div class="stats-section"><h2>By release</h2>'+statsTable(["Release","Tickets","Regression","Passed","Failed","Not Tested","Skipped","Blocked"], releaseRows)+'</div>'+
-    '<div class="stats-section"><h2>Assignment vs. activity</h2>'+statsTable(["QA Member","Assigned","Status Changes","Changed By Others"], actRows)+
-      '<p class="stats-note">Assigned = regression modules currently assigned · Status Changes = changes the member made to their own assigned regression · Changed By Others = changes to the member’s assigned regression made by someone else (counted for the assignee only, not as the other person’s status change). This is for QA workflow visibility only — not a measure of anyone’s performance.</p></div>'+
-    '<p class="stats-note">Items assigned before assignment dates were recorded have no date, so they appear under “All time” only. Only QA team members (Know the Team members available for regression assignment) are included — unassigned work, other assignees and release-level blockers are not.</p>';
+  var tlSub = st.timeline ? "Regression status changes by "+(st.timeline.unit==="day"?"day":(st.timeline.unit==="week"?"week":"month"))+", split by the status they were changed to." : "Regression status changes over time.";
+  return head+filtersHtml+statsKpiHtml(c, st)+
+    '<div class="sv-grid2">'+
+      statsSection("QA Activity Overview", tlSub, statsActivityChartHtml(st.timeline), "sv-wide")+
+      statsSection("Regression Overview", "Where assigned regression stands right now.", statsRegressionOverviewHtml(c))+
+    '</div>'+
+    statsSection("QA Member Activity", "Assigned regression next to the status changes recorded in the period. Listed alphabetically — a view of workload, not of performance.", statsMemberActivityHtml(st))+
+    statsSection("Release Overview", "Regression status mix and tickets for each release.", statsReleaseOverviewHtml(st))+
+    statsSection("Recent QA Activity", "The latest regression status changes from the Audit Log.", statsRecentHtml(st))+
+    statsTablesHtml(st)+
+    '<p class="stats-note">Items assigned before assignment dates were recorded have no date, so they appear under “All time” only. Only QA team members (Know the Team members available for regression assignment) are included — unassigned work, other assignees and release-level blockers are not. Completed = regression modules with a Passed, Warning or Failed result, out of those not skipped. For QA visibility only — not a measure of anyone’s performance.</p>';
 }
+
+// Hover / focus tooltip for chart marks (`data-tip`; newlines allowed). One
+// shared element, filled with textContent — never HTML.
+function statsTipEl(){
+  var el = document.getElementById("stats-tip");
+  if(!el){
+    el = document.createElement("div");
+    el.id = "stats-tip"; el.className = "sv-tip"; el.setAttribute("role","tooltip"); el.hidden = true;
+    document.body.appendChild(el);
+  }
+  return el;
+}
+function statsTipHide(){ var el = document.getElementById("stats-tip"); if(el) el.hidden = true; }
+function statsTipShow(target, x, y){
+  var txt = target.getAttribute("data-tip"); if(!txt){ statsTipHide(); return; }
+  var el = statsTipEl();
+  el.textContent = txt; el.hidden = false;
+  var w = el.offsetWidth||0, h = el.offsetHeight||0;
+  var vw = window.innerWidth||1024, vh = window.innerHeight||768;
+  var left = Math.min(Math.max(8, x+12), Math.max(8, vw-w-8));
+  var top = y+16+h>vh ? Math.max(8, y-h-12) : y+16;
+  el.style.left = left+"px"; el.style.top = top+"px";
+}
+function statsTipTarget(e){ return e && e.target && e.target.closest ? e.target.closest("[data-tip]") : null; }
+document.addEventListener("pointerover", function(e){ var t = statsTipTarget(e); if(t) statsTipShow(t, e.clientX, e.clientY); else statsTipHide(); });
+document.addEventListener("pointermove", function(e){ var t = statsTipTarget(e); if(t) statsTipShow(t, e.clientX, e.clientY); });
+document.addEventListener("focusin", function(e){
+  var t = statsTipTarget(e); if(!t){ statsTipHide(); return; }
+  var r = t.getBoundingClientRect ? t.getBoundingClientRect() : {left:0, top:0, height:0};
+  statsTipShow(t, r.left, r.top+(r.height||0)-16);
+});
+document.addEventListener("focusout", statsTipHide);
 
 /* ============================================================
    KNOW THE TEAM
