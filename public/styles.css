@@ -108,6 +108,7 @@ a{color:inherit;}
 /* ================= TOPBAR IDENTITY ================= */
 .topbar-right{display:flex;align-items:center;gap:8px;flex-shrink:0;margin-left:auto;}
 .topbar-user{display:flex;align-items:center;gap:6px;}
+.theme-toggle{padding:7px 9px;display:inline-flex;align-items:center;justify-content:center;line-height:1;}
 .user-badge{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:700;color:var(--ink-soft);background:var(--surface-alt);border:1px solid var(--border);border-radius:100px;padding:6px 12px 6px 10px;white-space:nowrap;}
 .user-badge svg{width:12px;height:12px;}
 .user-avatar{width:16px;height:16px;border-radius:50%;object-fit:cover;flex-shrink:0;}

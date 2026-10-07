@@ -7,6 +7,11 @@
 <link rel="icon" type="image/png" href="/logo.png">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;700;800&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap">
 <link rel="stylesheet" href="/styles.css">
+<script>
+/* Apply the saved light/dark choice before first paint (no flash). No saved
+   choice = follow the system setting, exactly as before. */
+try{ var t = localStorage.getItem("greenlight-theme"); if(t==="light"||t==="dark") document.documentElement.setAttribute("data-theme", t); }catch(e){}
+</script>
 </head>
 <body>
 <div class="topbar">
@@ -22,6 +27,7 @@
       </div>
     </div>
     <div class="topbar-right">
+      <button type="button" class="btn btn-ghost btn-sm theme-toggle" id="theme-toggle" aria-label="Switch to dark mode" title="Switch to dark mode"></button>
       <div class="topbar-user" id="topbar-user"></div>
     </div>
   </div>

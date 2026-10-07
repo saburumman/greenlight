@@ -5718,6 +5718,51 @@ function initAuthThenBoot(){
       '</div>';
   });
 }
+/* ============================================================
+   LIGHT / DARK SWITCH
+   The stylesheet already themes itself from the system setting and from a
+   [data-theme] attribute on <html>. The top-bar button flips between the two
+   and remembers the choice in this browser (index.html applies it before
+   first paint). Until it's clicked, the system setting still decides.
+   ============================================================ */
+function currentTheme(){
+  var root = document.documentElement;
+  var t = root && root.getAttribute ? root.getAttribute("data-theme") : null;
+  if(t==="light" || t==="dark") return t;
+  return (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light";
+}
+function themeToggleIcon(theme){
+  // shows what you'll switch TO: a moon in light mode, a sun in dark mode
+  var attrs = 'width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+  return theme==="dark"
+    ? '<svg '+attrs+'><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></svg>'
+    : '<svg '+attrs+'><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path></svg>';
+}
+function renderThemeToggle(){
+  var btn = document.getElementById("theme-toggle"); if(!btn) return;
+  var cur = currentTheme();
+  var label = cur==="dark" ? "Switch to light mode" : "Switch to dark mode";
+  btn.innerHTML = themeToggleIcon(cur);
+  btn.setAttribute("aria-label", label); btn.setAttribute("title", label);
+}
+function setTheme(theme){
+  if(document.documentElement) document.documentElement.setAttribute("data-theme", theme);
+  try{ localStorage.setItem("greenlight-theme", theme); }catch(e){}
+  renderThemeToggle();
+}
+(function initThemeToggle(){
+  var btn = document.getElementById("theme-toggle"); if(!btn) return;
+  renderThemeToggle();
+  if(!btn.addEventListener) return;
+  btn.addEventListener("click", function(){ setTheme(currentTheme()==="dark" ? "light" : "dark"); });
+  // while no explicit choice is saved, follow system changes
+  if(window.matchMedia){
+    var mq = window.matchMedia("(prefers-color-scheme: dark)");
+    var onChange = function(){ if(!document.documentElement || !document.documentElement.getAttribute("data-theme")) renderThemeToggle(); };
+    if(mq.addEventListener) mq.addEventListener("change", onChange);
+  }
+})();
+
 initAuthThenBoot();
 
 })();
