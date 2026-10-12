@@ -886,13 +886,10 @@ a{color:inherit;}
 .stats-note{font-size:12px;color:var(--ink-faint);margin:8px 2px 0;line-height:1.5;}
 .stats-empty{padding:18px;color:var(--ink-soft);font-size:13px;text-align:center;border:1px dashed var(--border-strong);border-radius:12px;}
 
-/* ================= KNOW THE TEAM — access block ================= */
-.team-access{margin-top:12px;padding-top:10px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:6px;}
-.team-access-title{font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;color:var(--ink-faint);}
+/* ================= KNOW THE TEAM — page access (inside the Add / Edit form only) ================= */
+.team-access-field{border-top:1px solid var(--border);padding-top:12px;gap:8px;}
 .team-access-row{display:flex;align-items:center;gap:8px;font-size:13px;}
 .team-access-name{flex:1;color:var(--ink);font-weight:500;}
-.team-access-state{font-size:11px;font-weight:700;letter-spacing:.04em;padding:1px 8px;border-radius:99px;border:1px solid var(--neutral-border);background:var(--neutral-bg);color:var(--neutral-fg);}
-.team-access-state.is-on{background:var(--go-bg);color:var(--go-fg);border-color:var(--go-border);}
 .switch.is-locked .switch-track,.switch input:disabled + .switch-track{opacity:.45;cursor:not-allowed;}
 
 /* ================= REPORTING (page shell) ================= */

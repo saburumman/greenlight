@@ -10,7 +10,7 @@ const db = require("../db");
 const { asyncHandler } = require("../asyncHandler");
 const { resolveActor } = require("../assignmentLogic");
 const { buildEntry } = require("../auditWriter");
-const { hasPageAccess } = require("../pageAccess");
+const { hasPageAccess, memberForUser, memberHasAccess, holdsAnyAccess } = require("../pageAccess");
 
 const router = express.Router();
 
@@ -88,16 +88,34 @@ const SERVER_ONLY_ACTIONS = new Set([
   "REPORT_EXPORTED",
 ]);
 
-// GET /api/audit — every audit record, newest first.
+// Who changed whose access to a restricted page, and Reporting sync/settings
+// activity, is only for the people who hold that access — the rest of the team
+// doesn't see these events (or even that they exist).
+const ACCESS_CHANGE_ACTIONS = new Set([
+  "STATISTICS_ACCESS_GRANTED", "STATISTICS_ACCESS_REVOKED",
+  "REPORTING_ACCESS_GRANTED", "REPORTING_ACCESS_REVOKED",
+]);
+const REPORTING_ACTIONS = new Set(["REPORT_SYNC_RUN", "REPORT_SETTINGS_UPDATED", "REPORT_EXPORTED"]);
+
+// GET /api/audit — audit records visible to the caller, newest first.
 // The structured `meta` (who changed whose regression, previous/new status…)
 // is the raw material of the Statistics page, so it is only returned to people
 // with Statistics access; everyone else gets the plain entries.
 router.get("/", asyncHandler(async (req, res) => {
-  const list = await db.auditLog.list();
+  const all = await db.auditLog.list();
   const team = await db.team.list();
+  const me = memberForUser(req.authUser, team);
+  const holdsAny = holdsAnyAccess(me);
+  const holdsReporting = memberHasAccess(me, "reporting");
+  const list = all.filter((e) => {
+    if (!e) return false;
+    if (ACCESS_CHANGE_ACTIONS.has(e.action)) return holdsAny;
+    if (REPORTING_ACTIONS.has(e.action)) return holdsReporting;
+    return true;
+  });
   if (hasPageAccess(req.authUser, team, "statistics")) return res.json(list);
   res.json(list.map((e) => {
-    if (!e || !e.meta) return e;
+    if (!e.meta) return e;
     const { meta, ...rest } = e;
     return rest;
   }));

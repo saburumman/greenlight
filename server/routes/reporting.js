@@ -118,7 +118,7 @@ router.get("/sync/status", needPostgres, asyncHandler(async (req, res) => {
     lastRun: runView(runs[0]),
     runs: runs.map(runView),
     counts,
-    scopeSet: !!String((settings.scope && settings.scope.jql) || "").trim(),
+    scopeLimited: !!String((settings.scope && settings.scope.jql) || "").trim(),
     lastSyncedAt: (settings.state && settings.state.lastSyncedAt) || null,
     auto: publicSettings(settings).auto,
   });

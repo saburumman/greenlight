@@ -89,8 +89,26 @@ function validateAndClean(body) {
   return { clean };
 }
 
+// Who has which restricted page is not for the whole team to see: people who
+// hold any restricted-page access get the flags (they manage them); everyone
+// else gets them stripped from other people's cards — only their own card
+// keeps its flags, because the page uses that to decide what to show them.
+function redactAccess(member, viewer, team) {
+  if (!member) return member;
+  if (access.holdsAnyAccess(viewer)) return member;
+  if (viewer && viewer.id === member.id) return member;
+  const out = { ...member };
+  for (const p of Object.keys(access.RESTRICTED_PAGES)) delete out[access.RESTRICTED_PAGES[p].field];
+  return out;
+}
+async function viewerOf(req) {
+  const team = await db.team.list();
+  return { team, viewer: access.memberForUser(req.authUser, team) };
+}
+
 router.get("/", asyncHandler(async (req, res) => {
-  res.json(await db.team.list());
+  const { team, viewer } = await viewerOf(req);
+  res.json(team.map((m) => redactAccess(m, viewer, team)));
 }));
 
 router.post("/", asyncHandler(async (req, res) => {
@@ -109,13 +127,15 @@ router.post("/", asyncHandler(async (req, res) => {
     updatedAt: now,
   };
   await db.team.set(id, member);
-  res.status(201).json(member);
+  const v1 = await viewerOf(req);
+  res.status(201).json(redactAccess(member, v1.viewer, v1.team));
 }));
 
 router.get("/:id", asyncHandler(async (req, res) => {
   const m = await db.team.get(req.params.id);
   if (!m) return notFound(res);
-  res.json(m);
+  const v2 = await viewerOf(req);
+  res.json(redactAccess(m, v2.viewer, v2.team));
 }));
 
 // Links (or unlinks) the CALLING user's own signed-in account to a Know the
@@ -175,7 +195,7 @@ router.put("/:id/link-me", asyncHandler(async (req, res) => {
   if (linked && heldBy !== email) events.push({ action: "TEAM_MEMBER_LINKED", entityType: "TeamMember", entityId: existing.id, details: "Sign-in linked to " + (existing.name || "a team member") });
   if (!linked && heldBy) events.push({ action: "TEAM_MEMBER_UNLINKED", entityType: "TeamMember", entityId: existing.id, details: "Sign-in link removed from " + (existing.name || "a team member") });
   if (events.length) await recordEvents(db, actor, events);
-  res.json(updated);
+  res.json(redactAccess(updated, access.memberForUser(req.authUser, all), all));
 }));
 
 // Switch one restricted page on/off for one person. Dedicated endpoint (not
@@ -226,7 +246,8 @@ router.put("/:id", asyncHandler(async (req, res) => {
     updatedAt: new Date().toISOString(),
   };
   await db.team.set(existing.id, merged);
-  res.json(merged);
+  const v3 = await viewerOf(req);
+  res.json(redactAccess(merged, v3.viewer, v3.team));
 }));
 
 router.delete("/:id", asyncHandler(async (req, res) => {

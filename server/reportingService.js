@@ -138,7 +138,6 @@ async function preflight() {
   await ready();
   const s = getStore();
   const settings = await s.getSettings();
-  if (!String((settings.scope && settings.scope.jql) || "").trim()) throw new SyncError("Set the sync scope (a JQL filter) in Reporting settings first.", "NO_SCOPE");
   await s.markStaleRuns(30 * 60 * 1000);
   if (current || (await s.getRunning())) throw new SyncError("A sync is already running.", "BUSY");
   return settings;
@@ -151,7 +150,7 @@ async function schedulerTick(nowMs, audit) {
   const s = getStore();
   const settings = await s.getSettings();
   const a = settings.auto || {};
-  if (!a.enabled || !a.accountId || !(settings.scope && settings.scope.jql)) return "off";
+  if (!a.enabled || !a.accountId) return "off";
   if (current) return "busy";
   const last = (await s.listRuns(1))[0];
   if (last && last.status === "running") return "busy";

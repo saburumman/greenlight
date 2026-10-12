@@ -2,7 +2,8 @@
 // Read-only against Jira. Dependencies (store, http) are injected so the whole
 // flow can be tested without Jira or a network.
 //
-//  full         every issue the scope JQL returns; afterwards anything the
+//  full         every issue the scope JQL returns (no scope = every issue the
+//               signed-in user can read); afterwards anything the
 //               scope no longer returns is removed.
 //  incremental  only issues updated since the last good sync (with a safety
 //               overlap); each re-fetched issue gets its worklogs and status
@@ -29,6 +30,11 @@ const BASE_FIELDS = [
   "fixVersions", "created", "duedate", "resolutiondate", "timeoriginalestimate", "timeestimate", "timespent",
   "worklog", "project",
 ];
+
+// With no scope set the sync covers every issue the signed-in user can read.
+// Jira's search refuses a query with no restriction at all, so this harmless
+// always-true date clause stands in for "everything".
+const ALL_ISSUES_JQL = 'created >= "1990-01-01"';
 
 function stripOrderBy(jql) { return String(jql || "").replace(/\s+order\s+by\s+[\s\S]*$/i, "").trim(); }
 
@@ -72,8 +78,7 @@ async function runSync(deps, opts) {
   const requested = (opts && opts.mode) === "full" ? "full" : "incremental";
 
   const settings = await store.getSettings();
-  const scope = String((settings.scope && settings.scope.jql) || "").trim();
-  if (!scope) throw new SyncError("Set the sync scope (a JQL filter) in Reporting settings first.", "NO_SCOPE");
+  const scope = stripOrderBy(String((settings.scope && settings.scope.jql) || "")) || ALL_ISSUES_JQL;
 
   await store.markStaleRuns(STALE_RUN_MS);
   if (await store.getRunning()) throw new SyncError("A sync is already running.", "BUSY");
@@ -152,4 +157,4 @@ async function runSync(deps, opts) {
   }
 }
 
-module.exports = { runSync, SyncError, buildJql, stripOrderBy, jqlTimestamp, resolveFieldIds, BASE_FIELDS };
+module.exports = { runSync, SyncError, ALL_ISSUES_JQL, buildJql, stripOrderBy, jqlTimestamp, resolveFieldIds, BASE_FIELDS };

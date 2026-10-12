@@ -1915,8 +1915,8 @@ function rpStatusHtml(){
     title = "Sync in progress…";
     sub = "Started "+fmtAmman(cur.startedAt)+" · "+(cur.issues||0)+" issues and "+(cur.worklogs||0)+" worklogs so far.";
   } else if(!st.lastSyncedAt){
-    title = st.scopeSet ? "Not synced yet" : "Sync not set up yet";
-    sub = st.scopeSet ? "Press “Sync now” to pull the first copy of your Jira data." : "Choose which Jira issues to include (the scope below), save it, then run the first sync.";
+    title = "Not synced yet";
+    sub = "Press “Sync now” to pull the first copy of your Jira data"+(st.scopeLimited ? " (limited by the filter below)." : " — every issue your Jira account can see.");
     if(st.lastRun && st.lastRun.status==="failed"){ tone = "is-bad"; title = "The last sync failed"; sub = st.lastRun.error || ""; }
   } else if(st.lastRun && st.lastRun.status==="failed"){
     tone = "is-bad"; title = "The last sync failed";
@@ -1930,8 +1930,8 @@ function rpStatusHtml(){
   var busy = st.running || state.rp.starting;
   return '<div class="rp-status '+tone+'"><span class="rp-dot" aria-hidden="true"></span><div class="rp-status-main"><div class="rp-status-title">'+esc(title)+'</div><div class="rp-status-sub">'+esc(sub)+'</div><div class="rp-status-sub">'+autoTxt+'</div></div></div>'+
     '<div class="rp-actions">'+
-      '<button class="btn btn-primary" data-action="rp-sync" data-mode="incremental"'+(busy||!st.scopeSet?" disabled":"")+'>Sync now</button>'+
-      '<button class="btn" data-action="rp-sync" data-mode="full"'+(busy||!st.scopeSet?" disabled":"")+' title="Re-reads every issue in scope and removes ones that no longer match. Takes longer.">Full resync</button>'+
+      '<button class="btn btn-primary" data-action="rp-sync" data-mode="incremental"'+(busy?" disabled":"")+'>Sync now</button>'+
+      '<button class="btn" data-action="rp-sync" data-mode="full"'+(busy?" disabled":"")+' title="Re-reads every issue in scope and removes ones that no longer match. Takes longer.">Full resync</button>'+
       '<span class="helper-text">“Sync now” only fetches what changed since the last sync. Jira is only ever read, never changed.</span>'+
     '</div>';
 }
@@ -1969,9 +1969,9 @@ function rpSettingsHtml(){
   var au = se.auto || {};
   var mp = se.mappings || {};
   return '<form id="rp-settings-form" class="rp-form" autocomplete="off">'+
-    '<div class="field"><label for="rp-jql">Which Jira issues to include</label>'+
-      '<textarea id="rp-jql" rows="3" maxlength="2000" placeholder="e.g. project in (PAY, WLT) AND updated >= -365d">'+esc((se.scope&&se.scope.jql)||"")+'</textarea>'+
-      '<span class="hint">A Jira search (JQL). Only issues this search returns are copied into Reporting. Sorting is ignored.</span></div>'+
+    '<div class="field"><label for="rp-jql">Limit to these Jira issues <span class="hint">(optional)</span></label>'+
+      '<textarea id="rp-jql" rows="3" maxlength="2000" placeholder="Empty = every issue your Jira account can see. Or e.g. project in (PAY, WLT)">'+esc((se.scope&&se.scope.jql)||"")+'</textarea>'+
+      '<span class="hint">Leave empty to include everything you can see in Jira. To narrow it, enter a Jira search (JQL) — only issues it returns are copied. Sorting is ignored.</span></div>'+
     '<div class="field"><label for="rp-blocked">Statuses that mean “blocked”</label><input type="text" id="rp-blocked" maxlength="400" value="'+escAttr((se.blockedStatuses||[]).join(", "))+'">'+
       '<span class="hint">Comma-separated. Time spent in these statuses (and while flagged as an impediment) counts as blocked time.</span></div>'+
     '<div class="rp-maps">'+
@@ -2356,20 +2356,24 @@ function allTeamMembers(){
   return state.teamOrder.map(function(id){ return state.team[id]; }).filter(Boolean);
 }
 var TEAM_UNASSIGNED_DEPARTMENT = "Unassigned";
-// The "Access" block on a card: one switch per restricted page, saved the
-// moment it's flipped (PUT /api/team/:id/access/:page). The state is written
-// out as ON/OFF too (not colour alone); a switch you aren't allowed to change
-// is disabled and says why in its tooltip.
-function teamAccessHtml(m){
-  if(!(state.auth && state.auth.authenticated)) return "";
-  return '<div class="team-access" role="group" aria-label="Access for '+escAttr(m.name)+'"><div class="team-access-title">Access</div>'+
-    ACCESS_PAGES.map(function(ap){
-      var on = m[ap.field]===true;
-      var why = accessChangeBlockedReason(m, ap, !on);
-      var tip = why || ((on?"Turn off ":"Turn on ")+ap.label+" access for "+m.name);
+// Access to Statistics / Reporting is managed ONLY inside the Add / Edit team
+// member form (see teamAccessFieldHtml) and only shown to people who may change
+// it — it is deliberately not displayed on the cards.
+// Pages whose access the CURRENT user may change for `target` (a saved member,
+// or {} for a new one). Empty for everyone else, so the section simply isn't
+// there. The server re-checks every change.
+function editableAccessPages(target){
+  return ACCESS_PAGES.filter(function(ap){
+    return !accessChangeBlockedReason(target||{}, ap, !((target||{})[ap.field]===true));
+  });
+}
+function teamAccessFieldHtml(target){
+  var pages = editableAccessPages(target);
+  if(!pages.length) return "";
+  return '<div class="field team-access-field"><label>Page access <span class="hint">(only people who can manage access see this)</span></label>'+
+    pages.map(function(ap){
       return '<div class="team-access-row"><span class="team-access-name">'+esc(ap.label)+'</span>'+
-        '<span class="team-access-state '+(on?"is-on":"is-off")+'">'+(on?"ON":"OFF")+'</span>'+
-        '<label class="switch'+(why?" is-locked":"")+'" title="'+escAttr(tip)+'"><input type="checkbox" data-action="set-page-access" data-id="'+escAttr(m.id)+'" data-page="'+ap.page+'" aria-label="'+escAttr(ap.label+" access for "+m.name)+'"'+(on?" checked":"")+(why?" disabled":"")+'><span class="switch-track"></span></label></div>';
+        toggleSwitch("access-"+ap.page, (target||{})[ap.field]===true, "Let this person open the "+ap.label+" page")+'</div>';
     }).join("")+'</div>';
 }
 function teamMemberCardHtml(m){
@@ -2402,7 +2406,6 @@ function teamMemberCardHtml(m){
     '<div class="team-card-name">'+esc(m.name)+(isMe?' <span class="badge badge-me" title="Regression assigned to you shows up in your My Regression view">'+iconUser()+' You</span>':'')+(m.seeded?' <span class="badge badge-manual">Example</span>':'')+'</div>'+
     '<div class="team-card-role">'+esc(m.role||"")+(m.regression===false?' <span class="hint">· not in Regression assign list</span>':'')+''+'</div>'+
     (m.bio ? '<p class="team-card-bio">'+esc(m.bio)+'</p>' : '')+
-    teamAccessHtml(m)+
     (specialtiesHtml ? '<div class="team-card-chips">'+specialtiesHtml+'</div>' : '')+
     (toolsHtml ? '<div class="team-card-chips">'+toolsHtml+'</div>' : '')+
     (linkBits.length ? '<div class="team-card-links">'+linkBits.join("")+'</div>' : '')+
@@ -2522,7 +2525,8 @@ function openTeamMemberModal(existing){
     '<div class="field">'+
       '<span class="regression-skip-toggle">Available for regression assignment'+toggleSwitch("team-regression", draft.regression, "Show this person in the Regression section's assignment dropdowns")+'</span>'+
       '<span class="hint" style="display:block;margin-top:4px;">Off = hidden from the Regression section\'s assign lists (still visible here in Know the Team).</span>'+
-    '</div>';
+    '</div>'+
+    teamAccessFieldHtml(existing);
   var foot = (isEdit? '<button type="button" class="btn btn-danger" id="del-team-member">'+iconTrash()+' Delete</button>' : '<span></span>')+
     '<span style="flex:1"></span><button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">'+(isEdit?"Save changes":"Save")+'</button>';
 
@@ -2571,15 +2575,31 @@ function openTeamMemberModal(existing){
     };
     var submitBtn = qs('#modal-form button[type="submit"]');
     if(submitBtn) submitBtn.disabled = true;
+    var accessPages = editableAccessPages(existing);
     var req = isEdit ? api.updateTeamMember(existing.id, payload) : api.createTeamMember(payload);
     req.then(function(saved){
       state.team[saved.id] = saved;
       if(state.teamOrder.indexOf(saved.id)===-1) state.teamOrder.unshift(saved.id);
-      closeModal();
-      renderSidenav();
-      if(state.route.view==="team") render();
-      logAudit({action: isEdit ? "TEAM_MEMBER_UPDATED" : "TEAM_MEMBER_ADDED", entityType:"TeamMember", entityId:saved.id, details:saved.name});
-      showToast(isEdit? "✓ Team member updated" : "✓ Team member added");
+      // Page access goes through its own endpoint (own rules + audit), one
+      // page at a time, only for switches that actually changed.
+      var changes = accessPages.map(function(ap){
+        var sw = qs("#toggle-access-"+ap.page);
+        return {ap:ap, want: !!(sw && sw.checked), was: !!(existing && existing[ap.field]===true)};
+      }).filter(function(c){ return c.want!==c.was; });
+      var accessError = null;
+      return changes.reduce(function(chain, c){
+        return chain.then(function(){
+          return api.setPageAccess(saved.id, c.ap.page, c.want).then(function(updated){
+            state.team[updated.id] = updated;
+          }).catch(function(err){ accessError = {label:c.ap.label, message:(err && err.message) || "not allowed"}; });
+        });
+      }, Promise.resolve()).then(function(){
+        closeModal();
+        renderSidenav();
+        if(state.route.view==="team" || state.route.view==="reporting" || state.route.view==="statistics") render();
+        logAudit({action: isEdit ? "TEAM_MEMBER_UPDATED" : "TEAM_MEMBER_ADDED", entityType:"TeamMember", entityId:saved.id, details:saved.name});
+        showToast(accessError ? "Saved, but couldn’t change "+accessError.label+" access: "+accessError.message : (isEdit? "✓ Team member updated" : "✓ Team member added"));
+      });
     }).catch(function(err){
       if(submitBtn) submitBtn.disabled = false;
       showToast(err.message || "Couldn't save team member.");
@@ -5838,22 +5858,6 @@ document.addEventListener("submit", function(e){
 
 document.addEventListener("change", function(e){
   var elp = e.target;
-  if(elp.matches && elp.matches('[data-action="set-page-access"]')){
-    var accId = elp.getAttribute("data-id"), accPage = elp.getAttribute("data-page");
-    var ap = ACCESS_PAGES.filter(function(x){ return x.page===accPage; })[0];
-    var want = !!elp.checked;
-    if(!ap || !state.team[accId]) return;
-    elp.disabled = true; // one request at a time per switch
-    api.setPageAccess(accId, accPage, want).then(function(saved){
-      state.team[saved.id] = saved;
-      renderSidenav(); render();
-      showToast("✓ "+ap.label+" access "+(want?"granted to ":"revoked from ")+saved.name);
-    }).catch(function(err){
-      showToast((err && err.message) || "Couldn’t change access.");
-      render(); // put the switch back to what the server has
-    });
-    return;
-  }
   if(elp.matches('[data-action="toggle-performance"]')){
     var r = state.releases[state.route.id]; if(!r) return;
     r.performance.enabled = elp.checked; persistRelease(r);
