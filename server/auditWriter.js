@@ -14,6 +14,7 @@ const META_KEYS = [
   "releaseId", "ticketKey", "regressionModuleId", "scope",
   "assignedTo", "previousAssignedTo", "changedBy",
   "previousStatus", "newStatus", "byOther",
+  "targetMemberId", "page",
 ];
 
 function cleanMeta(meta) {

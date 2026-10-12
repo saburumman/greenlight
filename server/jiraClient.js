@@ -255,4 +255,6 @@ function forUser(authUser) {
   };
 }
 
-module.exports = { JiraError, forUser };
+// resolveAuth is shared with the Reporting sync (reportingJira.js), which runs
+// every call under a real user's own Atlassian authorization too.
+module.exports = { JiraError, forUser, resolveAuth };

@@ -9,12 +9,16 @@ const regressionModulesRouter = require("./routes/regressionModules");
 const auditRouter = require("./routes/audit");
 const testDataRouter = require("./routes/testData");
 const teamRouter = require("./routes/team");
+const statisticsRouter = require("./routes/statistics");
+const reportingRouter = require("./routes/reporting");
 const authRouter = require("./routes/auth");
 const oauth = require("./auth/atlassianOAuth");
 const { requireAuth } = require("./auth/middleware");
 const pgPool = require("./db/pgPool");
 const db = require("./db");
 const { migrateAllReleases } = require("./migrateAssignments");
+const reportingService = require("./reportingService");
+const { recordEvents } = require("./auditWriter");
 
 // Authentication is mandatory — there is no guest fallback. Refuse to start
 // at all unless every Atlassian login variable is set, rather than silently
@@ -51,6 +55,9 @@ app.use("/api/regression-modules", regressionModulesRouter);
 app.use("/api/audit", auditRouter);
 app.use("/api/test-data", testDataRouter);
 app.use("/api/team", teamRouter);
+// Restricted areas: every route inside is guarded by pageAccess.requirePageAccess.
+app.use("/api/statistics", statisticsRouter);
+app.use("/api/reporting", reportingRouter);
 
 app.use(express.static(path.join(__dirname, "..", "public")));
 
@@ -80,6 +87,17 @@ app.listen(PORT, HOST, () => {
       .catch((e) => console.error(`  Database connection check failed (will keep retrying per-request): ${e.message}\n`));
   } else {
     console.log(`  Persistence: local JSON file (data/store.json) — set DATABASE_URL to use Postgres/Supabase instead\n`);
+  }
+  // Reporting cache (Postgres only): create its tables if missing and start
+  // the optional scheduled sync. Non-fatal for the same reason as above.
+  if (pgPool.isConfigured()) {
+    reportingService.ready().catch((e) => console.error(`  Reporting tables could not be prepared (Reporting will retry on use): ${e.message}\n`));
+    reportingService.startScheduler((actor, mode) =>
+      recordEvents(db, actor, [{
+        action: "REPORT_SYNC_RUN", entityType: "reporting", entityId: "sync",
+        details: "Scheduled Reporting sync (" + mode + ") started.", meta: { page: "reporting" },
+      }])
+    );
   }
   // Moves any name-based QA assignments (older releases) onto Know the Team
   // member ids. Idempotent; a no-op once everything is converted.

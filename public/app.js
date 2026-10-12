@@ -178,7 +178,14 @@ var api = {
   createTeamMember: function(data){ return apiCall("POST","/team", data); },
   updateTeamMember: function(id, data){ return apiCall("PUT","/team/"+id, data); },
   deleteTeamMember: function(id){ return apiCall("DELETE","/team/"+id); },
-  linkMeToTeamMember: function(id, linked){ return apiCall("PUT","/team/"+id+"/link-me", {linked: !!linked}); }
+  linkMeToTeamMember: function(id, linked){ return apiCall("PUT","/team/"+id+"/link-me", {linked: !!linked}); },
+  setPageAccess: function(id, page, enabled){ return apiCall("PUT","/team/"+id+"/access/"+page, {enabled: !!enabled}); },
+  statsActivity: function(){ return apiCall("GET","/statistics/activity"); },
+  reportingPing: function(){ return apiCall("GET","/reporting/ping"); },
+  reportingSettings: function(){ return apiCall("GET","/reporting/settings"); },
+  saveReportingSettings: function(data){ return apiCall("PUT","/reporting/settings", data); },
+  reportingSyncStatus: function(){ return apiCall("GET","/reporting/sync/status"); },
+  startReportingSync: function(mode){ return apiCall("POST","/reporting/sync", {mode: mode}); }
 };
 
 /* ============================================================
@@ -231,6 +238,12 @@ var state = {
   blockingModal: false, // true while the sign-in modal is open
   auditLog: [],
   auditReady: false,
+  statsActivity: [], // regression status-change events WITH their structured meta — from the access-guarded /api/statistics/activity
+  statsReady: false,
+  statsDenied: false, // the server said 403 (no Statistics access)
+  reportingReady: false,
+  reportingDenied: false, // the server said 403 (no Reporting access)
+  rp: {dataLayer:false, needsPostgres:false, status:null, settings:null, error:null, saving:false, starting:false, pollTimer:null},
   assessmentLoggedFor: {}, // releaseId -> true, so AI_ASSESSMENT_GENERATED logs once per viewing, not every re-render
   // ---- Test Data — a reusable QA data library, independent of any release
   // (see renderTestData() and friends) ----
@@ -1029,6 +1042,7 @@ function parseHash(){
   if(h==="releases") return {view:"list"};
   if(h==="audit") return {view:"audit"};
   if(h==="statistics") return {view:"statistics"};
+  if(h==="reporting") return {view:"reporting"};
   if(h==="test-data") return {view:"testData"};
   if(h==="team") return {view:"team"};
   var m = h.match(/^r\/([^\/]+)$/);
@@ -1075,6 +1089,35 @@ function loadAuditLog(){
     state.loadError = e.message;
   });
 }
+function loadStatsActivity(){
+  return api.statsActivity().then(function(list){
+    state.statsActivity = list; state.statsDenied = false; state.statsReady = true; state.loadError = null;
+  }).catch(function(e){
+    if(e && e.status===403){ state.statsDenied = true; state.statsReady = true; return; }
+    state.loadError = e.message;
+  });
+}
+// Opening Reporting asks the server once; a 403 (access never granted, or
+// just revoked) switches the page to its no-access state.
+function loadReportingAccess(){
+  return api.reportingPing().then(function(ping){
+    state.reportingDenied = false; state.reportingReady = true; state.loadError = null;
+    state.rp.dataLayer = !!(ping && ping.dataLayerReady);
+    state.rp.needsPostgres = !state.rp.dataLayer;
+    state.rp.error = null;
+    if(!state.rp.dataLayer) return null;
+    return Promise.all([api.reportingSyncStatus(), api.reportingSettings()]).then(function(r){
+      state.rp.status = r[0]; state.rp.settings = r[1];
+      rpSchedulePoll();
+    }).catch(function(e){
+      if(e && e.status===403){ state.reportingDenied = true; return; }
+      state.rp.error = (e && e.message) || "Couldn’t load the sync status.";
+    });
+  }).catch(function(e){
+    if(e && e.status===403){ state.reportingDenied = true; state.reportingReady = true; return; }
+    state.loadError = e.message;
+  });
+}
 function loadTestData(){
   return api.listTestData().then(function(list){
     state.testData = {};
@@ -1107,16 +1150,20 @@ function boot(){
   // when navigating to "team" — otherwise a release opened directly (or on
   // first load) sees an empty roster until the user happens to visit Know
   // the Team first. Small dataset, cheap GET — same as loadJiraStatus above.
-  var tasks = [loadJiraStatus(), loadTeam()];
+  var teamTask = loadTeam();
+  var tasks = [loadJiraStatus(), teamTask];
   if(state.route.view==="detail"){
     tasks.push(loadOne(state.route.id));
   } else if(state.route.view==="audit"){
     tasks.push(loadAuditLog());
   } else if(state.route.view==="statistics"){
-    // Statistics reads every release plus the audit log — read-only GETs, so
-    // simply viewing it never writes an audit event.
+    // Statistics reads every release plus the access-guarded activity feed
+    // (audit events with their structured data) — read-only GETs, so simply
+    // viewing it never writes an audit event. Without access, no request.
     tasks.push(loadList());
-    tasks.push(loadAuditLog());
+    tasks.push(teamTask.then(function(){ return canViewStatistics() ? loadStatsActivity() : null; }));
+  } else if(state.route.view==="reporting"){
+    tasks.push(teamTask.then(function(){ return canViewReporting() ? loadReportingAccess() : null; }));
   } else if(state.route.view==="testData"){
     tasks.push(loadTestData());
   } else if(state.route.view==="home"){
@@ -1155,6 +1202,8 @@ function render(){
     app.innerHTML = renderAuditLog();
   } else if(state.route.view==="statistics"){
     app.innerHTML = renderStatistics();
+  } else if(state.route.view==="reporting"){
+    app.innerHTML = renderReporting();
   } else if(state.route.view==="testData"){
     app.innerHTML = renderTestData();
   } else if(state.route.view==="team"){
@@ -1182,6 +1231,7 @@ var SIDENAV_ITEMS = [
   {icon:"🚀", label:"Release Monitor", action:"nav-list", match:["list","detail"]},
   {icon:"🧪", label:"Test Data", action:"nav-test-data", match:["testData"]},
   {icon:"📊", label:"Statistics", action:"nav-statistics", match:["statistics"], needs:"statistics"},
+  {icon:"📑", label:"Reporting", action:"nav-reporting", match:["reporting"], needs:"reporting"},
   {icon:"📋", label:"Audit", action:"nav-audit", match:["audit"]},
   {icon:"👥", label:"Know the Team", action:"nav-team", match:["team"]}
 ];
@@ -1193,8 +1243,32 @@ function canViewStatistics(){
   var me = currentMember();
   return !!(me && me.statisticsAccess===true);
 }
+// Same pattern for the Reporting page (its own flag, its own page, its own
+// server guard — see server/pageAccess.js).
+function canViewReporting(){
+  var me = currentMember();
+  return !!(me && me.reportingAccess===true);
+}
+var ACCESS_PAGES = [
+  {page:"statistics", field:"statisticsAccess", label:"Statistics"},
+  {page:"reporting", field:"reportingAccess", label:"Reporting"}
+];
+// Mirrors server/pageAccess.canChangePageAccess so the switch can be shown
+// disabled with a reason. The SERVER enforces it; this is only the UI.
+function accessChangeBlockedReason(target, ap, enable){
+  var me = currentMember();
+  if(!me) return "Link your sign-in to your Know the Team card first (“This is me”) to manage access.";
+  if((target[ap.field]===true)===!!enable) return "";
+  var holders = allTeamMembers().filter(function(m){ return m[ap.field]===true; });
+  if(!holders.length) return "";
+  if(me[ap.field]!==true) return "Only people who have "+ap.label+" access can change it for others.";
+  if(enable && me.id===target.id) return "You can’t give yourself "+ap.label+" access — ask someone who has it.";
+  return "";
+}
 function sidenavHtml(){
-  return SIDENAV_ITEMS.filter(function(it){ return it.needs!=="statistics" || canViewStatistics(); }).map(function(it){
+  return SIDENAV_ITEMS.filter(function(it){
+    return !it.needs || (it.needs==="statistics" && canViewStatistics()) || (it.needs==="reporting" && canViewReporting());
+  }).map(function(it){
     var active = it.match.indexOf(state.route.view) > -1;
     return '<button type="button" class="sidenav-item'+(active?" active":"")+'" data-action="'+it.action+'">'+
       '<span class="sidenav-icon">'+it.icon+'</span><span class="sidenav-label">'+esc(it.label)+'</span></button>';
@@ -1286,9 +1360,12 @@ function renderHome(){
     {icon:"🚀", title:"Release Monitor", desc:"Monitor release readiness from one place.", btn:"Open Releases →", action:"nav-list"},
     {icon:"🧪", title:"Test Data", desc:"Manage reusable QA test data, scenarios, entities and tags.", btn:"Open Test Data →", action:"nav-test-data"},
     {icon:"📊", title:"Statistics", desc:"See QA workload and activity by date, release and team member.", btn:"Open Statistics →", action:"nav-statistics"},
+    {icon:"📑", title:"Reporting", desc:"PMO delivery and variance reporting from Jira, in hours.", btn:"Open Reporting →", action:"nav-reporting"},
     {icon:"📋", title:"Audit", desc:"Track important changes and see who performed them.", btn:"View Audit →", action:"nav-audit"},
     {icon:"👥", title:"Know the Team", desc:"Meet the people behind the quality.", btn:"Meet the Team →", action:"nav-team"}
-  ].filter(function(c){ return c.action!=="nav-statistics" || canViewStatistics(); });
+  ].filter(function(c){
+    return (c.action!=="nav-statistics" || canViewStatistics()) && (c.action!=="nav-reporting" || canViewReporting());
+  });
   var cardsHtml = '<section class="home-section"><div class="feature-grid">'+
     cards.map(function(c){
       return '<div class="feature-card">'+
@@ -1423,7 +1500,16 @@ var AUDIT_ACTION_LABELS = {
   TEST_DATA_DELETED: "Deleted Test Data",
   TEAM_MEMBER_ADDED: "Added Team Member",
   TEAM_MEMBER_UPDATED: "Updated Team Member",
-  TEAM_MEMBER_DELETED: "Deleted Team Member"
+  TEAM_MEMBER_DELETED: "Deleted Team Member",
+  TEAM_MEMBER_LINKED: "Linked Sign-in to Team Member",
+  TEAM_MEMBER_UNLINKED: "Removed Sign-in Link",
+  STATISTICS_ACCESS_GRANTED: "Granted Statistics Access",
+  STATISTICS_ACCESS_REVOKED: "Revoked Statistics Access",
+  REPORTING_ACCESS_GRANTED: "Granted Reporting Access",
+  REPORTING_ACCESS_REVOKED: "Revoked Reporting Access",
+  REPORT_SYNC_RUN: "Ran Reporting Sync",
+  REPORT_SETTINGS_UPDATED: "Changed Reporting Sync Settings",
+  REPORT_EXPORTED: "Exported a Report"
 };
 function humanizeAuditAction(action){
   return AUDIT_ACTION_LABELS[action] || action;
@@ -1699,7 +1785,7 @@ function computeStatistics(f, now){
   var activity = {}; // member id -> {assigned, statusChanges, changedByOthers}
   var events = []; // the same credited events, for the over-time chart and the recent list
   function actRow(id){ return activity[id] = activity[id] || {assigned:0, statusChanges:0, changedByOthers:0}; }
-  (state.auditLog||[]).forEach(function(e){
+  (state.statsActivity||[]).forEach(function(e){
     var m = e && e.meta;
     if(!m || e.action!=="REGRESSION_UPDATED" || !m.newStatus) return;
     if(f.releaseId && m.releaseId!==f.releaseId) return;
@@ -1765,9 +1851,247 @@ function renderStatisticsNoAccess(){
   var me = currentMember();
   var why = !me
     ? 'Link your sign-in to your <b>Know the Team</b> entry first (top bar → Link to team), then ask a teammate who has access to turn on <b>Statistics access</b> for you.'
-    : 'Your Know the Team entry doesn’t have <b>Statistics access</b>. Ask a teammate who has it to turn it on in Know the Team → Edit.';
+    : 'Your Know the Team entry doesn’t have <b>Statistics access</b>. Ask a teammate who has it to switch it on for you in Know the Team.';
   return '<div class="list-head"><div><h1>QA Statistics</h1></div></div>'+
     '<div class="empty-state"><h3>You don’t have access to Statistics</h3><p>'+why+'</p></div>';
+}
+
+/* ============================================================
+   REPORTING  (SANAD PMO Reporting Module — see REPORTING_SPEC.md)
+   A restricted page of its own, opened only by team members whose Know the
+   Team card has the "Reporting" access switch ON. Access is enforced on the
+   server for every /api/reporting route (server/pageAccess.js); this page
+   also shows a no-access state, makes no request at all without access, and
+   switches to that state if the server answers 403 (e.g. just revoked).
+   Phase 0: the page shell. The Jira data layer (Phase 1) and the reports and
+   exports (Phases 2–3) are built on top of it.
+   ============================================================ */
+function renderReportingNoAccess(){
+  var me = currentMember();
+  var why = !me
+    ? 'Link your sign-in to your <b>Know the Team</b> entry first (top bar → Link to team), then ask a teammate who has access to turn on <b>Reporting</b> for you.'
+    : 'Your Know the Team entry doesn’t have <b>Reporting access</b>. Ask a teammate who has it to switch it on for you in Know the Team.';
+  return '<div class="list-head"><div><h1>Reporting</h1></div></div>'+
+    '<div class="empty-state"><h3>You don’t have access to Reporting</h3><p>'+why+'</p></div>';
+}
+/* ---- Reporting: Jira → database sync (Phase 1) ---- */
+// Every time is stored in UTC and shown in Jordan time (Asia/Amman).
+function fmtAmman(iso){
+  if(!iso) return "—";
+  try{
+    return new Intl.DateTimeFormat("en-GB",{timeZone:"Asia/Amman", day:"numeric", month:"short", year:"numeric", hour:"2-digit", minute:"2-digit", hour12:false}).format(new Date(iso))+" (Amman)";
+  }catch(e){ return String(iso); }
+}
+function rpDuration(a, b){
+  if(!a || !b) return "—";
+  var sec = Math.max(0, Math.round((new Date(b)-new Date(a))/1000));
+  if(sec < 60) return sec+" s";
+  var m = Math.floor(sec/60);
+  return m+" min "+(sec%60)+" s";
+}
+var RP_INTERVALS = [[30,"Every 30 minutes"],[60,"Every hour"],[180,"Every 3 hours"],[360,"Every 6 hours"],[720,"Every 12 hours"],[1440,"Every day"],[10080,"Every week"]];
+var RP_SOURCES = [["none","Not used"],["component","Jira component"],["label","Jira label"],["project","Jira project"],["field","A Jira field…"]];
+function rpMapToText(map){
+  return Object.keys(map||{}).map(function(k){ return k+" = "+map[k]; }).join("\n");
+}
+function rpTextToMap(text){
+  var out = {};
+  String(text||"").split("\n").forEach(function(line){
+    var i = line.indexOf("=");
+    if(i<1) return;
+    var from = line.slice(0,i).trim(), to = line.slice(i+1).trim();
+    if(from && to) out[from] = to;
+  });
+  return out;
+}
+function rpStatusHtml(){
+  var st = state.rp.status;
+  if(!st) return '<div class="rp-status"><span class="rp-dot" aria-hidden="true"></span><div><div class="rp-status-title">Loading…</div></div></div>';
+  var c = st.counts || {};
+  var tone = "", title, sub;
+  if(st.running){
+    var cur = st.current || {};
+    tone = "is-running";
+    title = "Sync in progress…";
+    sub = "Started "+fmtAmman(cur.startedAt)+" · "+(cur.issues||0)+" issues and "+(cur.worklogs||0)+" worklogs so far.";
+  } else if(!st.lastSyncedAt){
+    title = st.scopeSet ? "Not synced yet" : "Sync not set up yet";
+    sub = st.scopeSet ? "Press “Sync now” to pull the first copy of your Jira data." : "Choose which Jira issues to include (the scope below), save it, then run the first sync.";
+    if(st.lastRun && st.lastRun.status==="failed"){ tone = "is-bad"; title = "The last sync failed"; sub = st.lastRun.error || ""; }
+  } else if(st.lastRun && st.lastRun.status==="failed"){
+    tone = "is-bad"; title = "The last sync failed";
+    sub = (st.lastRun.error || "")+" Showing data from the last good sync: "+fmtAmman(st.lastSyncedAt)+".";
+  } else {
+    tone = "is-ok"; title = "Last synced: "+fmtAmman(st.lastSyncedAt);
+    sub = (c.issues||0)+" issues · "+(c.worklogs||0)+" worklogs · "+(c.transitions||0)+" status changes in the database.";
+  }
+  var auto = st.auto || {};
+  var autoTxt = auto.enabled ? "Automatic sync is on (every "+rpIntervalLabel(auto.intervalMinutes).toLowerCase().replace("every ","")+", under "+esc(auto.ownerName||"a team member")+"’s Atlassian sign-in)." : "Automatic sync is off.";
+  var busy = st.running || state.rp.starting;
+  return '<div class="rp-status '+tone+'"><span class="rp-dot" aria-hidden="true"></span><div class="rp-status-main"><div class="rp-status-title">'+esc(title)+'</div><div class="rp-status-sub">'+esc(sub)+'</div><div class="rp-status-sub">'+autoTxt+'</div></div></div>'+
+    '<div class="rp-actions">'+
+      '<button class="btn btn-primary" data-action="rp-sync" data-mode="incremental"'+(busy||!st.scopeSet?" disabled":"")+'>Sync now</button>'+
+      '<button class="btn" data-action="rp-sync" data-mode="full"'+(busy||!st.scopeSet?" disabled":"")+' title="Re-reads every issue in scope and removes ones that no longer match. Takes longer.">Full resync</button>'+
+      '<span class="helper-text">“Sync now” only fetches what changed since the last sync. Jira is only ever read, never changed.</span>'+
+    '</div>';
+}
+function rpIntervalLabel(min){
+  var f = RP_INTERVALS.filter(function(x){ return x[0]===min; })[0];
+  return f ? f[1] : "Every "+min+" minutes";
+}
+function rpRunsHtml(){
+  var st = state.rp.status;
+  var runs = (st && st.runs) || [];
+  if(!runs.length) return '<p class="helper-text">No sync has been run yet.</p>';
+  var rows = runs.map(function(r){
+    var tone = r.status==="success" ? "tone-go" : r.status==="failed" ? "tone-danger" : "tone-info";
+    var label = r.status==="success" ? "Succeeded" : r.status==="failed" ? "Failed" : "Running";
+    return '<tr><td>'+esc(fmtAmman(r.startedAt))+'</td><td>'+esc(rpDuration(r.startedAt, r.finishedAt))+'</td>'+
+      '<td><span class="pill '+tone+'"><span class="pill-dot"></span>'+label+'</span></td>'+
+      statsNumCell(r.issues)+statsNumCell(r.worklogs)+'<td class="rp-err">'+esc(r.error||"")+'</td></tr>';
+  }).join("");
+  return statsTable(["Started","Took","Result","Issues","Worklogs","Details"], rows);
+}
+function rpMappingHtml(key, label, hint, m){
+  m = m || {source:"none", map:{}, passthrough:true};
+  var isField = m.source.indexOf("field:")===0;
+  var srcVal = isField ? "field" : m.source;
+  return '<div class="rp-map" data-rp-map="'+key+'"><h3>'+esc(label)+'</h3><p class="helper-text">'+esc(hint)+'</p>'+
+    '<div class="field-row"><div class="field"><label for="rp-src-'+key+'">Take it from</label><select id="rp-src-'+key+'">'+
+      RP_SOURCES.map(function(o){ return '<option value="'+o[0]+'"'+(o[0]===srcVal?" selected":"")+'>'+esc(o[1])+'</option>'; }).join("")+'</select></div>'+
+    '<div class="field"><label for="rp-fld-'+key+'">Jira field name <span class="hint">(only for “A Jira field…”)</span></label><input type="text" id="rp-fld-'+key+'" maxlength="70" value="'+escAttr(isField?m.source.slice(6):"")+'"></div></div>'+
+    '<div class="field"><label for="rp-map-'+key+'">Rename values <span class="hint">(one per line: Jira value = Name to show)</span></label><textarea id="rp-map-'+key+'" rows="3" placeholder="e.g. payments-core = Payments">'+esc(rpMapToText(m.map))+'</textarea></div>'+
+    '<label class="rp-check"><input type="checkbox" id="rp-pass-'+key+'"'+(m.passthrough!==false?" checked":"")+'> Keep values I haven’t renamed (otherwise they stay empty)</label></div>';
+}
+function rpSettingsHtml(){
+  var se = state.rp.settings;
+  if(!se) return '';
+  var au = se.auto || {};
+  var mp = se.mappings || {};
+  return '<form id="rp-settings-form" class="rp-form" autocomplete="off">'+
+    '<div class="field"><label for="rp-jql">Which Jira issues to include</label>'+
+      '<textarea id="rp-jql" rows="3" maxlength="2000" placeholder="e.g. project in (PAY, WLT) AND updated >= -365d">'+esc((se.scope&&se.scope.jql)||"")+'</textarea>'+
+      '<span class="hint">A Jira search (JQL). Only issues this search returns are copied into Reporting. Sorting is ignored.</span></div>'+
+    '<div class="field"><label for="rp-blocked">Statuses that mean “blocked”</label><input type="text" id="rp-blocked" maxlength="400" value="'+escAttr((se.blockedStatuses||[]).join(", "))+'">'+
+      '<span class="hint">Comma-separated. Time spent in these statuses (and while flagged as an impediment) counts as blocked time.</span></div>'+
+    '<div class="rp-maps">'+
+      rpMappingHtml("service","Service","The service each issue belongs to.",mp.service)+
+      rpMappingHtml("component","Component","The component each issue belongs to.",mp.component)+
+      rpMappingHtml("squad","Squad","The squad each issue belongs to.",mp.squad)+
+    '</div>'+
+    '<div class="rp-auto"><label class="switch" title="Sync automatically"><input type="checkbox" id="rp-auto-on"'+(au.enabled?" checked":"")+' aria-label="Sync automatically"><span class="switch-track"></span></label>'+
+      '<div class="rp-auto-text"><b>Sync automatically</b><span class="helper-text">'+(au.enabled ? 'Runs under the Atlassian sign-in of '+esc(au.ownerName||"a team member")+', who turned it on. If their Atlassian access expires the sync reports it here until they sign in again.' : 'Turning this on makes the sync run under <b>your</b> Atlassian sign-in, so it can only read what you are allowed to see in Jira.')+'</span></div>'+
+      '<div class="field rp-interval"><label for="rp-interval">How often</label><select id="rp-interval">'+RP_INTERVALS.map(function(o){ return '<option value="'+o[0]+'"'+(o[0]===au.intervalMinutes?" selected":"")+'>'+esc(o[1])+'</option>'; }).join("")+'</select></div></div>'+
+    '<div class="rp-form-actions"><button type="submit" class="btn btn-primary"'+(state.rp.saving?" disabled":"")+'>'+(state.rp.saving?"Saving…":"Save settings")+'</button></div>'+
+  '</form>';
+}
+function rpCollectSettings(){
+  function val(id){ var el = document.getElementById(id); return el ? el.value : ""; }
+  var mappings = {};
+  ["service","component","squad"].forEach(function(k){
+    var src = val("rp-src-"+k);
+    if(src==="field"){
+      var nm = val("rp-fld-"+k).trim();
+      if(!nm) throw new Error("Enter the Jira field name for "+k+", or pick another source.");
+      src = "field:"+nm;
+    }
+    var pass = document.getElementById("rp-pass-"+k);
+    mappings[k] = {source: src, map: rpTextToMap(val("rp-map-"+k)), passthrough: !pass || pass.checked};
+  });
+  return {
+    scope: {jql: val("rp-jql").trim()},
+    blockedStatuses: val("rp-blocked"),
+    mappings: mappings,
+    auto: {enabled: !!(document.getElementById("rp-auto-on")||{}).checked, intervalMinutes: Number(val("rp-interval"))}
+  };
+}
+function rpRefreshStatusPanel(){
+  var el = document.getElementById("rp-sync-panel");
+  if(el) el.innerHTML = rpStatusHtml();
+  var runs = document.getElementById("rp-runs");
+  if(runs) runs.innerHTML = rpRunsHtml();
+}
+function rpFetchStatus(){
+  return api.reportingSyncStatus().then(function(st){
+    var was = state.rp.status && state.rp.status.running;
+    state.rp.status = st;
+    if(was && !st.running) showToast(st.lastRun && st.lastRun.status==="failed" ? "Sync failed — see the details below." : "✓ Sync finished");
+    rpRefreshStatusPanel();
+  }).catch(function(e){
+    if(e && e.status===403){ state.reportingDenied = true; render(); }
+  });
+}
+// While a sync is running, refresh its progress every few seconds; stop when
+// it ends or the person leaves the page.
+function rpSchedulePoll(){
+  if(state.rp.pollTimer){ clearTimeout(state.rp.pollTimer); state.rp.pollTimer = null; }
+  var st = state.rp.status;
+  if(!st || !st.running) return;
+  state.rp.pollTimer = setTimeout(function(){
+    state.rp.pollTimer = null;
+    if(state.route.view!=="reporting" || state.reportingDenied) return;
+    rpFetchStatus().then(rpSchedulePoll);
+  }, 3000);
+}
+function rpStartSync(mode){
+  if(state.rp.starting) return;
+  state.rp.starting = true; rpRefreshStatusPanel();
+  api.startReportingSync(mode).then(function(){
+    showToast(mode==="full" ? "Full resync started" : "Sync started");
+    return rpFetchStatus();
+  }).catch(function(e){
+    showToast((e && e.message) || "Couldn’t start the sync.");
+    return rpFetchStatus();
+  }).then(function(){
+    state.rp.starting = false; rpRefreshStatusPanel(); rpSchedulePoll();
+  });
+}
+function rpSaveSettings(){
+  if(state.rp.saving) return;
+  var body;
+  try{ body = rpCollectSettings(); }catch(e){ showToast(e.message); return; }
+  state.rp.saving = true;
+  var btn = document.querySelector("#rp-settings-form button[type=submit]");
+  if(btn){ btn.disabled = true; btn.textContent = "Saving…"; }
+  api.saveReportingSettings(body).then(function(saved){
+    state.rp.settings = saved;
+    showToast("✓ Settings saved");
+    return rpFetchStatus();
+  }).catch(function(e){
+    showToast((e && e.message) || "Couldn’t save the settings.");
+  }).then(function(){
+    state.rp.saving = false; render();
+  });
+}
+
+function renderReporting(){
+  if(!state.teamReady) return '<div class="list-head"><div><h1>Reporting</h1></div></div><div class="empty-state"><h3>Loading…</h3></div>';
+  if(!canViewReporting() || state.reportingDenied) return renderReportingNoAccess();
+  var head = '<div class="list-head sv-head"><div><h1>Reporting</h1><p>PMO delivery and variance reporting from Jira — all estimates and time in hours.</p></div></div>';
+  if(!state.reportingReady) return head+'<div class="empty-state"><h3>Loading…</h3></div>';
+  var plan = [
+    ["Full Summary Report", "Delivery status, estimated vs. logged hours, cycle and lead time, blockers by external entities, overdue work and spillover."],
+    ["Variance Report", "Estimated vs. logged hours by ticket, team member, team, component, epic and service."],
+    ["Excel and CSV export", "Every report as an Excel workbook (pivot-ready tables) and as UTF-8 CSV."]
+  ];
+  var rp = state.rp;
+  var syncBody;
+  if(rp.needsPostgres){
+    syncBody = '<div class="empty-state rp-needs"><h3>Reporting needs the Postgres database</h3><p>This server is running on the local JSON file. Reporting keeps its copy of the Jira data in Postgres (Supabase) — set <b>DATABASE_URL</b> and restart to use it.</p></div>';
+  } else if(rp.error){
+    syncBody = '<div class="empty-state rp-needs"><h3>Couldn’t load the sync status</h3><p>'+esc(rp.error)+'</p></div>';
+  } else {
+    syncBody = '<div id="rp-sync-panel">'+rpStatusHtml()+'</div>';
+  }
+  var out = head+
+    '<section class="sv-panel"><div class="sv-panel-head"><h2>Jira data</h2><p>Reporting reads from its own copy of your Jira data, so reports are fast and never hit Jira while you browse.</p></div>'+syncBody+'</section>';
+  if(!rp.needsPostgres && !rp.error){
+    out += '<section class="sv-panel"><div class="sv-panel-head"><h2>Recent syncs</h2><p>The last ten runs. Times are shown in Amman time.</p></div><div id="rp-runs">'+rpRunsHtml()+'</div></section>'+
+      '<section class="sv-panel"><div class="sv-panel-head"><h2>Sync settings</h2><p>What to copy from Jira and how to name services, components and squads. Changes apply from the next sync.</p></div>'+rpSettingsHtml()+'</section>';
+  }
+  return out+
+    '<section class="sv-panel"><div class="sv-panel-head"><h2>Coming next</h2><p>Planned for the following phases of the Reporting module — nothing below is available yet.</p></div>'+
+      '<ul class="rp-plan">'+plan.map(function(p){ return '<li><b>'+esc(p[0])+'</b><span>'+esc(p[1])+'</span></li>'; }).join("")+'</ul></section>';
 }
 
 /* ---- Statistics: visual building blocks (plain HTML/SVG, no libraries) ---- */
@@ -1957,7 +2281,8 @@ function renderStatistics(){
   if(!state.teamReady) return '<div class="list-head"><div><h1>QA Statistics</h1></div></div><div class="empty-state"><h3>Loading…</h3></div>';
   if(!canViewStatistics()) return renderStatisticsNoAccess();
   var head = '<div class="list-head sv-head"><div><h1>QA Statistics</h1><p>QA activity and release readiness insights.</p></div></div>';
-  if(!state.listReady || !state.auditReady) return head+'<div class="empty-state"><h3>Loading statistics…</h3></div>';
+  if(state.statsDenied) return renderStatisticsNoAccess();
+  if(!state.listReady || !state.statsReady) return head+'<div class="empty-state"><h3>Loading statistics…</h3></div>';
   var f = state.statsFilters || (state.statsFilters = statsDefaultFilters());
   var st = computeStatistics(f);
   var filtersHtml = statsFiltersHtml(f);
@@ -2031,6 +2356,22 @@ function allTeamMembers(){
   return state.teamOrder.map(function(id){ return state.team[id]; }).filter(Boolean);
 }
 var TEAM_UNASSIGNED_DEPARTMENT = "Unassigned";
+// The "Access" block on a card: one switch per restricted page, saved the
+// moment it's flipped (PUT /api/team/:id/access/:page). The state is written
+// out as ON/OFF too (not colour alone); a switch you aren't allowed to change
+// is disabled and says why in its tooltip.
+function teamAccessHtml(m){
+  if(!(state.auth && state.auth.authenticated)) return "";
+  return '<div class="team-access" role="group" aria-label="Access for '+escAttr(m.name)+'"><div class="team-access-title">Access</div>'+
+    ACCESS_PAGES.map(function(ap){
+      var on = m[ap.field]===true;
+      var why = accessChangeBlockedReason(m, ap, !on);
+      var tip = why || ((on?"Turn off ":"Turn on ")+ap.label+" access for "+m.name);
+      return '<div class="team-access-row"><span class="team-access-name">'+esc(ap.label)+'</span>'+
+        '<span class="team-access-state '+(on?"is-on":"is-off")+'">'+(on?"ON":"OFF")+'</span>'+
+        '<label class="switch'+(why?" is-locked":"")+'" title="'+escAttr(tip)+'"><input type="checkbox" data-action="set-page-access" data-id="'+escAttr(m.id)+'" data-page="'+ap.page+'" aria-label="'+escAttr(ap.label+" access for "+m.name)+'"'+(on?" checked":"")+(why?" disabled":"")+'><span class="switch-track"></span></label></div>';
+    }).join("")+'</div>';
+}
 function teamMemberCardHtml(m){
   var specialtiesHtml = (m.specialties||[]).map(function(s){return '<span class="chip">'+esc(s)+'</span>';}).join("");
   var toolsHtml = (m.tools||[]).map(function(t){return '<span class="chip chip-muted">'+esc(t)+'</span>';}).join("");
@@ -2042,19 +2383,26 @@ function teamMemberCardHtml(m){
   // their assignments, audit trail and statistics to this team member.
   var showMeOption = !!(state.auth && state.auth.authenticated);
   var isMe = showMeOption && myLinkedTeamMemberId()===m.id;
+  // A card another account already holds can't be taken over (access follows
+  // this link) — only its holder, or someone with restricted-page access, may
+  // remove that link.
+  var me0 = currentMember();
+  var heldByOther = !!(m.linkedEmail && !isMe);
+  var canMeBtn = showMeOption && (!heldByOther || ACCESS_PAGES.some(function(ap){ return me0 && me0[ap.field]===true; }));
   return '<div class="team-card">'+
     '<div class="dd team-card-menu">'+
       '<button class="btn btn-sm btn-icon" data-action="toggle-team-menu" data-id="'+m.id+'" aria-label="More actions">'+iconDots()+'</button>'+
       '<div class="menu" id="team-menu-'+m.id+'">'+
-        (showMeOption ? '<button data-action="toggle-my-team-member" data-id="'+m.id+'">'+iconUser()+(isMe?' Remove "This is me"':' This is me')+'</button>' : '')+
+        (canMeBtn ? '<button data-action="toggle-my-team-member" data-id="'+m.id+'">'+iconUser()+(isMe?' Remove "This is me"':(heldByOther?' Remove link (held by another account)':' This is me'))+'</button>' : '')+
         '<button data-action="edit-team-member" data-id="'+m.id+'">'+iconEdit()+' Edit</button>'+
         '<button class="danger" data-action="delete-team-member" data-id="'+m.id+'">'+iconTrash()+' Delete</button>'+
       '</div>'+
     '</div>'+
     '<div class="team-avatar'+(m.photo?" has-photo":"")+'">'+avatar+'</div>'+
     '<div class="team-card-name">'+esc(m.name)+(isMe?' <span class="badge badge-me" title="Regression assigned to you shows up in your My Regression view">'+iconUser()+' You</span>':'')+(m.seeded?' <span class="badge badge-manual">Example</span>':'')+'</div>'+
-    '<div class="team-card-role">'+esc(m.role||"")+(m.regression===false?' <span class="hint">· not in Regression assign list</span>':'')+(m.statisticsAccess===true?' <span class="hint">· Statistics access</span>':'')+'</div>'+
+    '<div class="team-card-role">'+esc(m.role||"")+(m.regression===false?' <span class="hint">· not in Regression assign list</span>':'')+''+'</div>'+
     (m.bio ? '<p class="team-card-bio">'+esc(m.bio)+'</p>' : '')+
+    teamAccessHtml(m)+
     (specialtiesHtml ? '<div class="team-card-chips">'+specialtiesHtml+'</div>' : '')+
     (toolsHtml ? '<div class="team-card-chips">'+toolsHtml+'</div>' : '')+
     (linkBits.length ? '<div class="team-card-links">'+linkBits.join("")+'</div>' : '')+
@@ -2142,8 +2490,8 @@ function openTeamMemberModal(existing){
     // A record saved before the Regression toggle existed has no `regression`
     // key at all — treat that as eligible (checked) so nobody who was already
     // usable as a regression assignee silently disappears from the list.
-    ? {name:existing.name, role:existing.role||"", department:existing.department||"", bio:existing.bio||"", specialties:(existing.specialties||[]).slice(), tools:(existing.tools||[]).slice(), linkedin:existing.linkedin||"", github:existing.github||"", photo:existing.photo||"", regression: existing.regression!==false, statisticsAccess: existing.statisticsAccess===true, jiraNames:(existing.jiraNames||[]).slice()}
-    : {name:"", role:"", department:"", bio:"", specialties:[], tools:[], linkedin:"", github:"", photo:"", regression:true, statisticsAccess:false, jiraNames:[]};
+    ? {name:existing.name, role:existing.role||"", department:existing.department||"", bio:existing.bio||"", specialties:(existing.specialties||[]).slice(), tools:(existing.tools||[]).slice(), linkedin:existing.linkedin||"", github:existing.github||"", photo:existing.photo||"", regression: existing.regression!==false, jiraNames:(existing.jiraNames||[]).slice()}
+    : {name:"", role:"", department:"", bio:"", specialties:[], tools:[], linkedin:"", github:"", photo:"", regression:true, jiraNames:[]};
   var pendingPhoto = draft.photo; // updated in place as the file input changes; submitted as-is
   var departmentOptions = distinct(allTeamMembers().map(function(m){return m.department;}));
 
@@ -2174,10 +2522,6 @@ function openTeamMemberModal(existing){
     '<div class="field">'+
       '<span class="regression-skip-toggle">Available for regression assignment'+toggleSwitch("team-regression", draft.regression, "Show this person in the Regression section's assignment dropdowns")+'</span>'+
       '<span class="hint" style="display:block;margin-top:4px;">Off = hidden from the Regression section\'s assign lists (still visible here in Know the Team).</span>'+
-    '</div>'+
-    '<div class="field">'+
-      '<span class="regression-skip-toggle">Statistics access'+toggleSwitch("team-statistics", draft.statisticsAccess, "Let this person open the Statistics page (once they link their sign-in to this card)")+'</span>'+
-      '<span class="hint" style="display:block;margin-top:4px;">Off = the Statistics page is hidden for this person. Takes effect once they use “Link to team” / “This is me”.</span>'+
     '</div>';
   var foot = (isEdit? '<button type="button" class="btn btn-danger" id="del-team-member">'+iconTrash()+' Delete</button>' : '<span></span>')+
     '<span style="flex:1"></span><button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">'+(isEdit?"Save changes":"Save")+'</button>';
@@ -2223,8 +2567,7 @@ function openTeamMemberModal(existing){
       linkedin: qs("#f-team-linkedin").value.trim(),
       github: qs("#f-team-github").value.trim(),
       photo: pendingPhoto,
-      regression: !!(qs("#toggle-team-regression") && qs("#toggle-team-regression").checked),
-      statisticsAccess: !!(qs("#toggle-team-statistics") && qs("#toggle-team-statistics").checked)
+      regression: !!(qs("#toggle-team-regression") && qs("#toggle-team-regression").checked)
     };
     var submitBtn = qs('#modal-form button[type="submit"]');
     if(submitBtn) submitBtn.disabled = true;
@@ -5302,6 +5645,8 @@ document.addEventListener("click", function(e){
     case "nav-list": goTo("#/releases"); break;
     case "nav-audit": goTo("#/audit"); break;
     case "nav-statistics": goTo("#/statistics"); break;
+    case "nav-reporting": goTo("#/reporting"); break;
+    case "rp-sync": rpStartSync(el2.getAttribute("data-mode")==="full" ? "full" : "incremental"); break;
     case "nav-team": goTo("#/team"); break;
     case "nav-detail": goTo("#/r/"+id); break;
     case "toggle-sidenav":
@@ -5487,8 +5832,28 @@ document.addEventListener("click", function(e){
   }
 });
 
+document.addEventListener("submit", function(e){
+  if(e.target && e.target.id==="rp-settings-form"){ e.preventDefault(); rpSaveSettings(); }
+});
+
 document.addEventListener("change", function(e){
   var elp = e.target;
+  if(elp.matches && elp.matches('[data-action="set-page-access"]')){
+    var accId = elp.getAttribute("data-id"), accPage = elp.getAttribute("data-page");
+    var ap = ACCESS_PAGES.filter(function(x){ return x.page===accPage; })[0];
+    var want = !!elp.checked;
+    if(!ap || !state.team[accId]) return;
+    elp.disabled = true; // one request at a time per switch
+    api.setPageAccess(accId, accPage, want).then(function(saved){
+      state.team[saved.id] = saved;
+      renderSidenav(); render();
+      showToast("✓ "+ap.label+" access "+(want?"granted to ":"revoked from ")+saved.name);
+    }).catch(function(err){
+      showToast((err && err.message) || "Couldn’t change access.");
+      render(); // put the switch back to what the server has
+    });
+    return;
+  }
   if(elp.matches('[data-action="toggle-performance"]')){
     var r = state.releases[state.route.id]; if(!r) return;
     r.performance.enabled = elp.checked; persistRelease(r);

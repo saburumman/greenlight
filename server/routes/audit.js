@@ -10,6 +10,7 @@ const db = require("../db");
 const { asyncHandler } = require("../asyncHandler");
 const { resolveActor } = require("../assignmentLogic");
 const { buildEntry } = require("../auditWriter");
+const { hasPageAccess } = require("../pageAccess");
 
 const router = express.Router();
 
@@ -52,6 +53,15 @@ const VALID_ACTIONS = new Set([
   "TEAM_MEMBER_ADDED",
   "TEAM_MEMBER_UPDATED",
   "TEAM_MEMBER_DELETED",
+  "TEAM_MEMBER_LINKED",
+  "TEAM_MEMBER_UNLINKED",
+  "STATISTICS_ACCESS_GRANTED",
+  "STATISTICS_ACCESS_REVOKED",
+  "REPORTING_ACCESS_GRANTED",
+  "REPORTING_ACCESS_REVOKED",
+  "REPORT_SYNC_RUN",
+  "REPORT_SETTINGS_UPDATED",
+  "REPORT_EXPORTED",
 ]);
 
 // Assignment events and regression status changes are written by the SERVER
@@ -67,11 +77,30 @@ const SERVER_ONLY_ACTIONS = new Set([
   "REGRESSION_ASSIGNED",
   "REGRESSION_UNASSIGNED",
   "ENTITY_REGRESSION_ASSIGNED",
+  "TEAM_MEMBER_LINKED",
+  "TEAM_MEMBER_UNLINKED",
+  "STATISTICS_ACCESS_GRANTED",
+  "STATISTICS_ACCESS_REVOKED",
+  "REPORTING_ACCESS_GRANTED",
+  "REPORTING_ACCESS_REVOKED",
+  "REPORT_SYNC_RUN",
+  "REPORT_SETTINGS_UPDATED",
+  "REPORT_EXPORTED",
 ]);
 
 // GET /api/audit — every audit record, newest first.
+// The structured `meta` (who changed whose regression, previous/new status…)
+// is the raw material of the Statistics page, so it is only returned to people
+// with Statistics access; everyone else gets the plain entries.
 router.get("/", asyncHandler(async (req, res) => {
-  res.json(await db.auditLog.list());
+  const list = await db.auditLog.list();
+  const team = await db.team.list();
+  if (hasPageAccess(req.authUser, team, "statistics")) return res.json(list);
+  res.json(list.map((e) => {
+    if (!e || !e.meta) return e;
+    const { meta, ...rest } = e;
+    return rest;
+  }));
 }));
 
 // POST /api/audit — append one audit record. Called by the client's
