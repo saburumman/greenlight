@@ -74,6 +74,22 @@ create table if not exists reporting_sync_runs (
   error text
 );
 
+create table if not exists reporting_dependencies (
+  id bigserial primary key,
+  entity text not null,
+  vendor text not null default '',
+  needed text not null default '',
+  owner_name text not null default '',
+  promised_date date,
+  status text not null default 'Requested',
+  last_contact_date date,
+  next_followup_date date,
+  created_by text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint reporting_dependencies_status check (status in ('Requested','In progress','Received','Cancelled'))
+);
+
 create table if not exists reporting_settings (
   id smallint primary key default 1,
   data jsonb not null,
@@ -179,7 +195,8 @@ function createReportingStore(pool, defaults) {
         const r = it.row;
         const vals = ISSUE_COLS.map((c) => (c === "sprints" ? JSON.stringify(r.sprints || []) : r[c]));
         const ph = ISSUE_COLS.map((c, i) => (c === "sprints" ? `$${i + 1}::jsonb` : `$${i + 1}`)).join(",");
-        const upd = ISSUE_COLS.filter((c) => c !== "issue_key").map((c) => `${c} = excluded.${c}`).join(", ");
+        // external_dependency_id is set by people in the Dependencies tab — a sync must never overwrite it
+        const upd = ISSUE_COLS.filter((c) => c !== "issue_key" && c !== "external_dependency_id").map((c) => `${c} = excluded.${c}`).join(", ");
         await client.query(
           `insert into reporting_issues (${ISSUE_COLS.join(",")}, synced_at) values (${ph}, now())
            on conflict (issue_key) do update set ${upd}, synced_at = now()`,
@@ -236,7 +253,113 @@ function createReportingStore(pool, defaults) {
     return rows[0];
   }
 
+
+  // ---- report data (read side) ----
+  const ISSUE_SELECT = `select issue_key, summary, issue_type, parent_key, epic_key, epic_name, service, component, squad, labels, priority, fix_version, release,
+      status, status_category, assignee_id, assignee_name, reporter_name, sprints, sprint_count,
+      created_at, started_at, completed_at, due_date::text as due_date,
+      original_estimate_h::float8 as original_estimate_h, remaining_estimate_h::float8 as remaining_estimate_h, logged_h::float8 as logged_h,
+      is_blocked, blocked_days::float8 as blocked_days, external_dependency_id, was_reopened, reopen_count,
+      variance_h::float8 as variance_h, variance_pct::float8 as variance_pct, estimate_accuracy_band,
+      cycle_time_days::float8 as cycle_time_days, lead_time_days::float8 as lead_time_days from reporting_issues`;
+  const iso = (d) => (d instanceof Date ? d.toISOString() : d || null);
+  function issueRow(r) {
+    return { ...r, created_at: iso(r.created_at), started_at: iso(r.started_at), completed_at: iso(r.completed_at), labels: r.labels || [], sprints: r.sprints || [], age_days: null, is_overdue: false };
+  }
+  function depRow(r) {
+    return { id: String(r.id), entity: r.entity, vendor: r.vendor, needed: r.needed, owner_name: r.owner_name, promised_date: r.promised_date, status: r.status, last_contact_date: r.last_contact_date, next_followup_date: r.next_followup_date, updated_at: iso(r.updated_at) };
+  }
+  const DEP_SELECT = `select id, entity, vendor, needed, owner_name, promised_date::text as promised_date, status, last_contact_date::text as last_contact_date, next_followup_date::text as next_followup_date, updated_at from reporting_dependencies`;
+
+  async function loadReportData() {
+    const [i, w, t, d] = await Promise.all([
+      q(ISSUE_SELECT),
+      q("select worklog_id, issue_key, author_id, author_name, started_at, time_spent_h::float8 as time_spent_h from reporting_worklogs"),
+      q("select issue_key, from_status, to_status, changed_at from reporting_status_transitions"),
+      q(DEP_SELECT + " order by id"),
+    ]);
+    return {
+      issues: i.rows.map(issueRow),
+      worklogs: w.rows.map((r) => ({ ...r, started_at: iso(r.started_at) })),
+      transitions: t.rows.map((r) => ({ ...r, changed_at: iso(r.changed_at) })),
+      dependencies: d.rows.map(depRow),
+    };
+  }
+
+  // ---- dependency tracker ----
+  async function listDependencies() {
+    const [d, links] = await Promise.all([
+      q(DEP_SELECT + " order by id"),
+      q("select external_dependency_id as id, issue_key, summary, status, status_category from reporting_issues where external_dependency_id is not null order by issue_key"),
+    ]);
+    const byDep = new Map();
+    for (const l of links.rows) { if (!byDep.has(l.id)) byDep.set(l.id, []); byDep.get(l.id).push({ key: l.issue_key, summary: l.summary, status: l.status, statusCategory: l.status_category }); }
+    return d.rows.map((r) => ({ ...depRow(r), issues: byDep.get(String(r.id)) || [] }));
+  }
+  async function createDependency(clean, createdBy) {
+    const { rows } = await q(
+      `insert into reporting_dependencies (entity, vendor, needed, owner_name, promised_date, status, last_contact_date, next_followup_date, created_by)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9) returning id`,
+      [clean.entity, clean.vendor || "", clean.needed || "", clean.owner_name || "", clean.promised_date || null, clean.status || "Requested", clean.last_contact_date || null, clean.next_followup_date || null, createdBy || null]
+    );
+    return String(rows[0].id);
+  }
+  async function updateDependency(id, clean) {
+    const keys = Object.keys(clean);
+    if (!keys.length) return true;
+    const sets = keys.map((k, n) => `${k} = $${n + 2}`);
+    const res = await q(`update reporting_dependencies set ${sets.join(", ")}, updated_at = now() where id = $1`, [id].concat(keys.map((k) => clean[k])));
+    return res.rowCount > 0;
+  }
+  async function deleteDependency(id) {
+    await q("update reporting_issues set external_dependency_id = null where external_dependency_id = $1", [String(id)]);
+    const res = await q("delete from reporting_dependencies where id = $1", [id]);
+    return res.rowCount > 0;
+  }
+  async function dependencyExists(id) {
+    const { rows } = await q("select 1 from reporting_dependencies where id = $1", [id]);
+    return rows.length > 0;
+  }
+  // depId null/"" clears the link. Returns false when the issue isn't cached.
+  async function setIssueDependency(issueKey, depId) {
+    const res = await q("update reporting_issues set external_dependency_id = $2 where issue_key = $1", [issueKey, depId ? String(depId) : null]);
+    return res.rowCount > 0;
+  }
+  async function searchIssues(text, limit) {
+    const t = String(text || "").trim();
+    if (!t) return [];
+    const like = "%" + t.replace(/[\\%_]/g, (c) => "\\" + c) + "%";
+    const { rows } = await q(
+      `select issue_key, summary, status, external_dependency_id from reporting_issues
+       where issue_key ilike $1 or summary ilike $1 order by issue_key limit $2`, [like, limit || 15]
+    );
+    return rows.map((r) => ({ key: r.issue_key, summary: r.summary, status: r.status, dependencyId: r.external_dependency_id }));
+  }
+
+  // ---- saved presets (kept inside the settings document) ----
+  async function listPresets() { return (await getSettings()).presets || []; }
+  async function savePreset(preset) {
+    const cur = await getSettings();
+    const list = (cur.presets || []).filter((p) => p.name.toLowerCase() !== preset.name.toLowerCase());
+    list.push(preset);
+    list.sort((a, b) => a.name.localeCompare(b.name));
+    if (list.length > 50) throw Object.assign(new Error("Too many saved presets (max 50)."), { code: "LIMIT" });
+    cur.presets = list;
+    await putSettings(cur);
+    return list;
+  }
+  async function deletePreset(id) {
+    const cur = await getSettings();
+    const before = (cur.presets || []).length;
+    cur.presets = (cur.presets || []).filter((p) => p.id !== id);
+    if (cur.presets.length === before) return null;
+    await putSettings(cur);
+    return cur.presets;
+  }
+
   return {
+    loadReportData, listDependencies, createDependency, updateDependency, deleteDependency, dependencyExists, setIssueDependency, searchIssues,
+    listPresets, savePreset, deletePreset,
     ensureSchema, getSettings, saveSettings, saveState,
     startRun, updateRun, finishRun, markStaleRuns, getRunning, listRuns,
     saveIssueBatch, deleteIssuesNotIn, postProcessEpics, epicKeysMissingName, setEpicNames, counts,

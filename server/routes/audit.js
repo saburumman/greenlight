@@ -62,6 +62,7 @@ const VALID_ACTIONS = new Set([
   "REPORT_SYNC_RUN",
   "REPORT_SETTINGS_UPDATED",
   "REPORT_EXPORTED",
+  "REPORT_DEPENDENCY_CHANGED",
 ]);
 
 // Assignment events and regression status changes are written by the SERVER
@@ -86,6 +87,7 @@ const SERVER_ONLY_ACTIONS = new Set([
   "REPORT_SYNC_RUN",
   "REPORT_SETTINGS_UPDATED",
   "REPORT_EXPORTED",
+  "REPORT_DEPENDENCY_CHANGED",
 ]);
 
 // Who changed whose access to a restricted page, and Reporting sync/settings
@@ -95,7 +97,7 @@ const ACCESS_CHANGE_ACTIONS = new Set([
   "STATISTICS_ACCESS_GRANTED", "STATISTICS_ACCESS_REVOKED",
   "REPORTING_ACCESS_GRANTED", "REPORTING_ACCESS_REVOKED",
 ]);
-const REPORTING_ACTIONS = new Set(["REPORT_SYNC_RUN", "REPORT_SETTINGS_UPDATED", "REPORT_EXPORTED"]);
+const REPORTING_ACTIONS = new Set(["REPORT_SYNC_RUN", "REPORT_SETTINGS_UPDATED", "REPORT_EXPORTED", "REPORT_DEPENDENCY_CHANGED"]);
 
 // GET /api/audit — audit records visible to the caller, newest first.
 // The structured `meta` (who changed whose regression, previous/new status…)

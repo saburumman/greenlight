@@ -15,6 +15,7 @@
     "db:seed-defaults": "node scripts/seed-defaults.js"
   },
   "dependencies": {
+    "@resvg/resvg-js": "^2.6.2",
     "exceljs": "^4.4.0",
     "express": "^4.19.2",
     "pg": "^8.23.0"

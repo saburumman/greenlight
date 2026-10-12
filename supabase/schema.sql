@@ -213,3 +213,20 @@ create table if not exists reporting_settings (
   updated_at timestamptz not null default now(),
   constraint reporting_settings_singleton check (id = 1)
 );
+
+-- Reporting dependency tracker. Same as migrations/0004_reporting_dependencies.sql.
+create table if not exists reporting_dependencies (
+  id bigserial primary key,
+  entity text not null,
+  vendor text not null default '',
+  needed text not null default '',
+  owner_name text not null default '',
+  promised_date date,
+  status text not null default 'Requested',
+  last_contact_date date,
+  next_followup_date date,
+  created_by text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint reporting_dependencies_status check (status in ('Requested','In progress','Received','Cancelled'))
+);

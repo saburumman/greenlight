@@ -185,7 +185,17 @@ var api = {
   reportingSettings: function(){ return apiCall("GET","/reporting/settings"); },
   saveReportingSettings: function(data){ return apiCall("PUT","/reporting/settings", data); },
   reportingSyncStatus: function(){ return apiCall("GET","/reporting/sync/status"); },
-  startReportingSync: function(mode){ return apiCall("POST","/reporting/sync", {mode: mode}); }
+  startReportingSync: function(mode){ return apiCall("POST","/reporting/sync", {mode: mode}); },
+  reportingFilters: function(){ return apiCall("GET","/reporting/filters"); },
+  reportingReport: function(filters){ return apiCall("POST","/reporting/report", {filters: filters}); },
+  reportingDependencies: function(){ return apiCall("GET","/reporting/dependencies"); },
+  createReportingDependency: function(data){ return apiCall("POST","/reporting/dependencies", data); },
+  updateReportingDependency: function(id, data){ return apiCall("PUT","/reporting/dependencies/"+id, data); },
+  deleteReportingDependency: function(id){ return apiCall("DELETE","/reporting/dependencies/"+id); },
+  reportingIssueSearch: function(q){ return apiCall("GET","/reporting/issues/search?q="+encodeURIComponent(q)); },
+  linkReportingIssue: function(key, depId){ return apiCall("PUT","/reporting/issues/"+encodeURIComponent(key)+"/dependency", {dependencyId: depId}); },
+  saveReportingPreset: function(name, filters){ return apiCall("POST","/reporting/presets", {name: name, filters: filters}); },
+  deleteReportingPreset: function(id){ return apiCall("DELETE","/reporting/presets/"+encodeURIComponent(id)); }
 };
 
 /* ============================================================
@@ -243,7 +253,8 @@ var state = {
   statsDenied: false, // the server said 403 (no Statistics access)
   reportingReady: false,
   reportingDenied: false, // the server said 403 (no Reporting access)
-  rp: {dataLayer:false, needsPostgres:false, status:null, settings:null, error:null, saving:false, starting:false, pollTimer:null},
+  rp: {dataLayer:false, needsPostgres:false, status:null, settings:null, error:null, saving:false, starting:false, pollTimer:null,
+       tab:"reports", filters:null, options:null, presets:[], presetName:"", report:null, reportLoading:false, reportError:null, reportBooting:false, sheetId:"summary", chartTables:{}, exporting:false, deps:null, depsError:null, depStatuses:null},
   assessmentLoggedFor: {}, // releaseId -> true, so AI_ASSESSMENT_GENERATED logs once per viewing, not every re-render
   // ---- Test Data — a reusable QA data library, independent of any release
   // (see renderTestData() and friends) ----
@@ -1109,6 +1120,7 @@ function loadReportingAccess(){
     return Promise.all([api.reportingSyncStatus(), api.reportingSettings()]).then(function(r){
       state.rp.status = r[0]; state.rp.settings = r[1];
       rpSchedulePoll();
+      rpEnsureReports();
     }).catch(function(e){
       if(e && e.status===403){ state.reportingDenied = true; return; }
       state.rp.error = (e && e.message) || "Couldn’t load the sync status.";
@@ -1204,6 +1216,7 @@ function render(){
     app.innerHTML = renderStatistics();
   } else if(state.route.view==="reporting"){
     app.innerHTML = renderReporting();
+    rpAfterRender();
   } else if(state.route.view==="testData"){
     app.innerHTML = renderTestData();
   } else if(state.route.view==="team"){
@@ -1509,7 +1522,8 @@ var AUDIT_ACTION_LABELS = {
   REPORTING_ACCESS_REVOKED: "Revoked Reporting Access",
   REPORT_SYNC_RUN: "Ran Reporting Sync",
   REPORT_SETTINGS_UPDATED: "Changed Reporting Sync Settings",
-  REPORT_EXPORTED: "Exported a Report"
+  REPORT_EXPORTED: "Exported a Report",
+  REPORT_DEPENDENCY_CHANGED: "Changed a Reporting Dependency"
 };
 function humanizeAuditAction(action){
   return AUDIT_ACTION_LABELS[action] || action;
@@ -2015,7 +2029,10 @@ function rpFetchStatus(){
   return api.reportingSyncStatus().then(function(st){
     var was = state.rp.status && state.rp.status.running;
     state.rp.status = st;
-    if(was && !st.running) showToast(st.lastRun && st.lastRun.status==="failed" ? "Sync failed — see the details below." : "✓ Sync finished");
+    if(was && !st.running){
+      showToast(st.lastRun && st.lastRun.status==="failed" ? "Sync failed — see the details below." : "✓ Sync finished");
+      if(!(st.lastRun && st.lastRun.status==="failed")){ state.rp.report = null; state.rp.reportError = null; }
+    }
     rpRefreshStatusPanel();
   }).catch(function(e){
     if(e && e.status===403){ state.reportingDenied = true; render(); }
@@ -2064,18 +2081,359 @@ function rpSaveSettings(){
   });
 }
 
-function renderReporting(){
-  if(!state.teamReady) return '<div class="list-head"><div><h1>Reporting</h1></div></div><div class="empty-state"><h3>Loading…</h3></div>';
-  if(!canViewReporting() || state.reportingDenied) return renderReportingNoAccess();
-  var head = '<div class="list-head sv-head"><div><h1>Reporting</h1><p>PMO delivery and variance reporting from Jira — all estimates and time in hours.</p></div></div>';
-  if(!state.reportingReady) return head+'<div class="empty-state"><h3>Loading…</h3></div>';
-  var plan = [
-    ["Full Summary Report", "Delivery status, estimated vs. logged hours, cycle and lead time, blockers by external entities, overdue work and spillover."],
-    ["Variance Report", "Estimated vs. logged hours by ticket, team member, team, component, epic and service."],
-    ["Excel and CSV export", "Every report as an Excel workbook (pivot-ready tables) and as UTF-8 CSV."]
-  ];
+/* ---- Reporting: reports, charts, downloads, dependency tracker, presets (Phases 2–4) ----
+   The server builds the report (server/reportingEngine.js) and the same JSON feeds
+   this page, the Excel workbook and the CSV files. Long tables are cut to their
+   first rows here and say so; the downloads always carry every row. */
+var RP_FILTER_LISTS = [["sprints","Sprint"],["services","Service"],["squads","Squad"],["components","Component"],["issueTypes","Issue type"],["assignees","Assignee"],["epics","Epic"],["statusCategories","Status category"],["priorities","Priority"]];
+var RP_NONE = "(none)", RP_UNASSIGNED = "__none__";
+function rpEmptyFilters(){
+  return {period:{by:"created", from:"", to:""}, sprints:[], services:[], squads:[], components:[], issueTypes:[], assignees:[], epics:[], statusCategories:[], priorities:[], blockedOnly:false, overdueOnly:false, includeSubtasks:true};
+}
+function rpCloneFilters(f){
+  var o = rpEmptyFilters(), src = f || {};
+  if(src.period){ o.period.by = src.period.by || "created"; o.period.from = src.period.from || ""; o.period.to = src.period.to || ""; }
+  RP_FILTER_LISTS.forEach(function(x){ o[x[0]] = (src[x[0]]||[]).slice(); });
+  o.blockedOnly = !!src.blockedOnly; o.overdueOnly = !!src.overdueOnly; o.includeSubtasks = src.includeSubtasks!==false;
+  return o;
+}
+var rpYmdFmt = null, rpPartsFmt = null;
+function rpAmmanYmd(iso){
+  if(!iso) return "";
+  if(/^\d{4}-\d{2}-\d{2}$/.test(iso)) return iso;
+  try{
+    rpYmdFmt = rpYmdFmt || new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Amman", year:"numeric", month:"2-digit", day:"2-digit"});
+    return rpYmdFmt.format(new Date(iso));
+  }catch(e){ return String(iso).slice(0,10); }
+}
+function rpAmmanDateTime(iso){
+  if(!iso) return "";
+  try{
+    rpPartsFmt = rpPartsFmt || new Intl.DateTimeFormat("en-CA",{timeZone:"Asia/Amman", year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", hourCycle:"h23"});
+    var o = {}; rpPartsFmt.formatToParts(new Date(iso)).forEach(function(p){ if(p.type!=="literal") o[p.type]=p.value; });
+    return o.year+"-"+o.month+"-"+o.day+" "+o.hour+":"+o.minute;
+  }catch(e){ return String(iso); }
+}
+function rpNum(v, d){
+  if(v===null || v===undefined || v==="" || isNaN(Number(v))) return null;
+  return Number(v).toLocaleString("en-US",{minimumFractionDigits:d, maximumFractionDigits:d});
+}
+// One table cell, formatted by its column type. Returns trusted HTML.
+function rpCell(col, v, site){
+  var empty = '<span class="rp-nil">—</span>';
+  if(v===null || v===undefined || v==="") return col.type==="text" || col.type==="key" ? "" : empty;
+  switch(col.type){
+    case "int": { var n = rpNum(Math.round(Number(v)),0); return n===null ? empty : esc(n); }
+    case "hours": case "days": { var h = rpNum(v,1); return h===null ? empty : esc(h); }
+    case "pct": { var p = rpNum(v,1); return p===null ? empty : esc(p)+"%"; }
+    case "date": return esc(rpAmmanYmd(v));
+    case "datetime": return esc(rpAmmanDateTime(v));
+    case "key":
+      return site && /^[A-Z][A-Z0-9_]+-\d+$/.test(String(v))
+        ? '<a class="rp-key" href="'+escAttr(site.replace(/\/+$/,"")+"/browse/"+v)+'" target="_blank" rel="noopener noreferrer">'+esc(v)+'</a>'
+        : '<span class="rp-key">'+esc(v)+'</span>';
+    default: {
+      var s = String(v);
+      if(col.key==="estimate_accuracy_band" || col.key==="accuracy_band") return '<span class="rp-chip '+rpBandClass(s)+'">'+esc(s)+'</span>';
+      if(col.key==="forecast") return '<span class="rp-chip '+(s==="Slipped"?"is-over":s==="At risk"?"is-warn":"is-ok")+'">'+esc(s)+'</span>';
+      return esc(s);
+    }
+  }
+}
+function rpBandClass(s){ return /^Over/.test(s) ? "is-over" : /^Under/.test(s) ? "is-under" : /^On target/.test(s) ? "is-ok" : "is-none"; }
+function rpIsNumType(t){ return t==="int" || t==="hours" || t==="days" || t==="pct"; }
+function rpBlockHtml(b, site){
+  var head = '<h3 class="rp-block-title">'+esc(b.title)+'</h3>'+(b.note?'<p class="rp-note">'+esc(b.note)+'</p>':'');
+  if(b.kind==="kv"){
+    return '<div class="rp-block">'+head+'<div class="rp-table-wrap"><table class="rp-table rp-kv"><thead><tr>'+b.columns.map(function(c){ return '<th>'+esc(c.header)+'</th>'; }).join("")+'</tr></thead><tbody>'+
+      b.rows.map(function(r){
+        return '<tr>'+b.columns.map(function(c){
+          if(c.key==="value"){ var t = r.valueType || "text"; return '<td class="'+(rpIsNumType(t)?"num":"")+' rp-pre">'+rpCell({type:t,key:"value"}, r.value, site)+'</td>'; }
+          return '<td class="'+(c.key==="note"?"rp-soft":"")+' rp-pre">'+esc(r[c.key]==null?"":r[c.key])+'</td>';
+        }).join("")+'</tr>';
+      }).join("")+'</tbody></table></div></div>';
+  }
+  var cut = b.totalRows!==undefined && b.totalRows > b.rows.length;
+  var body = b.rows.length
+    ? '<div class="rp-table-wrap"><table class="rp-table"><thead><tr>'+b.columns.map(function(c){ return '<th class="'+(rpIsNumType(c.type)?"num":"")+'">'+esc(c.header)+'</th>'; }).join("")+'</tr></thead><tbody>'+
+      b.rows.map(function(r){
+        return '<tr>'+b.columns.map(function(c){ return '<td class="'+(rpIsNumType(c.type)?"num":"")+'">'+rpCell(c, r[c.key], site)+'</td>'; }).join("")+'</tr>';
+      }).join("")+'</tbody></table></div>'
+    : '<div class="sv-empty"><span class="sv-empty-ico" aria-hidden="true">◌</span><span>No rows in this scope.</span></div>';
+  return '<div class="rp-block">'+head+body+
+    (cut ? '<p class="rp-cut">Showing the first '+b.rows.length+' of '+b.totalRows+' rows. The Excel and CSV downloads contain every row.</p>' : '')+'</div>';
+}
+function rpChartsHtml(report){
+  if(typeof ReportingCharts==="undefined") return '<div class="empty-state"><h3>Charts unavailable</h3><p>The chart module did not load. Reload the page.</p></div>';
+  return '<div class="rp-charts">'+report.charts.map(function(c){
+    var asTable = !!state.rp.chartTables[c.id];
+    var inner;
+    if(asTable){
+      var t = ReportingCharts.table(c);
+      inner = '<div class="rp-table-wrap rp-chart-table"><table class="rp-table"><thead><tr>'+t.columns.map(function(h){ return '<th>'+esc(h)+'</th>'; }).join("")+'</tr></thead><tbody>'+
+        (t.rows.slice(0,300).map(function(r){ return '<tr>'+r.map(function(x){ return '<td class="'+(typeof x==="number"?"num":"")+'">'+esc(x===null||x===undefined?"":x)+'</td>'; }).join("")+'</tr>'; }).join("") || '<tr><td colspan="'+t.columns.length+'" class="rp-soft">No data in this scope.</td></tr>')+'</tbody></table></div>';
+    } else {
+      inner = '<div class="rp-chart-svg">'+ReportingCharts.render(c,{theme:"css", interactive:true, width:620, height:350})+'</div>';
+    }
+    return '<figure class="rp-chart"><div class="rp-chart-head"><h3>'+esc(c.title)+'</h3><button type="button" class="btn btn-ghost btn-sm" data-action="rp-chart-table" data-id="'+escAttr(c.id)+'">'+(asTable?"Show chart":"View as table")+'</button></div>'+inner+'<figcaption>'+esc(c.caption||"")+'</figcaption></figure>';
+  }).join("")+'</div>';
+}
+function rpMultiOptions(key){
+  var o = state.rp.options || {};
+  var plain = function(list, withNone){ var a = (list||[]).map(function(x){ return {value:x, label:x}; }); if(withNone) a.push({value:RP_NONE, label:"(none set)"}); return a; };
+  switch(key){
+    case "sprints": return plain(o.sprints);
+    case "services": return plain(o.services, true);
+    case "squads": return plain(o.squads, true);
+    case "components": return plain(o.components, true);
+    case "issueTypes": return plain(o.issueTypes);
+    case "priorities": return plain(o.priorities, true);
+    case "statusCategories": return plain(o.statusCategories);
+    case "assignees": return [{value:RP_UNASSIGNED, label:"Unassigned"}].concat((o.assignees||[]).map(function(a){ return {value:a.id, label:a.name}; }));
+    case "epics": return [{value:RP_UNASSIGNED, label:"No epic"}].concat((o.epics||[]).map(function(e){ return {value:e.key, label:e.key+(e.name?" – "+e.name:"")}; }));
+  }
+  return [];
+}
+function rpMultiHtml(key, label){
+  var sel = state.rp.filters[key], opts = rpMultiOptions(key);
+  return '<details class="rp-ms" data-ms="'+key+'"><summary><span class="rp-ms-label">'+esc(label)+'</span><span class="rp-ms-count" data-ms-count="'+key+'">'+(sel.length ? sel.length+" selected" : "All")+'</span></summary>'+
+    '<div class="rp-ms-list">'+(opts.length ? opts.map(function(o){
+      return '<label class="rp-ms-opt"><input type="checkbox" data-rp-ms="'+key+'" value="'+escAttr(o.value)+'"'+(sel.indexOf(o.value)>=0?" checked":"")+'><span>'+esc(o.label)+'</span></label>';
+    }).join("") : '<div class="rp-ms-none">No values in the synced data.</div>')+'</div></details>';
+}
+function rpFilterBarHtml(){
+  var f = state.rp.filters, presets = state.rp.presets || [];
+  return '<section class="sv-panel rp-filters"><div class="sv-panel-head"><h2>Filters</h2><p>Everything below — the tables, charts and downloads — uses these filters. Dates are Amman calendar days.</p></div>'+
+    '<div class="rp-filter-row">'+
+      '<div class="field"><label for="rp-period-by">Period applies to</label><select id="rp-period-by" data-rp-f="period.by">'+
+        [["created","Created date"],["completed","Completed date"],["worklog","Worklog date"]].map(function(o){ return '<option value="'+o[0]+'"'+(f.period.by===o[0]?" selected":"")+'>'+o[1]+'</option>'; }).join("")+'</select></div>'+
+      '<div class="field"><label for="rp-from">From</label><input type="date" id="rp-from" data-rp-f="period.from" value="'+escAttr(f.period.from)+'"></div>'+
+      '<div class="field"><label for="rp-to">To</label><input type="date" id="rp-to" data-rp-f="period.to" value="'+escAttr(f.period.to)+'"></div>'+
+    '</div>'+
+    '<div class="rp-ms-grid">'+RP_FILTER_LISTS.map(function(x){ return rpMultiHtml(x[0], x[1]); }).join("")+'</div>'+
+    '<div class="rp-checks">'+
+      '<label class="rp-check"><input type="checkbox" data-rp-f="blockedOnly"'+(f.blockedOnly?" checked":"")+'> Blocked tickets only</label>'+
+      '<label class="rp-check"><input type="checkbox" data-rp-f="overdueOnly"'+(f.overdueOnly?" checked":"")+'> Overdue tickets only</label>'+
+      '<label class="rp-check"><input type="checkbox" data-rp-f="includeSubtasks"'+(f.includeSubtasks?" checked":"")+'> Include sub-tasks</label>'+
+    '</div>'+
+    '<div class="rp-preset-row">'+
+      '<div class="field"><label for="rp-preset-pick">Saved filter sets</label><div class="rp-inline">'+
+        '<select id="rp-preset-pick" data-rp-f="preset"><option value="">'+(presets.length ? "Choose a saved set…" : "None saved yet")+'</option>'+presets.map(function(p){ return '<option value="'+escAttr(p.id)+'">'+esc(p.name)+'</option>'; }).join("")+'</select>'+
+        '<button type="button" class="btn btn-sm" data-action="rp-preset-delete"'+(presets.length?"":" disabled")+'>Delete</button></div></div>'+
+      '<div class="field"><label for="rp-preset-name">Save these filters as</label><div class="rp-inline"><input type="text" id="rp-preset-name" maxlength="60" placeholder="e.g. Tax Gateway — Q3" value="'+escAttr(state.rp.presetName||"")+'"><button type="button" class="btn btn-sm" data-action="rp-preset-save">Save</button></div></div>'+
+      '<div class="rp-run"><button type="button" class="btn btn-primary" id="rp-run-btn" data-action="rp-run"'+(state.rp.reportLoading?" disabled":"")+'>'+(state.rp.reportLoading?"Updating…":"Update report")+'</button>'+
+        '<button type="button" class="btn" data-action="rp-reset">Clear filters</button></div>'+
+    '</div></section>';
+}
+function rpReportsTabHtml(){
   var rp = state.rp;
-  var syncBody;
+  if(rp.needsPostgres) return '<div class="empty-state rp-needs"><h3>Reporting needs the Postgres database</h3><p>Set <b>DATABASE_URL</b> (Supabase) and restart to use Reporting.</p></div>';
+  if(rp.status && !rp.status.lastSyncedAt && !(rp.status.counts && rp.status.counts.issues)){
+    return '<div class="empty-state"><h3>No Jira data yet</h3><p>Reports are built from the synced copy of your Jira data. Run the first sync, then come back here.</p><div style="margin-top:14px;"><button class="btn btn-primary" data-action="rp-tab" data-tab="sync">Go to Data sync</button></div></div>';
+  }
+  var out = '';
+  if(rp.filters) out += rpFilterBarHtml();
+  if(rp.reportError) out += '<div class="empty-state rp-needs"><h3>Couldn’t build the report</h3><p>'+esc(rp.reportError)+'</p></div>';
+  var rep = rp.report;
+  if(!rep) return out + (rp.reportError ? '' : '<div class="empty-state"><h3>Building the report…</h3></div>');
+  var site = rep.meta.jiraSiteUrl || "";
+  var sheet = rep.sheets.filter(function(s){ return s.id===rp.sheetId; })[0] || rep.sheets[1] || rep.sheets[0];
+  var pills = '<div class="rp-pills" role="tablist" aria-label="Report sheets">'+rep.sheets.map(function(s){
+    return '<button type="button" role="tab" class="rp-pill'+(s.id===sheet.id?" is-active":"")+'" aria-selected="'+(s.id===sheet.id)+'" data-action="rp-sheet" data-id="'+escAttr(s.id)+'">'+esc(s.name)+'</button>';
+  }).join("")+'</div>';
+  var busy = rp.exporting;
+  var bar = '<div class="rp-reportbar">'+pills+'<div class="rp-downloads">'+
+    '<button type="button" class="btn btn-primary btn-sm" data-action="rp-xlsx"'+(busy?" disabled":"")+'>'+iconDownload()+' '+(busy==="xlsx"?"Preparing…":"Excel workbook")+'</button>'+
+    '<button type="button" class="btn btn-sm" data-action="rp-csv"'+(busy?" disabled":"")+' title="Downloads the sheet you are looking at">'+iconDownload()+' '+(busy==="csv"?"Preparing…":"This sheet (CSV)")+'</button></div></div>';
+  var sub = '<p class="rp-scope">'+esc(rep.caption)+' · generated '+esc(rpAmmanDateTime(rep.meta.generatedAt))+' (Amman)'+(rp.reportLoading?' · <b>updating…</b>':'')+'</p>';
+  var body = sheet.charts ? rpChartsHtml(rep) : sheet.blocks.map(function(b){ return rpBlockHtml(b, site); }).join("");
+  return out + '<section class="sv-panel rp-report'+(rp.reportLoading?" is-loading":"")+'">'+bar+sub+'<div class="rp-sheet-title"><h2>'+esc(sheet.title)+'</h2></div>'+body+'</section>';
+}
+
+/* dependency tracker */
+function rpToday(){ return rpAmmanYmd(new Date().toISOString()); }
+function rpDaysOverdue(d){
+  if(["Requested","In progress"].indexOf(d.status)<0 || !d.promised_date) return 0;
+  var t = rpToday();
+  if(d.promised_date >= t) return 0;
+  return Math.round((Date.parse(t+"T00:00:00Z") - Date.parse(d.promised_date+"T00:00:00Z"))/86400000);
+}
+function rpDepStatusClass(s){ return s==="Received" ? "is-ok" : s==="Cancelled" ? "is-none" : s==="In progress" ? "is-warn" : "is-under"; }
+function rpDepsTabHtml(){
+  var rp = state.rp;
+  if(rp.needsPostgres) return '<div class="empty-state rp-needs"><h3>Reporting needs the Postgres database</h3><p>Set <b>DATABASE_URL</b> (Supabase) and restart to use Reporting.</p></div>';
+  var head = '<section class="sv-panel"><div class="sv-panel-head"><h2>External dependencies</h2><p>What government entities and vendors owe the programme. Link the Jira tickets each one is blocking — the Dependencies sheet, the blocked-days figures and the ageing chart are built from this list.</p></div>'+
+    '<div class="rp-actions"><button type="button" class="btn btn-primary" data-action="rp-dep-add">Add dependency</button></div>';
+  if(rp.depsError) return head+'<div class="empty-state rp-needs"><h3>Couldn’t load the dependencies</h3><p>'+esc(rp.depsError)+'</p></div></section>';
+  if(!rp.deps) return head+'<div class="empty-state"><h3>Loading…</h3></div></section>';
+  if(!rp.deps.length) return head+'<div class="empty-state"><h3>No dependencies tracked yet</h3><p>Add the first one — for example the ministry that has to give you an environment, and what you are waiting for.</p></div></section>';
+  var rows = rp.deps.map(function(d){
+    var od = rpDaysOverdue(d);
+    return '<tr><td><b>'+esc(d.entity)+'</b></td><td>'+esc(d.vendor)+'</td><td class="rp-wrap">'+esc(d.needed)+'</td><td>'+esc(d.owner_name)+'</td>'+
+      '<td>'+esc(d.promised_date||"—")+'</td><td><span class="rp-chip '+rpDepStatusClass(d.status)+'">'+esc(d.status)+'</span></td>'+
+      '<td class="num">'+(od? '<b class="rp-late">'+od+'</b>' : '<span class="rp-nil">—</span>')+'</td>'+
+      '<td>'+esc(d.last_contact_date||"—")+'</td><td>'+esc(d.next_followup_date||"—")+'</td>'+
+      '<td>'+(d.issues.length? d.issues.map(function(i){ return '<span class="rp-key">'+esc(i.key)+'</span>'; }).join(" ") : '<span class="rp-nil">none linked</span>')+'</td>'+
+      '<td><button type="button" class="btn btn-sm" data-action="rp-dep-edit" data-id="'+escAttr(d.id)+'">Edit</button></td></tr>';
+  }).join("");
+  return head+'<div class="rp-table-wrap"><table class="rp-table"><thead><tr><th>Government entity</th><th>Vendor</th><th>What is needed</th><th>Owner</th><th>Promised</th><th>Status</th><th class="num">Days overdue</th><th>Last contact</th><th>Next follow-up</th><th>Blocked tickets</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div></section>';
+}
+function rpDepFormHtml(d){
+  var isEdit = !!d;
+  d = d || {entity:"", vendor:"", needed:"", owner_name:"", promised_date:"", status:"Requested", last_contact_date:"", next_followup_date:""};
+  var statuses = state.rp.depStatuses || ["Requested","In progress","Received","Cancelled"];
+  var f = function(id, label, val, type, ph){ return '<div class="field"><label for="'+id+'">'+label+'</label><input type="'+(type||"text")+'" id="'+id+'" value="'+escAttr(val||"")+'"'+(ph?' placeholder="'+escAttr(ph)+'"':"")+'></div>'; };
+  return '<form id="rp-dep-form" autocomplete="off" data-id="'+escAttr(isEdit?d.id:"")+'"><div class="modal-head"><h3>'+(isEdit?"Edit dependency":"Add dependency")+'</h3><button type="button" class="btn btn-icon btn-ghost" data-action="close-modal" aria-label="Close">'+iconClose()+'</button></div>'+
+    '<div class="modal-body">'+
+      f("rp-d-entity","Government entity",d.entity,"text","e.g. Civil Status & Passports Dept")+
+      '<div class="field-row">'+f("rp-d-vendor","Vendor <span class=\"hint\">(optional)</span>",d.vendor)+f("rp-d-owner","Owner <span class=\"hint\">(who follows up)</span>",d.owner_name)+'</div>'+
+      '<div class="field"><label for="rp-d-needed">What is needed</label><textarea id="rp-d-needed" rows="2">'+esc(d.needed||"")+'</textarea></div>'+
+      '<div class="field-row">'+f("rp-d-promised","Promised date",d.promised_date,"date")+
+        '<div class="field"><label for="rp-d-status">Status</label><select id="rp-d-status">'+statuses.map(function(s){ return '<option'+(s===d.status?" selected":"")+'>'+esc(s)+'</option>'; }).join("")+'</select></div></div>'+
+      '<div class="field-row">'+f("rp-d-last","Last contact",d.last_contact_date,"date")+f("rp-d-next","Next follow-up",d.next_followup_date,"date")+'</div>'+
+      (isEdit ? '<div class="field"><label>Blocked tickets</label><div id="rp-dep-links">'+rpDepLinksHtml(d)+'</div>'+
+        '<div class="rp-inline" style="margin-top:8px;"><input type="text" id="rp-dep-search" placeholder="Search a synced ticket by key or title…" autocomplete="off"></div><div id="rp-dep-results" class="rp-results"></div></div>'
+        : '<p class="hint">Save first, then link the Jira tickets this blocks.</p>')+
+    '</div><div class="modal-foot">'+(isEdit?'<button type="button" class="btn btn-danger" data-action="rp-dep-del" data-id="'+escAttr(d.id)+'">Delete</button>':'<span></span>')+
+      '<span><button type="button" class="btn" data-action="close-modal">Cancel</button> <button type="submit" class="btn btn-primary">Save</button></span></div></form>';
+}
+function rpDepLinksHtml(d){
+  return d.issues && d.issues.length ? '<ul class="rp-linklist">'+d.issues.map(function(i){
+    return '<li><span class="rp-key">'+esc(i.key)+'</span><span class="rp-soft">'+esc(i.summary)+'</span><button type="button" class="btn btn-ghost btn-sm" data-action="rp-dep-unlink" data-key="'+escAttr(i.key)+'" aria-label="Unlink '+escAttr(i.key)+'">Unlink</button></li>';
+  }).join("")+'</ul>' : '<span class="rp-nil">No tickets linked yet.</span>';
+}
+function rpFindDep(id){ return (state.rp.deps||[]).filter(function(d){ return d.id===String(id); })[0] || null; }
+function rpLoadDeps(){
+  return api.reportingDependencies().then(function(r){ state.rp.deps = r.dependencies; state.rp.depStatuses = r.statuses; state.rp.depsError = null; })
+    .catch(function(e){ if(e && e.status===403){ state.reportingDenied = true; return; } state.rp.depsError = (e && e.message) || "Couldn’t load the dependencies."; });
+}
+function rpOpenDep(d){ openModal(rpDepFormHtml(d), {}); }
+function rpSaveDep(form){
+  var id = form.getAttribute("data-id");
+  var body = {entity:val("rp-d-entity"), vendor:val("rp-d-vendor"), owner_name:val("rp-d-owner"), needed:val("rp-d-needed"), promised_date:val("rp-d-promised")||null, status:val("rp-d-status"), last_contact_date:val("rp-d-last")||null, next_followup_date:val("rp-d-next")||null};
+  function val(i){ return (document.getElementById(i)||{value:""}).value.trim(); }
+  if(!body.entity){ showToast("Enter the government entity."); return; }
+  var btn = form.querySelector("button[type=submit]"); if(btn){ btn.disabled = true; btn.textContent = "Saving…"; }
+  (id ? api.updateReportingDependency(id, body) : api.createReportingDependency(body)).then(function(r){
+    return rpLoadDeps().then(function(){
+      showToast("✓ Dependency saved");
+      var created = (!id && r && r.id) ? rpFindDep(r.id) : null;
+      if(created) rpOpenDep(created); else closeModal();
+      state.rp.report = null; render();
+    });
+  }).catch(function(e){ showToast((e && e.message) || "Couldn’t save the dependency."); if(btn){ btn.disabled = false; btn.textContent = "Save"; } });
+}
+function rpRefreshDepLinks(id){
+  var d = rpFindDep(id), el = document.getElementById("rp-dep-links");
+  if(el && d) el.innerHTML = rpDepLinksHtml(d);
+}
+function rpSearchIssues(q, depId){
+  var out = document.getElementById("rp-dep-results"); if(!out) return;
+  if(!q.trim()){ out.innerHTML = ""; return; }
+  api.reportingIssueSearch(q).then(function(r){
+    if(!document.getElementById("rp-dep-results")) return;
+    out.innerHTML = r.issues.length ? '<ul class="rp-linklist">'+r.issues.map(function(i){
+      var already = i.dependencyId===String(depId);
+      return '<li><span class="rp-key">'+esc(i.key)+'</span><span class="rp-soft">'+esc(i.summary)+(i.dependencyId && !already ? ' <i>(linked to another dependency — linking moves it here)</i>' : '')+'</span>'+
+        (already ? '<span class="rp-nil">linked</span>' : '<button type="button" class="btn btn-sm" data-action="rp-dep-link" data-key="'+escAttr(i.key)+'">Link</button>')+'</li>';
+    }).join("")+'</ul>' : '<span class="rp-nil">No synced ticket matches.</span>';
+  }).catch(function(e){ out.innerHTML = '<span class="rp-nil">'+esc((e&&e.message)||"Search failed.")+'</span>'; });
+}
+function rpLinkIssue(key, linkTo, depId){
+  api.linkReportingIssue(key, linkTo).then(rpLoadDeps).then(function(){
+    rpRefreshDepLinks(depId); state.rp.report = null;
+    var q = document.getElementById("rp-dep-search"); if(q) rpSearchIssues(q.value, depId);
+    var d = document.getElementById("app"); if(d && state.route.view==="reporting") d.innerHTML = renderReporting();
+  }).catch(function(e){ showToast((e && e.message) || "Couldn’t update the link."); });
+}
+
+/* report loading / filters / downloads */
+function rpEnsureReports(){
+  var rp = state.rp;
+  if(rp.needsPostgres || rp.error || rp.reportBooting) return Promise.resolve();
+  if(rp.report && rp.filters) return Promise.resolve();
+  if(rp.status && !rp.status.lastSyncedAt && !(rp.status.counts && rp.status.counts.issues)) return Promise.resolve();
+  rp.reportBooting = true;
+  return api.reportingFilters().then(function(f){
+    rp.options = f.options; rp.presets = f.presets || [];
+    if(!rp.filters) rp.filters = rpEmptyFilters();
+  }).then(function(){ return rpRunReport(true); })
+  .catch(function(e){
+    if(e && e.status===403){ state.reportingDenied = true; return; }
+    rp.reportError = (e && e.message) || "Couldn’t load the report.";
+    if(!rp.filters) rp.filters = rpEmptyFilters();
+  }).then(function(){ rp.reportBooting = false; if(state.route.view==="reporting") render(); });
+}
+function rpRunReport(quiet){
+  var rp = state.rp;
+  rp.reportLoading = true; rp.reportError = null;
+  if(!quiet && state.route.view==="reporting") render();
+  return api.reportingReport(rp.filters).then(function(rep){
+    rp.report = rep; rp.reportLoading = false;
+    if(!rep.sheets.some(function(s){ return s.id===rp.sheetId; })) rp.sheetId = "summary";
+  }).catch(function(e){
+    rp.reportLoading = false;
+    if(e && e.status===403){ state.reportingDenied = true; return; }
+    rp.reportError = (e && e.message) || "Couldn’t build the report.";
+  }).then(function(){ if(!quiet && state.route.view==="reporting") render(); });
+}
+function rpDownload(path, body, fallbackName){
+  return fetch(API+path, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)}).then(function(res){
+    if(res.status===401){ location.reload(); return new Promise(function(){}); }
+    if(!res.ok) return res.json().catch(function(){ return {}; }).then(function(d){ var e = new Error(d.error || ("Download failed ("+res.status+")")); e.status = res.status; throw e; });
+    var m = /filename="([^"]+)"/.exec(res.headers.get("Content-Disposition")||"");
+    return res.blob().then(function(blob){
+      var url = URL.createObjectURL(blob), a = document.createElement("a");
+      a.href = url; a.download = m ? m[1] : fallbackName; document.body.appendChild(a); a.click();
+      setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(url); }, 1500);
+    });
+  });
+}
+function rpExport(kind){
+  var rp = state.rp; if(!rp.report || rp.exporting) return;
+  rp.exporting = kind; render();
+  // the report on screen is the one that downloads (its own filters, not unapplied edits)
+  var filters = rp.report.meta.filterValues;
+  var p = kind==="xlsx" ? rpDownload("/reporting/export/xlsx", {filters:filters}, "SANAD_PMO_Delivery_Report.xlsx")
+                        : rpDownload("/reporting/export/csv", {filters:filters, sheet:rp.sheetId}, "report.csv");
+  p.then(function(){ showToast("✓ Download started"); }).catch(function(e){
+    if(e && e.status===403){ state.reportingDenied = true; return; }
+    showToast((e && e.message) || "Download failed.");
+  }).then(function(){ rp.exporting = false; render(); });
+}
+function rpSetFilterField(path, value){
+  var f = state.rp.filters;
+  if(path.indexOf("period.")===0) f.period[path.slice(7)] = value; else f[path] = value;
+  var b = document.getElementById("rp-run-btn"); if(b) b.classList.add("is-dirty");
+}
+function rpFilterChange(el){
+  var f = state.rp.filters; if(!f) return false;
+  var ms = el.getAttribute("data-rp-ms");
+  if(ms){
+    var list = f[ms], v = el.value, i = list.indexOf(v);
+    if(el.checked && i<0) list.push(v); else if(!el.checked && i>=0) list.splice(i,1);
+    var c = document.querySelector('[data-ms-count="'+ms+'"]'); if(c) c.textContent = list.length ? list.length+" selected" : "All";
+    var b = document.getElementById("rp-run-btn"); if(b) b.classList.add("is-dirty");
+    return true;
+  }
+  var path = el.getAttribute("data-rp-f");
+  if(!path) return false;
+  if(path==="preset"){
+    var p = (state.rp.presets||[]).filter(function(x){ return x.id===el.value; })[0];
+    if(p){ state.rp.filters = rpCloneFilters(p.filters); state.rp.pickedPreset = p.id; rpRunReport(); }
+    return true;
+  }
+  rpSetFilterField(path, el.type==="checkbox" ? el.checked : el.value);
+  return true;
+}
+function rpTabHtml(){
+  var t = state.rp.tab;
+  return '<div class="rp-tabs" role="tablist">'+[["reports","Reports"],["deps","Dependencies"],["sync","Data sync"]].map(function(x){
+    return '<button type="button" role="tab" class="rp-tab'+(t===x[0]?" is-active":"")+'" aria-selected="'+(t===x[0])+'" data-action="rp-tab" data-tab="'+x[0]+'">'+x[1]+'</button>';
+  }).join("")+'</div>';
+}
+function rpSyncTabHtml(){
+  var rp = state.rp, syncBody;
   if(rp.needsPostgres){
     syncBody = '<div class="empty-state rp-needs"><h3>Reporting needs the Postgres database</h3><p>This server is running on the local JSON file. Reporting keeps its copy of the Jira data in Postgres (Supabase) — set <b>DATABASE_URL</b> and restart to use it.</p></div>';
   } else if(rp.error){
@@ -2083,15 +2441,23 @@ function renderReporting(){
   } else {
     syncBody = '<div id="rp-sync-panel">'+rpStatusHtml()+'</div>';
   }
-  var out = head+
-    '<section class="sv-panel"><div class="sv-panel-head"><h2>Jira data</h2><p>Reporting reads from its own copy of your Jira data, so reports are fast and never hit Jira while you browse.</p></div>'+syncBody+'</section>';
+  var out = '<section class="sv-panel"><div class="sv-panel-head"><h2>Jira data</h2><p>Reporting reads from its own copy of your Jira data, so reports are fast and never hit Jira while you browse.</p></div>'+syncBody+'</section>';
   if(!rp.needsPostgres && !rp.error){
     out += '<section class="sv-panel"><div class="sv-panel-head"><h2>Recent syncs</h2><p>The last ten runs. Times are shown in Amman time.</p></div><div id="rp-runs">'+rpRunsHtml()+'</div></section>'+
       '<section class="sv-panel"><div class="sv-panel-head"><h2>Sync settings</h2><p>What to copy from Jira and how to name services, components and squads. Changes apply from the next sync.</p></div>'+rpSettingsHtml()+'</section>';
   }
-  return out+
-    '<section class="sv-panel"><div class="sv-panel-head"><h2>Coming next</h2><p>Planned for the following phases of the Reporting module — nothing below is available yet.</p></div>'+
-      '<ul class="rp-plan">'+plan.map(function(p){ return '<li><b>'+esc(p[0])+'</b><span>'+esc(p[1])+'</span></li>'; }).join("")+'</ul></section>';
+  return out;
+}
+function rpAfterRender(){
+  if(typeof ReportingCharts!=="undefined") qsa(".rp-charts").forEach(function(el){ ReportingCharts.attachTips(el, document); });
+}
+function renderReporting(){
+  if(!state.teamReady) return '<div class="list-head"><div><h1>Reporting</h1></div></div><div class="empty-state"><h3>Loading…</h3></div>';
+  if(!canViewReporting() || state.reportingDenied) return renderReportingNoAccess();
+  var head = '<div class="list-head sv-head"><div><h1>Reporting</h1><p>PMO delivery and variance reporting from Jira — all estimates and time in hours.</p></div></div>';
+  if(!state.reportingReady) return head+'<div class="empty-state"><h3>Loading…</h3></div>';
+  var tab = state.rp.tab;
+  return head + rpTabHtml() + (tab==="deps" ? rpDepsTabHtml() : tab==="sync" ? rpSyncTabHtml() : rpReportsTabHtml());
 }
 
 /* ---- Statistics: visual building blocks (plain HTML/SVG, no libraries) ---- */
@@ -5667,6 +6033,47 @@ document.addEventListener("click", function(e){
     case "nav-statistics": goTo("#/statistics"); break;
     case "nav-reporting": goTo("#/reporting"); break;
     case "rp-sync": rpStartSync(el2.getAttribute("data-mode")==="full" ? "full" : "incremental"); break;
+    case "rp-tab":
+      state.rp.tab = el2.getAttribute("data-tab") || "reports";
+      if(state.rp.tab==="deps" && !state.rp.deps) rpLoadDeps().then(function(){ if(state.route.view==="reporting") render(); });
+      if(state.rp.tab==="reports") rpEnsureReports();
+      render();
+      break;
+    case "rp-run": rpRunReport(); break;
+    case "rp-reset": state.rp.filters = rpEmptyFilters(); rpRunReport(); break;
+    case "rp-sheet": state.rp.sheetId = id; render(); break;
+    case "rp-xlsx": rpExport("xlsx"); break;
+    case "rp-csv": rpExport("csv"); break;
+    case "rp-chart-table": state.rp.chartTables[id] = !state.rp.chartTables[id]; render(); break;
+    case "rp-preset-save":
+      var pnEl = document.getElementById("rp-preset-name"), pn = pnEl ? pnEl.value.trim() : "";
+      if(!pn){ showToast("Give the filter set a name first."); break; }
+      api.saveReportingPreset(pn, state.rp.filters).then(function(r){ state.rp.presets = r.presets; state.rp.presetName = ""; showToast("✓ Filter set saved"); render(); })
+        .catch(function(e){ showToast((e && e.message) || "Couldn’t save the filter set."); });
+      break;
+    case "rp-preset-delete":
+      var pickEl = document.getElementById("rp-preset-pick"), pid = pickEl ? pickEl.value : "";
+      if(!pid){ showToast("Choose a saved filter set to delete."); break; }
+      var pobj = (state.rp.presets||[]).filter(function(x){ return x.id===pid; })[0];
+      openConfirm("Delete this filter set?", "This removes <b>"+esc(pobj?pobj.name:"")+"</b> for everyone with Reporting access.", "Delete", function(){
+        api.deleteReportingPreset(pid).then(function(r){ state.rp.presets = r.presets; showToast("Filter set deleted"); render(); })
+          .catch(function(e){ showToast((e && e.message) || "Couldn’t delete the filter set."); });
+      }, true);
+      break;
+    case "rp-dep-add": rpOpenDep(null); break;
+    case "rp-dep-edit": if(rpFindDep(id)) rpOpenDep(rpFindDep(id)); break;
+    case "rp-dep-del":
+      var dd = rpFindDep(id);
+      openConfirm("Delete this dependency?", "This removes <b>"+esc(dd?dd.entity:"")+"</b> and unlinks its tickets (the tickets themselves are untouched).", "Delete", function(){
+        api.deleteReportingDependency(id).then(rpLoadDeps).then(function(){ state.rp.report = null; showToast("Dependency deleted"); render(); })
+          .catch(function(e){ showToast((e && e.message) || "Couldn’t delete the dependency."); });
+      }, true);
+      break;
+    case "rp-dep-link":
+    case "rp-dep-unlink":
+      var depForm = document.getElementById("rp-dep-form"), depId = depForm ? depForm.getAttribute("data-id") : "";
+      if(depId) rpLinkIssue(el2.getAttribute("data-key"), action==="rp-dep-link" ? depId : null, depId);
+      break;
     case "nav-team": goTo("#/team"); break;
     case "nav-detail": goTo("#/r/"+id); break;
     case "toggle-sidenav":
@@ -5852,12 +6259,19 @@ document.addEventListener("click", function(e){
   }
 });
 
+document.addEventListener("click", function(e){
+  // Reporting filter drop-downs close when you click anywhere else
+  qsa("details.rp-ms[open]").forEach(function(d){ if(!d.contains(e.target)) d.removeAttribute("open"); });
+});
+
 document.addEventListener("submit", function(e){
   if(e.target && e.target.id==="rp-settings-form"){ e.preventDefault(); rpSaveSettings(); }
+  if(e.target && e.target.id==="rp-dep-form"){ e.preventDefault(); rpSaveDep(e.target); }
 });
 
 document.addEventListener("change", function(e){
   var elp = e.target;
+  if(elp && elp.getAttribute && (elp.getAttribute("data-rp-ms") || elp.getAttribute("data-rp-f")) && rpFilterChange(elp)) return;
   if(elp.matches('[data-action="toggle-performance"]')){
     var r = state.releases[state.route.id]; if(!r) return;
     r.performance.enabled = elp.checked; persistRelease(r);
@@ -5934,7 +6348,15 @@ document.addEventListener("click", function(e){
   else if(cmd==="ul") document.execCommand("insertUnorderedList");
 });
 
+var rpSearchTimer = null;
 document.addEventListener("input", function(e){
+  if(e.target && e.target.id==="rp-preset-name"){ state.rp.presetName = e.target.value; return; }
+  if(e.target && e.target.id==="rp-dep-search"){
+    var rpForm = document.getElementById("rp-dep-form"), rpq = e.target.value;
+    clearTimeout(rpSearchTimer);
+    rpSearchTimer = setTimeout(function(){ if(rpForm) rpSearchIssues(rpq, rpForm.getAttribute("data-id")); }, 250);
+    return;
+  }
   if(e.target && e.target.id==="notes-editor"){
     state.notesDirty = true;
     var r = state.releases[state.route.id];

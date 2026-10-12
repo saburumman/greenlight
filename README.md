@@ -65,14 +65,14 @@ Nobody can use the app without signing in with an Atlassian account that has acc
 
 ### Restricted pages and access (Statistics, Reporting)
 
-Two pages are restricted: **Statistics** (`#/statistics`) and **Reporting** (`#/reporting`, the SANAD PMO Reporting Module — see `REPORTING_SPEC.md`; so far the access-controlled page and its Jira data sync exist; the reports and exports come in later phases). Access is one explicit boolean per page on the existing Know the Team record (`statisticsAccess`, `reportingAccess`; missing = OFF) — no second user table. Access is managed **only inside the Add / Edit team member form** (a **Page access** section with a switch per page) — it is deliberately not shown on the cards. The section appears only for people who may change that page's access; everyone else never sees it. Saving the form saves the profile first, then sends each changed switch to `PUT /api/team/:id/access/:page`. Profile create/edit **cannot** change access by itself; new members start OFF.
+Two pages are restricted: **Statistics** (`#/statistics`) and **Reporting** (`#/reporting`, the SANAD PMO Reporting Module — see `REPORTING_SPEC.md`; the page has three tabs: Reports, Dependencies and Data sync). Access is one explicit boolean per page on the existing Know the Team record (`statisticsAccess`, `reportingAccess`; missing = OFF) — no second user table. Access is managed **only inside the Add / Edit team member form** (a **Page access** section with a switch per page) — it is deliberately not shown on the cards. The section appears only for people who may change that page's access; everyone else never sees it. Saving the form saves the profile first, then sends each changed switch to `PUT /api/team/:id/access/:page`. Profile create/edit **cannot** change access by itself; new members start OFF.
 
 - **Identity:** the signed-in Atlassian account, linked to a card once with "This is me" (`member.linkedEmail`). An account that isn't linked has no access.
 - **Server enforcement:** every `/api/reporting/*` route and `/api/statistics/*` route is behind `requirePageAccess(page)` (`server/pageAccess.js`), which reads the team on every request — revoking takes effect on the very next call, no restart. A 403 makes the page show its no-access state. `GET /api/team` leaves the access flags off other people's cards unless the caller holds some restricted-page access (a person always keeps the flags on their own card), `/api/audit` hides access-change events from people who hold no access and Reporting sync/settings events from people without Reporting access, and it returns entries **without** their structured `meta` to people lacking Statistics access; the Statistics page gets that data from the guarded `/api/statistics/activity`.
 - **Who can change access:** (1) someone who *has* a page's access can grant/revoke it for others; (2) nobody can grant it to themselves (revoking your own is fine); (3) **bootstrap:** while *nobody* has a page's access, any signed-in user linked to a card may grant it (including to themselves) so the first holder can exist; (4) an unlinked sign-in can't change access. There are no admin roles. If the last holder revokes their own access, the bootstrap rule applies again.
 - **"This is me" can't take over a card:** a card already linked to another account refuses a new link (409). Its holder — or someone with Statistics/Reporting access — removes the link first.
 - **Audit:** `STATISTICS_ACCESS_GRANTED/REVOKED`, `REPORTING_ACCESS_GRANTED/REVOKED` (who, whose access, when), plus `TEAM_MEMBER_LINKED/UNLINKED`. Written by the server only; re-sending an unchanged state writes nothing.
-- **Limitations:** release data (tickets, regression results, `lastChange` on regression modules) is still served to every signed-in user by the release API — Statistics access hides the analytics view and the audit-derived detail, it does not make release data confidential. Reporting data, once the data layer exists, will be served only through the guarded routes. Access follows the sign-in → card link, so anyone who can legitimately hold a card's link inherits its access.
+- **Limitations:** release data (tickets, regression results, `lastChange` on regression modules) is still served to every signed-in user by the release API — Statistics access hides the analytics view and the audit-derived detail, it does not make release data confidential. Reporting data is served only through the guarded routes. Access follows the sign-in → card link, so anyone who can legitimately hold a card's link inherits its access.
 
 ### Reporting data sync (Phase 1)
 
@@ -85,6 +85,19 @@ The Reporting page keeps its own copy of your Jira data in Postgres so reports a
 - **Whose Jira access:** the existing per-user Atlassian sign-in — no shared credential. *Sync now* runs as the person who pressed it. **Sync automatically** (optional, every 30 min – 7 days) runs as the person who turned it on, using their own stored authorization; if it lapses the run fails with a clear message until they sign in again. Only people with Reporting access can change any of this.
 - **Derived per issue** (`reporting_issues`): variance in hours and %, accuracy band (±10 % / 10–25 % / >25 %, or *Unestimated* — a missing or zero estimate is never treated as 0), started / completed dates from the status history, reopen count, blocked days, cycle / lead time, age, overdue.
 - **Audit:** `REPORT_SETTINGS_UPDATED` and `REPORT_SYNC_RUN` (server-written).
+
+### Reporting: reports, charts, downloads (Phases 2–4)
+
+**Reporting → Reports** builds the SANAD PMO report from the synced copy — no Jira calls while you browse. One server-side engine (`server/reportingEngine.js`) produces every table and chart as JSON, and the page, the Excel workbook and the CSV files all read that same JSON, so a number is the same everywhere. Everything is **hours**; dates are shown in **Asia/Amman** (stored UTC); every detail row carries its **issue key** (a link to Jira in the page and the workbook).
+
+- **Filters** (apply to every table, chart and download): period (by created / completed / worklog date), sprint, service, squad, component, issue type, assignee, epic, status category, priority, blocked only, overdue only, include sub-tasks. **Saved filter sets** are shared by everyone with Reporting access. The active filters are printed on the Cover sheet and under every chart.
+- **Sheets:** Cover · Executive Summary · Ticket Register · Variance by Ticket · Variance by Member · Variance by Squad / Component / Service · Epic Rollup · Status & Flow · Dependencies · Charts · Data Quality · **PIVOT_SOURCE** (one flat row per ticket) · **PIVOT_WORKLOGS** (one flat row per worklog — an addition to the spec, so hours by person/day can be pivoted).
+- **Nothing is silently dropped.** Tickets with no estimate, or Done with no logged time, stay in every total *and* are listed in Data Quality; a missing estimate is blank, never 0. Long tables on the page show their first 500 rows and say how many there really are; the downloads carry every row.
+- **Definitions:** *variance* = logged − estimated hours (positive = over); the per-group figures (estimated, logged, variance, accuracy bands) cover **completed tickets that carry an estimate** — completed tickets without one are counted and their logged hours shown separately. *Epic forecast:* **Slipped** = an open child is overdue or the epic's own due date has passed with work open; **At risk** = not slipped but an open child is blocked, or hours already logged exceed the estimate on open work; otherwise **On track**. The member sheet is labelled *estimation calibration, not individual performance ranking* and is listed alphabetically.
+- **Excel** (`SANAD_PMO_Delivery_Report_<date>.xlsx`): real types (hours `0.0`, percentages as true percentages, dates as Excel dates in Amman time), native Excel Tables with filter buttons and a frozen header on the big sheets, colour cues for estimate bands and epic forecast. The **Charts** sheet embeds the 12 charts as images (drawn with the same code as the page, rasterised on the server with `@resvg/resvg-js` and the bundled DejaVu Sans font in `server/fonts/`) with each chart's numbers in a table beside it. **CSV** (one per sheet): UTF-8 **with BOM**, ISO dates, text that looks like a formula is neutralised.
+- **Dependency tracker** (Reporting → *Dependencies*, table `reporting_dependencies`, `supabase/migrations/0004_reporting_dependencies.sql`): government entity, vendor, what is needed, owner, promised date, status (Requested / In progress / Received / Cancelled), last contact, next follow-up, plus the Jira tickets each one blocks. Links live on `reporting_issues.external_dependency_id` and **a sync never overwrites them**. Feeds the Dependencies sheet, blocked-days figures and the ageing chart.
+- **Audit** (server-written, hidden from people without Reporting access): `REPORT_EXPORTED` (with the filter summary), `REPORT_DEPENDENCY_CHANGED`.
+- **Not built (needs your decision):** native, editable Excel charts (the workbook carries chart images + data tables instead) and scheduled e-mail delivery of the workbook.
 
 **Upgrading from the name-based model:** on startup (and again on every read/save, idempotently) existing releases are migrated from names to ids: an Entity `owner` that uniquely matches a Know the Team name becomes `assignedTo`; ticket `qaAssignee` names do the same. Anything that can't be matched confidently is never guessed — it's kept as `legacyOwner` / `legacyQaAssignee` and shown as "(not in Know the Team)" until someone reassigns it.
 
@@ -307,6 +320,10 @@ greenlight-app/
     reportingStore.js        — Reporting: Postgres tables + queries for the Jira cache
     reportingSync.js         — Reporting: full / incremental / resumable sync
     reportingService.js      — Reporting: settings validation, background sync runner, scheduler
+    reportingEngine.js       — Reporting: filters + every sheet/chart as JSON (pure; Amman-time helpers)
+    reportingExport.js       — Reporting: Excel workbook (exceljs) + CSV writers, chart PNGs (resvg)
+    reportingDependencies.js — Reporting: dependency-tracker / preset validation
+    fonts/                   — DejaVu Sans (+ licence) used to draw chart images in the Excel export
     releaseNotesLogic.js   — Release Notes categorization + rule-based summarizer (server-side twin of the same logic in app.js)
     aiService.js             — thin Google Gemini API client used only for Release Notes item text (see "Release notes" above)
     auth/
@@ -321,15 +338,16 @@ greenlight-app/
       regressionModules.js  — the reusable Regression Module master list
       audit.js                — audit log read/append endpoints (browser-postable events only; assignment events are server-derived)
       statistics.js              — guarded activity feed behind the Statistics page
-      reporting.js                — guarded Reporting API (settings, sync status, start a sync)
+      reporting.js                — guarded Reporting API (settings, sync, report JSON, Excel/CSV downloads, dependencies, presets)
       team.js                      — Know the Team CRUD, "This is me" link, per-page access switches
       testData.js               — the reusable Test Data library CRUD endpoints
       auth.js                  — /auth/login, /auth/callback, /auth/logout, /auth/me
   public/
     index.html, styles.css, app.js  — the dashboard itself (no build step, no framework)
+    reportingCharts.js              — Reporting charts (SVG; shared by the page and the server-side Excel export)
   data/                    — created automatically when running on the JSON-file backend; your releases, audit log, and every signed-in user's own Jira OAuth tokens live here
   supabase/
-    migrations/             — incremental SQL (0002 adds audit_log.team_member_id / meta; 0003 adds the Reporting cache tables; the app also creates both automatically)
+    migrations/             — incremental SQL (0002 adds audit_log.team_member_id / meta; 0003 adds the Reporting cache tables, 0004 the dependency tracker; the app also creates both automatically)
     schema.sql              — the Postgres table definitions (run once against a new database — see "Deploying to Render + Supabase" below)
   scripts/
     migrate-json-to-supabase.js  — one-time (safely re-runnable) import of an existing data/store.json into Postgres
