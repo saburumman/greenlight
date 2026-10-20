@@ -14,7 +14,7 @@ A lightweight QA release-readiness dashboard. It runs happily on your own machin
 - Once a release is published, a **Download PDF** button appears — see [Download PDF](#download-pdf) below.
 - An instant search bar on the main page finds a release, ticket, bug, blocker, or regression entity/service as you type, and jumps straight to it.
 - The main list always shows newest-created releases first, and that order doesn't shuffle as you edit a release afterward.
-- An **Audit Log** (sidebar → Audit) records who did what and when — releases created, tickets added/updated, Jira syncs, regression/bug/blocker/platform/performance/security updates, release notes generated or saved, and Test Data added/updated/copied/deleted. See [Identity & the Audit Log](#identity--the-audit-log) for how "who" is determined.
+- An **Audit Log** (sidebar → Audit) records who did what and when — releases created, tickets added/updated, Jira syncs, regression/bug/blocker/platform/performance/security updates, release notes generated or saved, Test Data added/updated/copied/deleted, and Test Data accounts linked/unlinked. See [Identity & the Audit Log](#identity--the-audit-log) for how "who" is determined.
 - **Test Data** (sidebar → Test Data) is a reusable QA data library, independent of any release — see [Test Data](#test-data) below.
 - **Know the Team** (sidebar → Know the Team) is a purely informational page introducing the people behind the QA work — see [Know the Team](#know-the-team) below.
 
@@ -237,6 +237,17 @@ The browser's Save-as-PDF dialog also suggests the file's name for you, from the
 - Test Data is stored independently of releases (same `data/store.json`, its own top-level collection) and survives refreshes, browser restarts, and signing in as someone else. Create/update/copy/delete actions are recorded in the Audit Log the same way every other action in this app is.
 - The list is paginated 25 records per page, with **Showing X–Y of Z** and **Prev/Next** controls below the table. Searching or changing the Entities/Tags filter always jumps back to page 1.
 
+### Related Test Accounts
+
+Real test scenarios often need several accounts that belong together — a household head with a wife and children, a person and their parents, a guardian and a dependant. Any Test Data record can be **linked to other Test Data records**; each account stays its own independent record and a link is stored once.
+
+- **Add links** from the **Related Test Accounts** panel in a record's **View** or **Add/Edit** form: search for existing accounts (by National ID, scenario, entity or tag), tick one or several, and give each a relationship. Suggestions are *Husband, Wife, Father, Mother, Son, Daughter, Brother, Sister, Parent, Child, Guardian, Other*, but the field is free text — type any label your scenario needs ("Business partner", "Sponsor"…). A new account's links are created right after it is saved; a copied account does not inherit the original's links.
+- **Both directions.** The panel on each account lists its direct links (*Wife — 9920000002*) and each row opens that account (with a **Back** button). The label on the far side is only filled in when it is known — *Wife ↔ Husband, Father/Mother ↔ Child, Son/Daughter ↔ Parent, Brother/Sister ↔ Sibling* — or when you type it in the optional second field. Nothing else is reversed blindly: *Guardian* and custom labels have no inverse unless you supply one, and the other account then shows the link as **Linked** with a note ("lists this account as “Guardian”"). A link is *reciprocal* only when an inverse label exists.
+- **Edit or remove from either account.** One shared record means editing it from either side updates both views, and a reciprocal link never exists twice. Removing a link (inline confirmation) never deletes either account. Several different relationships can coexist between the same two accounts (use the **+** on a row); an identical one, a link to itself, or a link to a missing account is refused.
+- **In the list**, accounts with links show a small badge ("4 related accounts"); the **Related to** box (next to the Entities and Tags filters) shows the accounts directly linked to the account with that National ID, and the panel's **Show these accounts in the list** button fills it in for you. Export honours it too. More than eight links start collapsed.
+- **Deleting an account** removes its links (the confirmation says how many) and leaves the linked accounts untouched. Create / update / delete of a link are recorded in the Audit Log by the server — `TEST_ACCOUNT_RELATIONSHIP_CREATED / _UPDATED / _DELETED` — with the acting Know the Team member; the browser cannot post these itself. Anyone signed in can view and edit links, exactly like the Test Data they belong to.
+- **Storage.** JSON backend: a new top-level `testAccountRelationships` collection (added automatically to an existing `data/store.json`; no existing record is modified). Postgres: table `test_account_relationships` — a JSONB document per link plus two real `uuid` columns with foreign keys to `test_data(id) ON DELETE CASCADE` and a no-self-link check, so the database itself can never hold a link to a deleted account. The server creates the table on first use; `supabase/migrations/0005_test_account_relationships.sql` and `schema.sql` do the same by hand, and `npm run db:migrate` carries links over from `store.json` (links whose account is missing are skipped and reported).
+
 ### Exporting to Excel
 
 Click **⬇ Export** (next to Import) to download the list as an `.xlsx` file, generated server-side with `exceljs`. It exports whatever's currently on screen — if search or the Entities/Tags filters are active, only the matching records are included (across all pages, not just the one you're looking at); with no search or filters, it's the whole table. The file name reflects that: `test-data-<date>.xlsx` for the full list, `test-data-filtered-<date>.xlsx` when a search/filter was applied. Columns: National ID, Supported Scenarios, Entities, Tags, Notes, Created By, Created At.
@@ -323,6 +334,7 @@ greenlight-app/
     reportingEngine.js       — Reporting: filters + every sheet/chart as JSON (pure; Amman-time helpers)
     reportingExport.js       — Reporting: Excel workbook (exceljs) + CSV writers, chart PNGs (resvg)
     reportingDependencies.js — Reporting: dependency-tracker / preset validation
+    testAccountRelationships.js — Test Data: Related Test Accounts logic (labels, known inverses, duplicate / self-link checks) — pure, no I/O
     fonts/                   — DejaVu Sans (+ licence) used to draw chart images in the Excel export
     releaseNotesLogic.js   — Release Notes categorization + rule-based summarizer (server-side twin of the same logic in app.js)
     aiService.js             — thin Google Gemini API client used only for Release Notes item text (see "Release notes" above)
@@ -340,14 +352,14 @@ greenlight-app/
       statistics.js              — guarded activity feed behind the Statistics page
       reporting.js                — guarded Reporting API (settings, sync, report JSON, Excel/CSV downloads, dependencies, presets)
       team.js                      — Know the Team CRUD, "This is me" link, per-page access switches
-      testData.js               — the reusable Test Data library CRUD endpoints
+      testData.js               — the reusable Test Data library CRUD endpoints + Related Test Accounts (links between records)
       auth.js                  — /auth/login, /auth/callback, /auth/logout, /auth/me
   public/
     index.html, styles.css, app.js  — the dashboard itself (no build step, no framework)
     reportingCharts.js              — Reporting charts (SVG; shared by the page and the server-side Excel export)
   data/                    — created automatically when running on the JSON-file backend; your releases, audit log, and every signed-in user's own Jira OAuth tokens live here
   supabase/
-    migrations/             — incremental SQL (0002 adds audit_log.team_member_id / meta; 0003 adds the Reporting cache tables, 0004 the dependency tracker; the app also creates both automatically)
+    migrations/             — incremental SQL (0002 adds audit_log.team_member_id / meta; 0003 adds the Reporting cache tables, 0004 the dependency tracker, 0005 the Related Test Accounts table; the app also creates all of these automatically)
     schema.sql              — the Postgres table definitions (run once against a new database — see "Deploying to Render + Supabase" below)
   scripts/
     migrate-json-to-supabase.js  — one-time (safely re-runnable) import of an existing data/store.json into Postgres

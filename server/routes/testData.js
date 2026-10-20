@@ -7,6 +7,11 @@
 // ID + the scenarios/entities/tags/notes that describe what it's good for)
 // that a QA engineer can search and reuse while working any release.
 //
+// Related Test Accounts (links between records — see
+// testAccountRelationships.js) live in their own collection and are served
+// from /relationships and /:id/relationships below; each account stays an
+// independent record. Link changes are audited by the server itself.
+//
 // Auth: every request here already passed requireAuth (see index.js /
 // auth/middleware.js) — identity for createdBy always comes from the
 // verified session (req.authUser.name), never from the request body.
@@ -16,6 +21,9 @@ const crypto = require("crypto");
 const ExcelJS = require("exceljs");
 const db = require("../db");
 const { asyncHandler } = require("../asyncHandler");
+const { resolveActor } = require("../assignmentLogic");
+const { recordEvents } = require("../auditWriter");
+const rel = require("../testAccountRelationships");
 
 const router = express.Router();
 
@@ -145,7 +153,8 @@ router.post("/bulk", asyncHandler(async (req, res) => {
 // by hand — used only by the export route below, so export honors
 // whatever search/entity/tag filters are active on screen when it's
 // downloaded (no filters active = every record).
-function matchesExportFilters(t, q, entQ, tagQ) {
+function matchesExportFilters(t, q, entQ, tagQ, relatedIds) {
+  if (relatedIds && !relatedIds.has(t.id)) return false;
   if (entQ && !(t.entities || []).some((en) => en.toLowerCase().indexOf(entQ) > -1)) return false;
   if (tagQ && !(t.tags || []).some((tg) => tg.toLowerCase().indexOf(tagQ) > -1)) return false;
   if (!q) return true;
@@ -161,8 +170,23 @@ router.get("/export", asyncHandler(async (req, res) => {
     const q = String(req.query.q || "").trim().toLowerCase();
     const entQ = String(req.query.entity || "").trim().toLowerCase();
     const tagQ = String(req.query.tag || "").trim().toLowerCase();
+    const relatedToQ = String(req.query.relatedTo || "").trim().toLowerCase();
     const allRecords = await db.testData.list();
-    const records = allRecords.filter((t) => matchesExportFilters(t, q, entQ, tagQ));
+    // "Related to <National ID>" — only the accounts directly linked to the
+    // account(s) with exactly that National ID (same rule as the on-screen filter).
+    let relatedIds = null;
+    if (relatedToQ) {
+      const focus = new Set(allRecords.filter((t) => String(t.nationalId).toLowerCase() === relatedToQ).map((t) => t.id));
+      relatedIds = new Set();
+      if (focus.size) {
+        const { ok } = rel.splitOrphans(await db.testAccountRelationships.list(), new Set(allRecords.map((t) => t.id)));
+        for (const r of ok) {
+          if (focus.has(r.accountAId)) relatedIds.add(r.accountBId);
+          if (focus.has(r.accountBId)) relatedIds.add(r.accountAId);
+        }
+      }
+    }
+    const records = allRecords.filter((t) => matchesExportFilters(t, q, entQ, tagQ, relatedIds));
 
     const workbook = new ExcelJS.Workbook();
     workbook.creator = "Release Monitor";
@@ -195,7 +219,7 @@ router.get("/export", asyncHandler(async (req, res) => {
     sheet.views = [{ state: "frozen", ySplit: 1 }];
 
     const nameBits = ["test-data"];
-    if (q || entQ || tagQ) nameBits.push("filtered");
+    if (q || entQ || tagQ || relatedToQ) nameBits.push("filtered");
     nameBits.push(new Date().toISOString().slice(0, 10));
     const filename = nameBits.join("-") + ".xlsx";
 
@@ -203,6 +227,130 @@ router.get("/export", asyncHandler(async (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     await workbook.xlsx.write(res);
     res.end();
+}));
+
+// ---- Related Test Accounts ---------------------------------------------
+// Declared before the /:id routes so "relationships" is never read as an :id.
+
+async function currentActor(req) {
+  return resolveActor(req.authUser, await db.team.list());
+}
+
+// Every link whose two accounts still exist, plus the account lookup. Links
+// that somehow point at a missing account are dropped from the result and
+// cleaned up, so a broken reference can never reach the client.
+async function loadRelationshipContext() {
+  const [all, accounts] = await Promise.all([db.testAccountRelationships.list(), db.testData.list()]);
+  const accountsById = new Map(accounts.map((a) => [a.id, a]));
+  const { ok, orphans } = rel.splitOrphans(all, new Set(accountsById.keys()));
+  for (const o of orphans) {
+    db.testAccountRelationships.delete(o.id).catch((e) => console.error("orphan relationship cleanup failed:", e && e.message));
+  }
+  return { rels: ok, accountsById };
+}
+
+function nid(accountsById, id) {
+  const a = accountsById.get(id);
+  return a ? a.nationalId : "(deleted account)";
+}
+// "<B> is <label> of <A>" — A is the account the primary label is written on.
+function describeLink(r, accountsById) {
+  return (
+    nid(accountsById, r.accountBId) + " is " + r.relationshipType + " of " + nid(accountsById, r.accountAId) +
+    (r.inverseRelationshipType ? " (inverse: " + r.inverseRelationshipType + ")" : "")
+  );
+}
+function relEvent(action, r, accountsById, extra) {
+  return {
+    action,
+    entityType: "TestAccountRelationship",
+    entityId: r.id,
+    details: (extra ? extra + " — " : "") + describeLink(r, accountsById),
+    meta: {
+      accountAId: r.accountAId,
+      accountBId: r.accountBId,
+      relationshipType: r.relationshipType,
+      inverseRelationshipType: r.inverseRelationshipType || null,
+    },
+  };
+}
+
+router.get("/relationships", asyncHandler(async (req, res) => {
+  const { rels } = await loadRelationshipContext();
+  res.json(rels);
+}));
+
+// Create one or several links from account :id to other accounts. Each link is
+// validated independently (self-link, missing account, duplicate…); the ones
+// that pass are saved and the rest are reported back, nothing is dropped
+// silently.
+router.post("/:id/relationships", asyncHandler(async (req, res) => {
+  const selfId = req.params.id;
+  const links = Array.isArray(req.body && req.body.links) ? req.body.links : [];
+  if (!links.length) return res.status(400).json({ error: "Choose at least one account to link." });
+  if (links.length > 50) return res.status(400).json({ error: "Too many links in one request (max 50)." });
+  const { rels, accountsById } = await loadRelationshipContext();
+  if (!accountsById.has(selfId)) return notFound(res);
+  const actor = await currentActor(req);
+  const now = new Date().toISOString();
+  const working = rels.slice();
+  const created = [];
+  const skipped = [];
+  for (const link of links) {
+    const v = rel.validateLinkRequest(selfId, link, accountsById, working);
+    if (v.error) {
+      skipped.push({ otherId: (link && link.otherId) || "", reason: v.error, status: v.status || 400 });
+      continue;
+    }
+    const record = rel.buildRecord(v.clean, crypto.randomUUID(), actor, now);
+    await db.testAccountRelationships.set(record.id, record);
+    working.push(record);
+    created.push(record);
+  }
+  await recordEvents(db, actor, created.map((r) => relEvent("TEST_ACCOUNT_RELATIONSHIP_CREATED", r, accountsById)), now);
+  if (!created.length) {
+    return res.status(skipped[0].status === 409 ? 409 : 400).json({ error: skipped[0].reason, skipped });
+  }
+  res.status(201).json({ created, skipped });
+}));
+
+// Edit one link from the point of view of `perspectiveId` (either account in
+// it): { perspectiveId, relationshipType, inverseRelationshipType } where
+// relationshipType = what the OTHER account is to the perspective account.
+router.put("/relationships/:relId", asyncHandler(async (req, res) => {
+  const { rels, accountsById } = await loadRelationshipContext();
+  const existing = rels.find((r) => r.id === req.params.relId);
+  if (!existing) return res.status(404).json({ error: "Relationship not found." });
+  const perspectiveId = String((req.body && req.body.perspectiveId) || "");
+  const v = rel.validateUpdateRequest(existing, perspectiveId, req.body, rels);
+  if (v.error) return res.status(v.status || 400).json({ error: v.error });
+  if (rel.sameLabels(existing, v.clean)) return res.json(existing);
+  const actor = await currentActor(req);
+  const now = new Date().toISOString();
+  const merged = {
+    ...existing,
+    accountAId: v.clean.accountAId,
+    accountBId: v.clean.accountBId,
+    relationshipType: v.clean.relationshipType,
+    inverseRelationshipType: v.clean.inverseRelationshipType,
+    isReciprocal: !!v.clean.inverseRelationshipType,
+    updatedAt: now,
+    updatedBy: actor.name,
+    updatedByMemberId: actor.id || null,
+  };
+  await db.testAccountRelationships.set(merged.id, merged);
+  await recordEvents(db, actor, [relEvent("TEST_ACCOUNT_RELATIONSHIP_UPDATED", merged, accountsById, "was: " + describeLink(existing, accountsById))], now);
+  res.json(merged);
+}));
+
+// Removes the link only — both accounts are left exactly as they were.
+router.delete("/relationships/:relId", asyncHandler(async (req, res) => {
+  const { rels, accountsById } = await loadRelationshipContext();
+  const existing = rels.find((r) => r.id === req.params.relId);
+  if (!existing) return res.status(404).json({ error: "Relationship not found." });
+  await db.testAccountRelationships.delete(existing.id);
+  await recordEvents(db, await currentActor(req), [relEvent("TEST_ACCOUNT_RELATIONSHIP_DELETED", existing, accountsById)]);
+  res.json({ ok: true });
 }));
 
 router.get("/:id", asyncHandler(async (req, res) => {
@@ -238,7 +386,19 @@ router.put("/:id", asyncHandler(async (req, res) => {
 router.delete("/:id", asyncHandler(async (req, res) => {
   const existing = await db.testData.get(req.params.id);
   if (!existing) return notFound(res);
+  // Links to this account go with it (each is audited) — the linked accounts
+  // themselves stay. Snapshot first so the audit text can still name both ends.
+  const { rels, accountsById } = await loadRelationshipContext();
+  const touching = rels.filter((r) => rel.involves(r, existing.id));
+  await db.testAccountRelationships.deleteForAccount(existing.id);
   await db.testData.delete(req.params.id);
+  if (touching.length) {
+    await recordEvents(
+      db,
+      await currentActor(req),
+      touching.map((r) => relEvent("TEST_ACCOUNT_RELATIONSHIP_DELETED", r, accountsById, "account deleted"))
+    );
+  }
   res.json({ ok: true });
 }));
 

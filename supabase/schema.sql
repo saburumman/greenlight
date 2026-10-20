@@ -97,6 +97,23 @@ create index if not exists idx_test_data_created_at on test_data (created_at des
 create index if not exists idx_test_data_data_gin on test_data using gin (data jsonb_path_ops);
 
 -- ---------------------------------------------------------------------
+-- test_account_relationships — links between Test Data accounts (Related Test
+-- Accounts). Account ids are real FK columns with ON DELETE CASCADE.
+-- ---------------------------------------------------------------------
+create table if not exists test_account_relationships (
+  id uuid primary key,
+  account_a_id uuid not null references test_data(id) on delete cascade,
+  account_b_id uuid not null references test_data(id) on delete cascade,
+  data jsonb not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint test_account_relationships_not_self check (account_a_id <> account_b_id)
+);
+comment on table test_account_relationships is 'Links between Test Data accounts: A lists B as relationshipType, B lists A as inverseRelationshipType (null = one-way) — see server/testAccountRelationships.js.';
+create index if not exists idx_test_account_relationships_a on test_account_relationships (account_a_id);
+create index if not exists idx_test_account_relationships_b on test_account_relationships (account_b_id);
+
+-- ---------------------------------------------------------------------
 -- team — "Know the Team" roster, independent of releases and of auth.
 -- ---------------------------------------------------------------------
 create table if not exists team (

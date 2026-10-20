@@ -81,6 +81,45 @@ async function migrateTestData(testDataObj) {
   return { total: entries.length, inserted, updated };
 }
 
+// Links between Test Data accounts. Must run after migrateTestData (the account
+// ids are foreign keys). A link whose account isn't in the file is skipped and
+// reported, never inserted dangling.
+async function migrateTestAccountRelationships(relObj, testDataObj) {
+  const entries = Object.entries(relObj || {});
+  let inserted = 0;
+  let updated = 0;
+  let skipped = 0;
+  if (entries.length) {
+    await pgPool.query(`
+      create table if not exists test_account_relationships (
+        id uuid primary key,
+        account_a_id uuid not null references test_data(id) on delete cascade,
+        account_b_id uuid not null references test_data(id) on delete cascade,
+        data jsonb not null,
+        created_at timestamptz not null default now(),
+        updated_at timestamptz not null default now(),
+        constraint test_account_relationships_not_self check (account_a_id <> account_b_id)
+      )`);
+  }
+  for (const [id, r] of entries) {
+    if (!r || !(testDataObj || {})[r.accountAId] || !(testDataObj || {})[r.accountBId] || r.accountAId === r.accountBId) {
+      skipped++;
+      continue;
+    }
+    const existing = await pgPool.query(`SELECT 1 FROM test_account_relationships WHERE id = $1`, [id]);
+    await pgPool.query(
+      `INSERT INTO test_account_relationships (id, account_a_id, account_b_id, data, created_at, updated_at)
+       VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+       ON CONFLICT (id) DO UPDATE SET account_a_id = EXCLUDED.account_a_id, account_b_id = EXCLUDED.account_b_id,
+         data = EXCLUDED.data, updated_at = EXCLUDED.updated_at`,
+      [id, r.accountAId, r.accountBId, JSON.stringify(r), r.createdAt || new Date().toISOString(), r.updatedAt || r.createdAt || new Date().toISOString()]
+    );
+    if (existing.rows.length) updated++;
+    else inserted++;
+  }
+  return { total: entries.length, inserted, updated, skipped };
+}
+
 async function migrateTeam(teamObj) {
   const entries = Object.entries(teamObj || {});
   let inserted = 0;
@@ -159,6 +198,7 @@ async function main() {
   const regressionResult = await migrateRegressionModules(store.regressionModules);
   const auditResult = await migrateAuditLog(store.auditLog);
   const testDataResult = await migrateTestData(store.testData);
+  const relationshipsResult = await migrateTestAccountRelationships(store.testAccountRelationships, store.testData);
   const teamResult = await migrateTeam(store.team);
 
   console.log("==================== Migration summary ====================");
@@ -170,6 +210,7 @@ async function main() {
   }
   console.log(`audit_log           : ${auditResult.total} in file  ->  ${auditResult.inserted} inserted, ${auditResult.alreadyPresent} already present`);
   console.log(`test_data           : ${testDataResult.total} in file  ->  ${testDataResult.inserted} inserted, ${testDataResult.updated} updated`);
+  console.log(`test_account_rel.  : ${relationshipsResult.total} in file  ->  ${relationshipsResult.inserted} inserted, ${relationshipsResult.updated} updated, ${relationshipsResult.skipped} skipped (missing account)`);
   console.log(`team                : ${teamResult.total} in file  ->  ${teamResult.inserted} inserted, ${teamResult.updated} updated`);
   console.log("=============================================================");
   console.log("\ndata/store.json was not modified or deleted — keep it as a backup until you've verified the app against Postgres.");

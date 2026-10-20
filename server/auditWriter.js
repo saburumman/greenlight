@@ -15,6 +15,7 @@ const META_KEYS = [
   "assignedTo", "previousAssignedTo", "changedBy",
   "previousStatus", "newStatus", "byOther",
   "targetMemberId", "page",
+  "accountAId", "accountBId", "relationshipType", "inverseRelationshipType",
 ];
 
 function cleanMeta(meta) {

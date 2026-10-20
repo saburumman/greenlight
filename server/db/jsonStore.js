@@ -11,7 +11,7 @@
 //
 // Shape on disk: { releases: { <id>: {...} }, regressionModules: [{id,name,services:[{id,name}]}],
 //                   auditLog: [{id,teamMemberId,userName,action,entityType,entityId,details,meta?,createdAt}],
-//                   testData: { <id>: {...} }, team: { <id>: {...} },
+//                   testData: { <id>: {...} }, testAccountRelationships: { <id>: {...} }, team: { <id>: {...} },
 //                   atlassianTokens: { <accountId>: {accountId,accessToken,refreshToken,expiresAt,scope,updatedAt} } }
 //
 // testData is a reusable QA data library — see routes/testData.js. It is
@@ -109,6 +109,7 @@ function ensureStore() {
           regressionModules: DEFAULT_REGRESSION_MODULES,
           auditLog: [],
           testData: {},
+          testAccountRelationships: {},
           team: buildDefaultTeam(),
           atlassianTokens: {},
         },
@@ -155,6 +156,12 @@ function readAll() {
     // get an empty collection — nothing else about them changes.
     if (!parsed.testData || typeof parsed.testData !== "object" || Array.isArray(parsed.testData)) {
       parsed.testData = {};
+      dirty = true;
+    }
+    // Additive: stores created before Related Test Accounts existed just get
+    // an empty collection — no Test Data record is touched.
+    if (!parsed.testAccountRelationships || typeof parsed.testAccountRelationships !== "object" || Array.isArray(parsed.testAccountRelationships)) {
+      parsed.testAccountRelationships = {};
       dirty = true;
     }
     // Additive: Test Data records saved before Entity became a multi-value
@@ -207,6 +214,7 @@ function readAll() {
       regressionModules: DEFAULT_REGRESSION_MODULES,
       auditLog: [],
       testData: {},
+      testAccountRelationships: {},
       team: buildDefaultTeam(),
       atlassianTokens: {},
     };
@@ -313,7 +321,53 @@ const testData = {
   async delete(id) {
     const data = readAll();
     delete data.testData[id];
+    // Deleting an account removes every relationship that referenced it (in
+    // the same write), so no link is ever left pointing at a missing record.
+    for (const [relId, rel] of Object.entries(data.testAccountRelationships || {})) {
+      if (rel && (rel.accountAId === id || rel.accountBId === id)) delete data.testAccountRelationships[relId];
+    }
     writeAll(data);
+  },
+};
+
+// Links between Test Data accounts (see server/testAccountRelationships.js).
+// One record per link, in its own collection: each account stays an
+// independent record and a link is stored exactly once however many sides
+// show it.
+const testAccountRelationships = {
+  async list() {
+    const data = readAll();
+    return Object.values(data.testAccountRelationships).sort((a, b) =>
+      String(b.createdAt || b.updatedAt || "").localeCompare(String(a.createdAt || a.updatedAt || ""))
+    );
+  },
+  async get(id) {
+    const data = readAll();
+    return data.testAccountRelationships[id] || null;
+  },
+  async set(id, record) {
+    const data = readAll();
+    data.testAccountRelationships[id] = record;
+    writeAll(data);
+    return record;
+  },
+  async delete(id) {
+    const data = readAll();
+    delete data.testAccountRelationships[id];
+    writeAll(data);
+  },
+  // Removes every link touching an account; returns the removed records.
+  async deleteForAccount(accountId) {
+    const data = readAll();
+    const removed = [];
+    for (const [relId, rel] of Object.entries(data.testAccountRelationships)) {
+      if (rel && (rel.accountAId === accountId || rel.accountBId === accountId)) {
+        removed.push(rel);
+        delete data.testAccountRelationships[relId];
+      }
+    }
+    if (removed.length) writeAll(data);
+    return removed;
   },
 };
 
@@ -374,6 +428,7 @@ module.exports = {
   regressionModules,
   auditLog,
   testData,
+  testAccountRelationships,
   team,
   atlassianTokens,
   DEFAULT_REGRESSION_MODULES,

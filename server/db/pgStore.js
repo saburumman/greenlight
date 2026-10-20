@@ -78,6 +78,77 @@ const testData = {
   delete: (id) => docDelete("test_data", id),
 };
 
+// Links between Test Data accounts (see server/testAccountRelationships.js).
+// The document stays JSONB like its siblings, but the two account ids are also
+// real columns with foreign keys to test_data ON DELETE CASCADE, so the
+// database itself guarantees a link never points at a deleted account (and
+// refuses one to an account that doesn't exist). The table is created on first
+// use (idempotent), so a database that hasn't had
+// supabase/migrations/0005_test_account_relationships.sql applied by hand keeps
+// working; if the role may not create tables the error surfaces on the
+// relationship endpoints only — Test Data itself is unaffected.
+let relTablePromise = null;
+function ensureRelationshipsTable() {
+  if (!relTablePromise) {
+    relTablePromise = pgPool.query(RELATIONSHIPS_DDL).catch((e) => {
+      relTablePromise = null;
+      throw e;
+    });
+  }
+  return relTablePromise;
+}
+const RELATIONSHIPS_DDL = `
+create table if not exists test_account_relationships (
+  id uuid primary key,
+  account_a_id uuid not null references test_data(id) on delete cascade,
+  account_b_id uuid not null references test_data(id) on delete cascade,
+  data jsonb not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint test_account_relationships_not_self check (account_a_id <> account_b_id)
+);
+create index if not exists idx_test_account_relationships_a on test_account_relationships (account_a_id);
+create index if not exists idx_test_account_relationships_b on test_account_relationships (account_b_id);
+`;
+const testAccountRelationships = {
+  async list() {
+    await ensureRelationshipsTable();
+    const { rows } = await pgPool.query(`SELECT data FROM test_account_relationships`);
+    return sortNewestFirst(rows.map((r) => r.data));
+  },
+  async get(id) {
+    await ensureRelationshipsTable();
+    const { rows } = await pgPool.query(`SELECT data FROM test_account_relationships WHERE id = $1`, [id]);
+    return rows.length ? rows[0].data : null;
+  },
+  async set(id, rel) {
+    await ensureRelationshipsTable();
+    await pgPool.query(
+      `INSERT INTO test_account_relationships (id, account_a_id, account_b_id, data, created_at, updated_at)
+       VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+       ON CONFLICT (id) DO UPDATE SET
+         account_a_id = EXCLUDED.account_a_id,
+         account_b_id = EXCLUDED.account_b_id,
+         data = EXCLUDED.data,
+         updated_at = EXCLUDED.updated_at`,
+      [id, rel.accountAId, rel.accountBId, JSON.stringify(rel), isoOrNow(rel.createdAt), isoOrNow(rel.updatedAt)]
+    );
+    return rel;
+  },
+  async delete(id) {
+    await ensureRelationshipsTable();
+    await pgPool.query(`DELETE FROM test_account_relationships WHERE id = $1`, [id]);
+  },
+  async deleteForAccount(accountId) {
+    await ensureRelationshipsTable();
+    const { rows } = await pgPool.query(
+      `DELETE FROM test_account_relationships WHERE account_a_id = $1 OR account_b_id = $1 RETURNING data`,
+      [accountId]
+    );
+    return rows.map((r) => r.data);
+  },
+};
+
 const team = {
   list: () => docList("team"),
   get: (id) => docGet("team", id),
@@ -257,4 +328,4 @@ function rowToTokenRecord(row) {
   };
 }
 
-module.exports = { releases, regressionModules, auditLog, testData, team, atlassianTokens };
+module.exports = { releases, regressionModules, auditLog, testData, testAccountRelationships, team, atlassianTokens };

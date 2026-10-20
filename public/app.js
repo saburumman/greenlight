@@ -174,6 +174,10 @@ var api = {
   bulkImportTestData: function(records){ return apiCall("POST","/test-data/bulk", {records:records}); },
   updateTestData: function(id, data){ return apiCall("PUT","/test-data/"+id, data); },
   deleteTestData: function(id){ return apiCall("DELETE","/test-data/"+id); },
+  listTestRelationships: function(){ return apiCall("GET","/test-data/relationships"); },
+  createTestRelationships: function(accountId, links){ return apiCall("POST","/test-data/"+accountId+"/relationships", {links:links}); },
+  updateTestRelationship: function(relId, data){ return apiCall("PUT","/test-data/relationships/"+relId, data); },
+  deleteTestRelationship: function(relId){ return apiCall("DELETE","/test-data/relationships/"+relId); },
   listTeam: function(){ return apiCall("GET","/team"); },
   createTeamMember: function(data){ return apiCall("POST","/team", data); },
   updateTeamMember: function(id, data){ return apiCall("PUT","/team/"+id, data); },
@@ -264,6 +268,9 @@ var state = {
   testDataSearch: "",
   testDataEntityFilter: "", // empty = no filter — these are now searchable text inputs, not fixed dropdowns
   testDataTagFilter: "",
+  testRels: [], // Related Test Accounts: link records (see RELATED TEST ACCOUNTS)
+  testDataRelatedTo: "", // "Related to <National ID>" filter text
+  tdRel: null, // UI state of the open Related Test Accounts panel
   testDataPage: 1, // 1-based; reset to 1 whenever search/entity/tag filters change
   // ---- Know the Team — a small editable roster, independent of releases
   // and of the auth system (see renderTeam() and friends) ----
@@ -1137,6 +1144,11 @@ function loadTestData(){
     list.forEach(function(t){ state.testData[t.id] = t; state.testDataOrder.push(t.id); });
     state.testDataReady = true;
     state.loadError = null;
+    // Links are loaded separately and are optional: if they can't be read the
+    // Test Data page still works, just without relationship indicators.
+    return api.listTestRelationships().then(function(rels){
+      state.testRels = Array.isArray(rels) ? rels : [];
+    }).catch(function(){ state.testRels = []; });
   }).catch(function(e){
     state.loadError = e.message;
   });
@@ -1511,6 +1523,9 @@ var AUDIT_ACTION_LABELS = {
   TEST_DATA_UPDATED: "Updated Test Data",
   TEST_DATA_COPIED: "Copied Test Data",
   TEST_DATA_DELETED: "Deleted Test Data",
+  TEST_ACCOUNT_RELATIONSHIP_CREATED: "Linked Test Accounts",
+  TEST_ACCOUNT_RELATIONSHIP_UPDATED: "Updated Test Account Link",
+  TEST_ACCOUNT_RELATIONSHIP_DELETED: "Removed Test Account Link",
   TEAM_MEMBER_ADDED: "Added Team Member",
   TEAM_MEMBER_UPDATED: "Updated Team Member",
   TEAM_MEMBER_DELETED: "Deleted Team Member",
@@ -3040,7 +3055,10 @@ function filterTestData(){
   // work.
   var entQ = (state.testDataEntityFilter||"").trim().toLowerCase();
   var tagQ = (state.testDataTagFilter||"").trim().toLowerCase();
+  var relatedQ = (state.testDataRelatedTo||"").trim();
+  var relatedIds = relatedQ ? tdRelatedToIds(relatedQ).ids : null;
   return all.filter(function(t){
+    if(relatedIds && !relatedIds[t.id]) return false;
     if(entQ && !(t.entities||[]).some(function(en){return en.toLowerCase().indexOf(entQ)>-1;})) return false;
     if(tagQ && !(t.tags||[]).some(function(tg){return tg.toLowerCase().indexOf(tagQ)>-1;})) return false;
     if(!q) return true;
@@ -3094,6 +3112,8 @@ function renderTestData(){
         '<label class="helper-text" for="td-tag-filter">Tags</label>'+
         '<input type="search" id="td-tag-filter" list="td-tag-filter-options" autocomplete="off" placeholder="All tags" value="'+escAttr(state.testDataTagFilter||"")+'">'+
         '<datalist id="td-tag-filter-options">'+tagOptions.map(function(tg){return '<option value="'+escAttr(tg)+'">';}).join("")+'</datalist>'+
+        '<label class="helper-text" for="td-related-filter">Related to</label>'+
+        '<input type="search" id="td-related-filter" autocomplete="off" placeholder="National ID" title="Show the accounts linked to the account with this National ID" value="'+escAttr(state.testDataRelatedTo||"")+'">'+
       '</div>'+
     '</div>';
 
@@ -3108,10 +3128,22 @@ function renderTestData(){
     '</div>';
   return head+controls+listHead+'<div id="td-list-container">'+renderTestDataListHtml()+'</div>';
 }
+function tdRelBadgeHtml(t){
+  var n = tdRelCount(t.id);
+  if(!n) return "";
+  return '<button type="button" class="td-rel-badge" data-action="view-test-data" data-id="'+escAttr(t.id)+'" title="Open this account to see its related accounts">'+esc(tdRelCountText(n))+'</button>';
+}
 function renderTestDataListHtml(){
   var filtered = filterTestData();
   if(!filtered.length){
     state.testDataPage = 1;
+    var relQ = (state.testDataRelatedTo||"").trim();
+    if(relQ){
+      var relInfo = tdRelatedToIds(relQ);
+      return '<div class="empty-state"><h3>No matches</h3><p>'+(relInfo.found
+        ? 'No related accounts match your search or filters.'
+        : 'No account has the National ID “'+esc(relQ)+'”.')+'</p></div>';
+    }
     return '<div class="empty-state"><h3>No matches</h3><p>No test data matches your search or filters.</p></div>';
   }
   // Clamp the current page into range — filters/search reset it to 1
@@ -3134,7 +3166,7 @@ function renderTestDataListHtml(){
     '</div>';
   return '<div class="td-list">'+pageItems.map(function(t){
     return '<div class="td-row">'+
-      '<div class="td-col td-col-id"><span class="mono">'+highlightMatch(t.nationalId, q)+'</span></div>'+
+      '<div class="td-col td-col-id"><span class="mono">'+highlightMatch(t.nationalId, q)+'</span>'+tdRelBadgeHtml(t)+'</div>'+
       '<div class="td-col td-col-scenarios">'+(t.supportedScenarios||[]).map(function(s){return '<span class="chip">'+highlightMatch(s,q)+'</span>';}).join("")+'</div>'+
       '<div class="td-col td-col-entity">'+((t.entities&&t.entities.length)? t.entities.map(function(en){return '<span class="chip chip-muted">'+highlightMatch(en,q)+'</span>';}).join("") : '<span class="helper-text">—</span>')+'</div>'+
       '<div class="td-col td-col-tags">'+(t.tags||[]).map(function(tg){return '<span class="chip chip-muted">'+highlightMatch(tg,q)+'</span>';}).join("")+'</div>'+
@@ -3153,16 +3185,363 @@ function renderTestDataListHtml(){
     '</div>';
   }).join("")+'</div>'+pager;
 }
-function openTestDataViewModal(t){
+/* ============================================================
+   RELATED TEST ACCOUNTS
+   Links between Test Data accounts. Each account stays its own record; a
+   link is stored once (server/testAccountRelationships.js) and shown from
+   BOTH accounts — "Wife — Account B" on one side, "Husband — Account A" on
+   the other when an inverse label is known (never guessed for custom labels
+   or "Guardian": the other side then reads "Linked"). The panel below is
+   shared by the View modal (live: every change is saved immediately) and the
+   Add/Edit form (an existing account: same; a brand-new account: links are
+   staged and created right after the account itself is saved).
+   ============================================================ */
+var TD_REL_SUGGESTIONS = ["Husband","Wife","Father","Mother","Son","Daughter","Brother","Sister","Parent","Child","Guardian","Other"];
+// Mirrors server/testAccountRelationships.js KNOWN_INVERSES — used only to
+// pre-fill the optional second label; the server applies the same rule.
+var TD_REL_INVERSES = {husband:"Wife",wife:"Husband",father:"Child",mother:"Child",parent:"Child",son:"Parent",daughter:"Parent",child:"Parent",brother:"Sibling",sister:"Sibling",sibling:"Sibling"};
+var TD_REL_AUTO_COLLAPSE_OVER = 8; // more links than this start collapsed
+function tdRelClean(v){ return String(v==null?"":v).replace(/\s+/g," ").trim().slice(0,60); }
+function tdRelKey(v){ return tdRelClean(v).toLowerCase(); }
+function tdRelKnownInverse(label){ return TD_REL_INVERSES[tdRelKey(label)] || ""; }
+// What the OTHER account is to `viewerId` according to a link ("" = one-way, no label on this side).
+function tdRelSeenBy(rel, viewerId){
+  if(rel.accountAId===viewerId) return rel.relationshipType||"";
+  if(rel.accountBId===viewerId) return rel.inverseRelationshipType||"";
+  return "";
+}
+function tdRelOther(rel, viewerId){
+  if(rel.accountAId===viewerId) return rel.accountBId;
+  if(rel.accountBId===viewerId) return rel.accountAId;
+  return null;
+}
+// Direct links of one account, ready to display (accounts that no longer
+// exist are skipped, so a stale reference can never render).
+function tdRelsFor(accountId){
+  var out = [];
+  (state.testRels||[]).forEach(function(rel){
+    var oid = tdRelOther(rel, accountId);
+    if(!oid) return;
+    var other = state.testData[oid];
+    if(!other) return;
+    var label = tdRelSeenBy(rel, accountId);
+    out.push({key:rel.id, rel:rel, other:other, label:label, listedAs: label ? "" : (rel.relationshipType||""), inverse: tdRelSeenBy(rel, oid)});
+  });
+  out.sort(function(a,b){
+    var la = (a.label||"￿").toLowerCase(), lb = (b.label||"￿").toLowerCase();
+    if(la!==lb) return la<lb ? -1 : 1;
+    return String(a.other.nationalId).localeCompare(String(b.other.nationalId));
+  });
+  return out;
+}
+function tdRelCount(accountId){ return tdRelsFor(accountId).length; }
+function tdRelCountText(n){ return n+" related account"+(n===1?"":"s"); }
+// Ids of the accounts directly linked to the account(s) whose National ID is exactly `nid`.
+function tdRelatedToIds(nid){
+  var want = String(nid||"").trim().toLowerCase();
+  var focus = {};
+  var found = false;
+  allTestDataRecords().forEach(function(t){ if(String(t.nationalId).toLowerCase()===want){ focus[t.id] = true; found = true; } });
+  var ids = {};
+  (state.testRels||[]).forEach(function(rel){
+    if(focus[rel.accountAId]) ids[rel.accountBId] = true;
+    if(focus[rel.accountBId]) ids[rel.accountAId] = true;
+  });
+  return {found:found, ids:ids};
+}
+
+function tdRelInit(accountId, trail){
+  state.tdRel = {accountId: accountId||null, pending: [], editor: null, collapsed: null, confirmKey: null, inForm: false, trail: trail||[]};
+}
+function tdRelItems(ui){
+  if(ui.accountId) return tdRelsFor(ui.accountId);
+  // Brand-new, unsaved account: its staged links.
+  return ui.pending.map(function(p, i){
+    var other = state.testData[p.otherId];
+    return other ? {key:"p"+i, pendingIndex:i, other:other, label:p.type, listedAs:"", inverse:p.inverse} : null;
+  }).filter(Boolean);
+}
+function tdRelPanelHtml(){
+  return '<div class="td-rel" id="td-rel-panel">'+tdRelInnerHtml()+'</div>';
+}
+function tdRelRefresh(){
+  var el = qs("#td-rel-panel");
+  if(el) el.innerHTML = tdRelInnerHtml();
+}
+function tdRelInnerHtml(){
+  var ui = state.tdRel;
+  if(!ui) return "";
+  var items = tdRelItems(ui);
+  var n = items.length;
+  var collapsed = ui.collapsed==null ? n>TD_REL_AUTO_COLLAPSE_OVER : ui.collapsed;
+  var head = '<div class="td-rel-head">'+
+    '<button type="button" class="td-rel-toggle" data-action="td-rel-toggle" aria-expanded="'+(collapsed?"false":"true")+'">'+
+      (collapsed? iconChevronDown() : iconChevronUp())+' Related Test Accounts <span class="td-rel-count">'+n+'</span></button>'+
+    (ui.editor ? '' : '<button type="button" class="btn btn-sm" data-action="td-rel-add">'+iconPlus()+' Add related account</button>')+
+  '</div>';
+  var body = "";
+  if(collapsed && !ui.editor){
+    body = n ? '<p class="helper-text td-rel-hint">'+esc(tdRelCountText(n))+' — expand to see them.</p>' : '';
+  } else {
+    if(!n && !ui.editor){
+      body += '<p class="helper-text td-rel-hint">'+(ui.accountId
+        ? 'No related accounts yet. Link accounts that belong together — a household, a parent and child, a husband and wife…'
+        : 'Link accounts that belong together. They are connected as soon as this account is saved.')+'</p>';
+    }
+    if(n){
+      body += '<div class="td-rel-list">'+items.map(function(it){ return tdRelRowHtml(ui, it); }).join("")+'</div>';
+      if(ui.accountId && !ui.inForm && !ui.editor){
+        body += '<div class="td-rel-foot"><button type="button" class="btn btn-sm btn-ghost" data-action="td-rel-show-in-list">Show these accounts in the list</button></div>';
+      }
+    }
+    if(ui.editor) body += tdRelEditorHtml(ui);
+  }
+  return head+body+suggestionDatalist("td-rel-labels", TD_REL_SUGGESTIONS);
+}
+function tdRelRowHtml(ui, it){
+  var linkEl = ui.inForm
+    ? '<span class="mono td-rel-nid">'+esc(it.other.nationalId)+'</span>'
+    : '<button type="button" class="td-rel-link mono" data-action="td-rel-open" data-id="'+escAttr(it.other.id)+'" title="Open this account">'+esc(it.other.nationalId)+'</button>';
+  if(ui.confirmKey===it.key){
+    return '<div class="td-rel-row td-rel-row-confirm" role="alert">'+
+      '<span class="td-rel-confirm-text">Remove the link to <b class="mono">'+esc(it.other.nationalId)+'</b>? Both accounts stay as they are.</span>'+
+      '<span class="td-rel-actions">'+
+        '<button type="button" class="btn btn-sm" data-action="td-rel-remove-cancel">Cancel</button>'+
+        '<button type="button" class="btn btn-sm btn-danger" data-action="td-rel-remove-confirm" data-id="'+escAttr(it.key)+'">Remove link</button>'+
+      '</span></div>';
+  }
+  var label = it.label
+    ? '<span class="chip td-rel-chip">'+esc(it.label)+'</span>'
+    : '<span class="chip chip-muted td-rel-chip" title="This account has no label for the other side">Linked</span>';
+  var note = it.listedAs ? '<span class="helper-text td-rel-note">lists this account as “'+esc(it.listedAs)+'”</span>' : '';
+  return '<div class="td-rel-row">'+label+linkEl+note+
+    '<span class="td-rel-actions">'+
+      '<button type="button" class="btn btn-sm btn-icon btn-ghost" data-action="td-rel-edit" data-id="'+escAttr(it.key)+'" aria-label="Edit relationship with '+escAttr(it.other.nationalId)+'" title="Edit relationship">'+iconEdit()+'</button>'+
+      '<button type="button" class="btn btn-sm btn-icon btn-ghost" data-action="td-rel-another" data-id="'+escAttr(it.key)+'" aria-label="Add another relationship with '+escAttr(it.other.nationalId)+'" title="Add another relationship with this account">'+iconPlus()+'</button>'+
+      '<button type="button" class="btn btn-sm btn-icon btn-ghost" data-action="td-rel-remove" data-id="'+escAttr(it.key)+'" aria-label="Remove link to '+escAttr(it.other.nationalId)+'" title="Remove link">'+iconTrash()+'</button>'+
+    '</span></div>';
+}
+
+/* ---- editor (add one or several links / edit one) ---- */
+function tdRelEditorHtml(ui){
+  var ed = ui.editor;
+  var sel = ed.selected.map(function(s){ return tdRelSelectedRowHtml(s, ed.mode); }).join("");
+  if(ed.mode==="edit"){
+    return '<div class="td-rel-editor">'+
+      '<div class="td-rel-editor-title">Edit relationship</div>'+sel+
+      '<div class="td-rel-editor-foot"><button type="button" class="btn btn-sm" data-action="td-rel-cancel">Cancel</button>'+
+      '<button type="button" class="btn btn-sm btn-primary" data-action="td-rel-save">Save relationship</button></div></div>';
+  }
+  return '<div class="td-rel-editor">'+
+    '<div class="td-rel-editor-title">Link accounts</div>'+
+    '<div class="field"><label for="td-rel-search">Find accounts</label>'+
+      '<input type="text" id="td-rel-search" autocomplete="off" placeholder="Search by National ID, scenario, entity or tag…" value="'+escAttr(ed.query||"")+'"></div>'+
+    '<div class="td-rel-results" id="td-rel-results">'+tdRelResultsHtml()+'</div>'+
+    '<div id="td-rel-selected">'+sel+'</div>'+
+    '<div class="td-rel-editor-foot"><button type="button" class="btn btn-sm" data-action="td-rel-cancel">Cancel</button>'+
+    '<button type="button" class="btn btn-sm btn-primary" data-action="td-rel-save" id="td-rel-save-btn"'+(ed.selected.length?'':' disabled')+'>'+tdRelSaveLabel(ed)+'</button></div></div>';
+}
+function tdRelSaveLabel(ed){
+  var n = ed.selected.length;
+  return n>1 ? "Add "+n+" relationships" : "Add relationship";
+}
+function tdRelSelectedRowHtml(s, mode){
+  var other = state.testData[s.id];
+  if(!other) return "";
+  return '<div class="td-rel-sel" data-sel-id="'+escAttr(s.id)+'">'+
+    '<div class="td-rel-sel-head"><span class="mono">'+esc(other.nationalId)+'</span>'+
+      (mode==="edit" ? '' : '<button type="button" class="btn btn-sm btn-icon btn-ghost" data-action="td-rel-unselect" data-id="'+escAttr(s.id)+'" aria-label="Don’t link '+escAttr(other.nationalId)+'">'+iconClose()+'</button>')+
+    '</div>'+
+    '<div class="field-row">'+
+      '<div class="field"><label>Their relationship to this account</label>'+
+        '<input type="text" class="td-rel-type" list="td-rel-labels" autocomplete="off" maxlength="60" value="'+escAttr(s.type||"")+'" placeholder="e.g. Wife, Son, Colleague"></div>'+
+      '<div class="field"><label>This account’s relationship to them <span class="hint">(optional)</span></label>'+
+        '<input type="text" class="td-rel-inverse" list="td-rel-labels" autocomplete="off" maxlength="60" value="'+escAttr(s.inverse||"")+'" placeholder="e.g. Husband"'+(s.touched?' data-touched="1"':'')+'></div>'+
+    '</div>'+
+    '<span class="hint td-rel-sel-hint">Leave the second label empty when it isn’t two-way — the other account then shows this link as “Linked”. Type any label you need.</span>'+
+  '</div>';
+}
+function tdRelAccountMatches(t, q){
+  if(!q) return true;
+  var hay = [t.nationalId, (t.supportedScenarios||[]).join(" "), (t.entities||[]).join(" "), (t.tags||[]).join(" "), t.notes].filter(Boolean).join(" ").toLowerCase();
+  return hay.indexOf(q)>-1;
+}
+function tdRelResultsHtml(){
+  var ui = state.tdRel;
+  var ed = ui && ui.editor;
+  if(!ed) return "";
+  var q = String(ed.query||"").trim().toLowerCase();
+  var selected = {};
+  ed.selected.forEach(function(s){ selected[s.id] = true; });
+  // Accounts already linked to this one (or already staged), with their labels.
+  var linked = {};
+  tdRelItems(ui).forEach(function(it){ linked[it.other.id] = (linked[it.other.id]||[]).concat([it.label || "Linked"]); });
+  var pool = allTestDataRecords().filter(function(t){ return t.id!==ui.accountId && tdRelAccountMatches(t, q); });
+  if(!pool.length) return '<p class="helper-text">No matching accounts.</p>';
+  var shown = pool.slice(0, 8);
+  return shown.map(function(t){
+    var note = "";
+    var disabled = false;
+    if(selected[t.id]){ note = "Selected"; disabled = true; }
+    else if(linked[t.id]){ note = "Already linked as "+linked[t.id].join(", "); disabled = true; }
+    var chips = (t.entities||[]).slice(0,2).map(function(en){ return '<span class="chip chip-muted">'+esc(en)+'</span>'; }).join("");
+    return '<button type="button" class="td-rel-result" data-action="td-rel-pick" data-id="'+escAttr(t.id)+'"'+(disabled?' disabled':'')+'>'+
+      '<span class="mono td-rel-result-id">'+highlightMatch(t.nationalId, ed.query ? ed.query.trim() : "")+'</span>'+chips+
+      (note ? '<span class="helper-text td-rel-result-note">'+esc(note)+'</span>' : '')+
+    '</button>';
+  }).join("")+(pool.length>shown.length ? '<p class="helper-text">Showing 8 of '+pool.length+' — type to narrow it down.</p>' : '');
+}
+// Copies what's typed in the selected rows back into state, so re-rendering
+// (selecting another account, etc.) never loses it.
+function tdRelSyncSelectedFromDom(){
+  var ui = state.tdRel;
+  if(!ui || !ui.editor) return;
+  qsa("#td-rel-panel .td-rel-sel").forEach(function(row){
+    var id = row.getAttribute("data-sel-id");
+    var s = ui.editor.selected.filter(function(x){ return x.id===id; })[0];
+    if(!s) return;
+    s.type = row.querySelector(".td-rel-type").value;
+    var inv = row.querySelector(".td-rel-inverse");
+    s.inverse = inv.value;
+    s.touched = inv.getAttribute("data-touched")==="1";
+  });
+}
+function tdRelOpenEditor(mode, selected, relKey){
+  var ui = state.tdRel;
+  if(!ui) return;
+  ui.confirmKey = null;
+  ui.collapsed = false;
+  ui.editor = {mode:mode, relKey:relKey||null, query:"", selected:selected||[]};
+  tdRelRefresh();
+  var f = qs("#td-rel-search") || qs("#td-rel-panel .td-rel-type");
+  if(f) f.focus();
+}
+function tdRelItemByKey(ui, key){
+  return tdRelItems(ui).filter(function(it){ return it.key===key; })[0] || null;
+}
+// After any change: refresh the panel, the list badges behind the modal.
+function tdRelAfterChange(){
+  tdRelRefresh();
+  var list = qs("#td-list-container");
+  if(list && state.route.view==="testData") list.innerHTML = renderTestDataListHtml();
+}
+function tdRelSave(){
+  var ui = state.tdRel;
+  if(!ui || !ui.editor) return;
+  tdRelSyncSelectedFromDom();
+  var ed = ui.editor;
+  if(!ed.selected.length){ showToast("Choose at least one account to link."); return; }
+  for(var i=0;i<ed.selected.length;i++){
+    var s = ed.selected[i];
+    if(!tdRelClean(s.type) && !tdRelClean(s.inverse)){
+      var o = state.testData[s.id];
+      showToast("Enter the relationship for "+(o?o.nationalId:"the account")+" — for example Wife, Son, or a label of your own.");
+      var row = qs('#td-rel-panel .td-rel-sel[data-sel-id="'+s.id+'"] .td-rel-type');
+      if(row) row.focus();
+      return;
+    }
+  }
+  var saveBtn = qs("#td-rel-save-btn") || qs('#td-rel-panel [data-action="td-rel-save"]');
+  if(saveBtn) saveBtn.disabled = true;
+  var failed = function(err){
+    if(saveBtn) saveBtn.disabled = false;
+    showToast(err && err.message ? err.message : "Couldn't save the relationship.");
+  };
+
+  // ---- staged links for a not-yet-saved account
+  if(!ui.accountId){
+    var pendingErr = null;
+    if(ed.mode==="edit"){
+      var idx = parseInt(String(ed.relKey).slice(1),10);
+      if(ui.pending[idx]){ var s0 = ed.selected[0]; ui.pending[idx].type = tdRelClean(s0.type); ui.pending[idx].inverse = tdRelClean(s0.inverse); }
+    } else {
+      ed.selected.forEach(function(s){
+        var type = tdRelClean(s.type), inverse = tdRelClean(s.inverse);
+        var inv = s.touched ? inverse : (inverse || tdRelKnownInverse(type));
+        var dup = ui.pending.some(function(p){ return p.otherId===s.id && tdRelKey(p.type)===tdRelKey(type); });
+        if(dup){ pendingErr = "These accounts are already linked with this relationship."; return; }
+        ui.pending.push({otherId:s.id, type:type, inverse:inv});
+      });
+    }
+    ui.editor = null;
+    tdRelRefresh();
+    if(pendingErr) showToast(pendingErr);
+    return;
+  }
+
+  // ---- saved account: write through the API
+  if(ed.mode==="edit"){
+    var it = tdRelItemByKey(ui, ed.relKey);
+    if(!it){ ui.editor = null; tdRelAfterChange(); return; }
+    var s1 = ed.selected[0];
+    api.updateTestRelationship(it.rel.id, {perspectiveId: ui.accountId, relationshipType: tdRelClean(s1.type), inverseRelationshipType: tdRelClean(s1.inverse)})
+      .then(function(updated){
+        state.testRels = (state.testRels||[]).map(function(r){ return r.id===updated.id ? updated : r; });
+        ui.editor = null;
+        tdRelAfterChange();
+        showToast("✓ Relationship updated");
+      }).catch(failed);
+    return;
+  }
+  var links = ed.selected.map(function(s){
+    var type = tdRelClean(s.type), inverse = tdRelClean(s.inverse);
+    // an untouched second label is the known reverse (or none); a typed/edited one is sent as typed
+    return {otherId:s.id, relationshipType:type, inverseRelationshipType: s.touched ? inverse : (inverse || tdRelKnownInverse(type))};
+  });
+  api.createTestRelationships(ui.accountId, links).then(function(res){
+    state.testRels = (state.testRels||[]).concat(res.created||[]);
+    ui.editor = null;
+    tdRelAfterChange();
+    var skipped = res.skipped||[];
+    showToast(skipped.length
+      ? "✓ "+(res.created||[]).length+" linked — "+skipped.length+" skipped: "+skipped[0].reason
+      : "✓ "+((res.created||[]).length>1 ? (res.created.length+" relationships added") : "Relationship added"));
+  }).catch(failed);
+}
+function tdRelRemove(key){
+  var ui = state.tdRel;
+  if(!ui) return;
+  ui.confirmKey = null;
+  if(!ui.accountId){
+    var idx = parseInt(String(key).slice(1),10);
+    ui.pending.splice(idx, 1);
+    tdRelRefresh();
+    return;
+  }
+  api.deleteTestRelationship(key).then(function(){
+    state.testRels = (state.testRels||[]).filter(function(r){ return r.id!==key; });
+    tdRelAfterChange();
+    showToast("Link removed — both accounts kept");
+  }).catch(function(err){
+    // already gone (removed elsewhere): just drop it locally
+    if(err && err.status===404){ state.testRels = (state.testRels||[]).filter(function(r){ return r.id!==key; }); tdRelAfterChange(); return; }
+    showToast(err.message || "Couldn't remove the link.");
+  });
+}
+// Called after a brand-new account has been saved: creates its staged links.
+function tdRelCreatePending(savedId, pending){
+  if(!pending || !pending.length) return Promise.resolve(null);
+  var links = pending.map(function(p){ return {otherId:p.otherId, relationshipType:p.type, inverseRelationshipType:p.inverse}; });
+  return api.createTestRelationships(savedId, links).then(function(res){
+    state.testRels = (state.testRels||[]).concat(res.created||[]);
+    return res;
+  });
+}
+
+function openTestDataViewModal(t, trail){
+  tdRelInit(t.id, trail||[]);
   var body =
     '<div class="field"><label>National ID</label><p class="mono">'+esc(t.nationalId)+'</p></div>'+
     '<div class="field"><label>Supported Scenarios</label><p>'+(t.supportedScenarios||[]).map(function(s){return '<span class="chip">'+esc(s)+'</span>';}).join(" ")+'</p></div>'+
     '<div class="field"><label>Entities</label><p>'+((t.entities&&t.entities.length)? t.entities.map(function(en){return '<span class="chip chip-muted">'+esc(en)+'</span>';}).join(" ") : '<span class="helper-text">Not provided</span>')+'</p></div>'+
     '<div class="field"><label>Tags</label><p>'+((t.tags||[]).length? t.tags.map(function(tg){return '<span class="chip chip-muted">'+esc(tg)+'</span>';}).join(" ") : '<span class="helper-text">Not provided</span>')+'</p></div>'+
     '<div class="field"><label>Notes</label><p>'+(t.notes? esc(t.notes) : '<span class="helper-text">Not provided</span>')+'</p></div>'+
+    '<div class="field">'+tdRelPanelHtml()+'</div>'+
     '<div class="field"><label>Added</label><p class="helper-text">'+esc(t.createdBy||"Unknown")+' · '+esc(fmtDateTime(t.createdAt)||"")+'</p></div>';
-  var foot = '<span style="flex:1"></span><button type="button" class="btn" data-action="close-modal">Close</button><button type="button" class="btn btn-primary" id="td-view-edit">'+iconEdit()+' Edit</button>';
-  openModal('<div class="modal-head"><h3>Test Data — '+esc(t.nationalId)+'</h3><button class="btn btn-icon btn-ghost" data-action="close-modal" aria-label="Close">'+iconClose()+'</button></div><div class="modal-body">'+body+'</div><div class="modal-foot">'+foot+'</div>');
+  var back = (trail && trail.length && state.testData[trail[trail.length-1]])
+    ? '<button type="button" class="btn" data-action="td-rel-back">'+iconBack()+' Back to '+esc(state.testData[trail[trail.length-1]].nationalId)+'</button>' : '';
+  var foot = back+'<span style="flex:1"></span><button type="button" class="btn" data-action="close-modal">Close</button><button type="button" class="btn btn-primary" id="td-view-edit">'+iconEdit()+' Edit</button>';
+  openModal('<div class="modal-head"><h3>Test Data — '+esc(t.nationalId)+'</h3><button class="btn btn-icon btn-ghost" data-action="close-modal" aria-label="Close">'+iconClose()+'</button></div><div class="modal-body">'+body+'</div><div class="modal-foot">'+foot+'</div>', {wide:true});
   var editBtn = qs("#td-view-edit");
   if(editBtn) editBtn.addEventListener("click", function(){ closeModal(); openTestDataModal(t, false); });
 }
@@ -3184,6 +3563,11 @@ function openTestDataModal(existing, isCopyMode){
   var entityOptions = distinct(TEST_DATA_ENTITY_SUGGESTIONS.concat(all.reduce(function(acc,t){return acc.concat(t.entities||[]);},[])));
   var tagOptions = distinct(all.reduce(function(acc,t){return acc.concat(t.tags||[]);},[]));
 
+  // Related Test Accounts: an existing account edits its links live; a new
+  // (or copied) account stages them and they are created right after it is
+  // saved. A copy never inherits the original's links.
+  tdRelInit(isEdit ? existing.id : null);
+  state.tdRel.inForm = true;
   var title = isEdit ? "Edit Test Data" : (isCopyMode ? "Copy Test Data" : "Add Test Data");
   var body =
     '<div class="field"><label for="f-td-nid">National ID</label><input type="text" id="f-td-nid" value="'+escAttr(draft.nationalId)+'" required placeholder="e.g. 9920123456"></div>'+
@@ -3194,16 +3578,17 @@ function openTestDataModal(existing, isCopyMode){
     '<div class="field"><label for="f-td-tags">Tags <span class="hint">(optional)</span></label><input type="text" id="f-td-tags" list="td-tag-suggestions" value="'+escAttr(draft.tags.join(", "))+'" placeholder="e.g. female-head, jordanian"><span class="hint">Separate multiple tags with commas.</span></div>'+
     suggestionDatalist("td-tag-suggestions", tagOptions)+
     '<div class="field"><label for="f-td-notes">Notes <span class="hint">(optional)</span></label><textarea id="f-td-notes" rows="3">'+esc(draft.notes)+'</textarea></div>'+
+    '<div class="field">'+tdRelPanelHtml()+'</div>'+
     '<div id="td-dup-warning" class="helper-text" style="display:none;color:var(--danger-fg);margin-top:-6px;"></div>';
   var foot = (isEdit? '<button type="button" class="btn btn-danger" id="del-test-data">'+iconTrash()+' Delete</button>' : '<span></span>')+
     '<span style="flex:1"></span><button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">'+(isEdit?"Save changes":"Save")+'</button>';
 
-  openModal(modalShell(title, body, foot));
+  openModal(modalShell(title, body, foot), {wide:true});
 
   var delBtn = qs("#del-test-data");
   if(delBtn) delBtn.addEventListener("click", function(){
     closeModal();
-    openConfirm("Delete this test data?", "This permanently deletes test data for National ID <b>"+esc(existing.nationalId)+"</b>.", "Delete", function(){ deleteTestDataRecord(existing.id); }, true);
+    openConfirm("Delete this test data?", tdDeleteMessage(existing), "Delete", function(){ deleteTestDataRecord(existing.id); }, true);
   });
 
   qs("#modal-form").addEventListener("submit", function(e){
@@ -3217,6 +3602,7 @@ function openTestDataModal(existing, isCopyMode){
     var tags = splitCommaList(qs("#f-td-tags").value);
     var notes = qs("#f-td-notes").value.trim();
     var payload = {nationalId:nationalId, supportedScenarios:scenarios, entities:entities, tags:tags, notes:notes};
+    var stagedLinks = (!isEdit && state.tdRel) ? state.tdRel.pending.slice() : [];
     var submitBtn = qs('#modal-form button[type="submit"]');
     if(submitBtn) submitBtn.disabled = true;
     var warn = qs("#td-dup-warning");
@@ -3226,13 +3612,24 @@ function openTestDataModal(existing, isCopyMode){
       state.testData[saved.id] = saved;
       if(state.testDataOrder.indexOf(saved.id)===-1) state.testDataOrder.unshift(saved.id);
       closeModal();
-      if(state.route.view==="testData") render();
       logAudit({
         action: isEdit ? "TEST_DATA_UPDATED" : (isCopyMode ? "TEST_DATA_COPIED" : "TEST_DATA_CREATED"),
         entityType: "TestData", entityId: saved.id,
         details: saved.nationalId+((saved.entities&&saved.entities.length)? " — "+saved.entities.join(", "):"")
       });
-      showToast(isEdit? "✓ Test data updated" : "✓ Test data saved");
+      var done = function(extra){
+        if(state.route.view==="testData") render();
+        showToast((isEdit? "✓ Test data updated" : "✓ Test data saved")+(extra||""));
+      };
+      if(!stagedLinks.length) return done();
+      // The account exists now — create the links staged in the form.
+      tdRelCreatePending(saved.id, stagedLinks).then(function(res){
+        var made = res && res.created ? res.created.length : 0;
+        var skipped = res && res.skipped ? res.skipped.length : 0;
+        done(" · "+made+" related account"+(made===1?"":"s")+" linked"+(skipped? " ("+skipped+" skipped)":""));
+      }).catch(function(err){
+        done(" — but the related accounts couldn't be linked: "+(err && err.message ? err.message : "try again from the account"));
+      });
     }).catch(function(err){
       if(submitBtn) submitBtn.disabled = false;
       if(err && err.status===409 && err.data && err.data.existingId){
@@ -3253,9 +3650,16 @@ function openTestDataModal(existing, isCopyMode){
     });
   });
 }
+function tdDeleteMessage(t){
+  var n = t ? tdRelCount(t.id) : 0;
+  return "This permanently deletes test data for National ID <b>"+esc(t?t.nationalId:"")+"</b>."+
+    (n ? " Its "+n+" related-account link"+(n===1?"":"s")+" will be removed too; the linked accounts themselves are kept." : "");
+}
 function deleteTestDataRecord(id){
   var t = state.testData[id];
   api.deleteTestData(id).then(function(){
+    // Links to the deleted account go with it (the server removed them too).
+    state.testRels = (state.testRels||[]).filter(function(r){ return r.accountAId!==id && r.accountBId!==id; });
     delete state.testData[id];
     state.testDataOrder = state.testDataOrder.filter(function(x){return x!==id;});
     if(state.route.view==="testData") render();
@@ -3274,6 +3678,7 @@ function testDataExportUrl(){
   if(state.testDataSearch) params.push("q="+encodeURIComponent(state.testDataSearch));
   if(state.testDataEntityFilter) params.push("entity="+encodeURIComponent(state.testDataEntityFilter));
   if(state.testDataTagFilter) params.push("tag="+encodeURIComponent(state.testDataTagFilter));
+  if((state.testDataRelatedTo||"").trim()) params.push("relatedTo="+encodeURIComponent(state.testDataRelatedTo.trim()));
   return API+"/test-data/export"+(params.length? "?"+params.join("&") : "");
 }
 function triggerFileDownload(url){
@@ -4862,6 +5267,15 @@ function openModal(innerHtml, opts){
 }
 function closeModal(){ if(state.blockingModal) return; qs("#modal-root").innerHTML = ""; }
 document.addEventListener("keydown", function(e){ if(e.key==="Escape" && !state.blockingModal) closeModal(); });
+// Enter inside the Related Test Accounts panel must never submit the surrounding
+// Add/Edit Test Data form: in a label field it saves the link being edited,
+// elsewhere (the account search) it does nothing.
+document.addEventListener("keydown", function(e){
+  if(e.key!=="Enter" || !e.target || !e.target.closest || !e.target.closest("#td-rel-panel")) return;
+  if(e.target.tagName==="BUTTON") return;
+  e.preventDefault();
+  if(e.target.classList.contains("td-rel-type") || e.target.classList.contains("td-rel-inverse")) tdRelSave();
+});
 
 function statusChoiceGroup(name, options, current, plain){
   // plain=true skips the status-tone coloring — for non-status choices
@@ -6231,7 +6645,7 @@ document.addEventListener("click", function(e){
     case "copy-test-data": if(state.testData[id]) openTestDataModal(state.testData[id], true); break;
     case "delete-test-data":
       var tdTarget = state.testData[id];
-      openConfirm("Delete this test data?", "This permanently deletes test data for National ID <b>"+esc(tdTarget?tdTarget.nationalId:"")+"</b>.", "Delete", function(){ deleteTestDataRecord(id); }, true);
+      openConfirm("Delete this test data?", tdDeleteMessage(tdTarget), "Delete", function(){ deleteTestDataRecord(id); }, true);
       break;
     case "clear-td-search":
       state.testDataSearch = "";
@@ -6241,6 +6655,74 @@ document.addEventListener("click", function(e){
       var tdListEl = qs("#td-list-container");
       if(tdListEl) tdListEl.innerHTML = renderTestDataListHtml();
       el2.hidden = true;
+      break;
+    case "td-rel-toggle":
+      if(state.tdRel){
+        var tdRelItemsNow = tdRelItems(state.tdRel);
+        var tdRelWasCollapsed = state.tdRel.collapsed==null ? tdRelItemsNow.length>TD_REL_AUTO_COLLAPSE_OVER : state.tdRel.collapsed;
+        state.tdRel.collapsed = !tdRelWasCollapsed;
+        tdRelRefresh();
+      }
+      break;
+    case "td-rel-add": tdRelOpenEditor("add", []); break;
+    case "td-rel-cancel": if(state.tdRel){ state.tdRel.editor = null; tdRelRefresh(); } break;
+    case "td-rel-pick":
+      if(state.tdRel && state.tdRel.editor && state.testData[id]){
+        tdRelSyncSelectedFromDom();
+        if(!state.tdRel.editor.selected.some(function(x){ return x.id===id; })) state.tdRel.editor.selected.push({id:id, type:"", inverse:"", touched:false});
+        var tdRelQ = qs("#td-rel-search");
+        state.tdRel.editor.query = tdRelQ ? tdRelQ.value : state.tdRel.editor.query;
+        tdRelRefresh();
+        var tdRelNewType = qs('#td-rel-panel .td-rel-sel[data-sel-id="'+id+'"] .td-rel-type');
+        if(tdRelNewType) tdRelNewType.focus();
+      }
+      break;
+    case "td-rel-unselect":
+      if(state.tdRel && state.tdRel.editor){
+        tdRelSyncSelectedFromDom();
+        state.tdRel.editor.selected = state.tdRel.editor.selected.filter(function(x){ return x.id!==id; });
+        var tdRelQ2 = qs("#td-rel-search");
+        if(tdRelQ2) state.tdRel.editor.query = tdRelQ2.value;
+        tdRelRefresh();
+      }
+      break;
+    case "td-rel-save": tdRelSave(); break;
+    case "td-rel-edit":
+      if(state.tdRel){
+        var tdRelEd = tdRelItemByKey(state.tdRel, id);
+        if(tdRelEd) tdRelOpenEditor("edit", [{id:tdRelEd.other.id, type:tdRelEd.label, inverse:tdRelEd.inverse, touched:!!tdRelEd.inverse}], tdRelEd.key);
+      }
+      break;
+    case "td-rel-another":
+      if(state.tdRel){
+        var tdRelAn = tdRelItemByKey(state.tdRel, id);
+        if(tdRelAn) tdRelOpenEditor("add", [{id:tdRelAn.other.id, type:"", inverse:"", touched:false}]);
+      }
+      break;
+    case "td-rel-remove": if(state.tdRel){ state.tdRel.confirmKey = id; tdRelRefresh(); } break;
+    case "td-rel-remove-cancel": if(state.tdRel){ state.tdRel.confirmKey = null; tdRelRefresh(); } break;
+    case "td-rel-remove-confirm": tdRelRemove(id); break;
+    case "td-rel-open":
+      if(state.tdRel && state.testData[id]){
+        var tdTrail = state.tdRel.trail.slice();
+        if(state.tdRel.accountId) tdTrail.push(state.tdRel.accountId);
+        openTestDataViewModal(state.testData[id], tdTrail);
+      }
+      break;
+    case "td-rel-back":
+      if(state.tdRel && state.tdRel.trail.length){
+        var tdTrailBack = state.tdRel.trail.slice();
+        var tdPrev = state.testData[tdTrailBack.pop()];
+        if(tdPrev) openTestDataViewModal(tdPrev, tdTrailBack);
+      }
+      break;
+    case "td-rel-show-in-list":
+      if(state.tdRel && state.tdRel.accountId && state.testData[state.tdRel.accountId]){
+        state.testDataRelatedTo = state.testData[state.tdRel.accountId].nationalId;
+        state.testDataPage = 1;
+        closeModal();
+        if(state.route.view==="testData") render();
+      }
       break;
     case "add-team-member": openTeamMemberModal(null); break;
     case "toggle-team-menu":
@@ -6398,6 +6880,27 @@ document.addEventListener("input", function(e){
     var tdListEl3 = qs("#td-list-container");
     if(tdListEl3) tdListEl3.innerHTML = renderTestDataListHtml();
   }
+  if(e.target && e.target.id==="td-related-filter"){
+    state.testDataRelatedTo = e.target.value;
+    state.testDataPage = 1;
+    var tdListEl6 = qs("#td-list-container");
+    if(tdListEl6) tdListEl6.innerHTML = renderTestDataListHtml();
+  }
+  // Related Test Accounts panel: live account search, and the optional second
+  // label follows the first (Wife -> Husband) until the user types their own.
+  if(e.target && e.target.id==="td-rel-search" && state.tdRel && state.tdRel.editor){
+    state.tdRel.editor.query = e.target.value;
+    var tdRelRes = qs("#td-rel-results");
+    if(tdRelRes) tdRelRes.innerHTML = tdRelResultsHtml();
+  }
+  if(e.target && e.target.classList && e.target.classList.contains("td-rel-type")){
+    var tdRelRow = e.target.closest(".td-rel-sel");
+    var tdRelInv = tdRelRow && tdRelRow.querySelector(".td-rel-inverse");
+    if(tdRelInv && tdRelInv.getAttribute("data-touched")!=="1") tdRelInv.value = tdRelKnownInverse(e.target.value);
+  }
+  if(e.target && e.target.classList && e.target.classList.contains("td-rel-inverse")){
+    e.target.setAttribute("data-touched","1");
+  }
   if(e.target && e.target.id==="td-tag-filter"){
     state.testDataTagFilter = e.target.value;
     state.testDataPage = 1;
@@ -6411,7 +6914,7 @@ document.addEventListener("input", function(e){
 // "input" for that specific interaction, so this is a safety net to make
 // sure clearing via the native button re-filters the list too.
 document.addEventListener("search", function(e){
-  if(e.target && (e.target.id==="td-entity-filter" || e.target.id==="td-tag-filter")){
+  if(e.target && (e.target.id==="td-entity-filter" || e.target.id==="td-tag-filter" || e.target.id==="td-related-filter")){
     state.testDataPage = 1;
     var tdListEl5 = qs("#td-list-container");
     if(tdListEl5) tdListEl5.innerHTML = renderTestDataListHtml();
