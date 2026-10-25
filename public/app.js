@@ -1142,7 +1142,35 @@ function loadTeam(){
   });
 }
 
+/* ---- Page-load feedback ----
+   Opening a page fetches its data first, and on a slow connection (or a
+   server that has gone to sleep) that can take seconds — during which nothing
+   on screen used to change, so it felt like the click did nothing. While a
+   page loads: a thin progress bar runs along the top, the side menu already
+   highlights the page being opened, and the page still on screen is dimmed
+   (all of it only appears if loading takes longer than a blink, via a short
+   CSS delay, so fast pages don't flicker). The very first load, when nothing
+   is on screen yet, shows a spinner instead. */
+var navToken = 0;
+function setRouteLoading(on){
+  var bar = qs("#route-progress"), app = qs("#app");
+  if(bar) bar.classList.toggle("on", !!on);
+  if(app){
+    app.classList.toggle("is-loading", !!on);
+    app.setAttribute("aria-busy", on ? "true" : "false");
+  }
+}
+function loadingPlaceholderHtml(){
+  return '<div class="page-loading" role="status"><span class="page-loading-spinner" aria-hidden="true"></span>'+
+    '<div class="page-loading-text">Loading…</div>'+
+    '<div class="page-loading-hint">Still working — the server can take a little longer to respond after a quiet period.</div></div>';
+}
 function boot(){
+  var myNav = ++navToken;
+  var appEl = qs("#app");
+  setRouteLoading(true);
+  renderSidenav(); // highlight the page being opened right away
+  if(appEl && !appEl.firstElementChild) appEl.innerHTML = loadingPlaceholderHtml();
   // Know the Team names are needed well beyond the Know the Team view
   // itself — regression/ticket assignment dropdowns (regressionOwnerOptions,
   // ticketAssigneeOptions) and "My Regression" (currentPreparerName) all
@@ -1176,7 +1204,15 @@ function boot(){
     // "team" needs nothing beyond the loadTeam() already queued above.
     tasks.push(loadList());
   }
-  Promise.all(tasks).then(render);
+  Promise.all(tasks).then(function(){
+    if(myNav !== navToken) return; // a newer navigation took over; it will render
+    setRouteLoading(false);
+    render();
+  }, function(){
+    if(myNav !== navToken) return;
+    setRouteLoading(false);
+    render();
+  });
 }
 
 /* ============================================================
@@ -7160,10 +7196,13 @@ function surfaceAuthErrorFromUrl(){
 }
 function initAuthThenBoot(){
   surfaceAuthErrorFromUrl();
+  var appEl0 = qs("#app");
+  if(appEl0 && !appEl0.firstElementChild) appEl0.innerHTML = loadingPlaceholderHtml(); // visible while we check the sign-in
   authApi.me().then(function(info){
     state.auth = info;
     renderTopbarUser();
     if(!info.authenticated){
+      if(appEl0) appEl0.innerHTML = "";
       openSignInModal();
       return; // nothing else loads until they've actually signed in
     }
