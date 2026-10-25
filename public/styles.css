@@ -295,52 +295,122 @@ a{color:inherit;}
 .regmod-reorder{display:flex;gap:3px;flex-shrink:0;}
 .regmod-reorder .btn-icon{width:26px;height:26px;padding:4px;}
 
-/* Regression section (release view): entities grouped as headed sections */
-.regression-controls{display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap;}
-.regression-controls select{border:1px solid var(--border-strong);border-radius:7px;padding:6px 10px;font-size:12.5px;font-family:inherit;background:var(--surface);color:var(--ink);}
-.regression-entity-list{display:flex;flex-direction:column;gap:20px;}
-.regression-entity-heading-row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--border);}
-.regression-entity-heading{font-weight:800;font-size:12.5px;text-transform:uppercase;letter-spacing:.04em;color:var(--ink-soft);}
+/* Regression section (release view): one collapsed-by-default card per Entity,
+   opening to a Module | Status | Assignee | Notes table. Colours all come from
+   the app's own tokens, so dark mode needs nothing extra. */
 .regression-owner-btn{display:inline-flex;align-items:center;gap:6px;color:var(--ink-faint);font-weight:600;white-space:nowrap;flex-shrink:0;}
 .regression-owner-btn.has-owner{color:var(--accent);}
 .regression-skip-toggle{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--ink-soft);}
-/* "Group by: Owner" view — one bucket per assignee (or "Unassigned"),
-   each containing its own entity groups rendered exactly as the default
-   "Group by: Entity" view does. */
+/* "Group by: Owner" view — one bucket per assignee (or "Unassigned"), each
+   holding its own entity cards. */
 .regression-owner-group-heading{display:flex;align-items:center;gap:7px;font-weight:800;font-size:13.5px;color:var(--accent);margin-bottom:12px;padding-bottom:8px;border-bottom:1.5px solid var(--accent-soft-border);}
 .regression-owner-group-heading svg{flex-shrink:0;}
 .regression-owner-group-count{color:var(--ink-faint);font-weight:600;font-size:12px;}
-.regression-owner-group .regression-entity-group + .regression-entity-group{margin-top:20px;}
 
-/* Entity heading: name + compact summary stacked on the left, the owner
-   control on the right (unchanged position/behavior from before — still
-   the same button, still opens the same kind of modal, just now a
-   dropdown-style pick list instead of free text). */
-.regression-entity-heading-main{min-width:0;}
-.regression-entity-summary{font-size:11.5px;color:var(--ink-faint);font-weight:600;margin-top:2px;}
+.section-card.reg{padding:22px;}
+.reg-head{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:18px;}
+.reg-head-icon{width:44px;height:44px;border-radius:12px;background:var(--accent-soft);color:var(--accent);display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.reg-head-text{flex:1;min-width:200px;}
+.reg-head-text h2{margin:0;font-family:var(--font-display);font-weight:800;font-size:20px;letter-spacing:-.01em;}
+.reg-head-text p{margin:2px 0 0;color:var(--ink-soft);font-size:13px;}
+.reg-head-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;}
+.reg .menu-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:8px 10px;font-size:13px;font-weight:600;color:var(--ink);}
+.reg .menu-row:hover{background:none;}
+.reg .reg-more-menu{min-width:210px;}
+.reg-row-menu{top:34px;min-width:170px;}
 
-/* View tabs (All / My Regression / Unassigned) — small plain buttons, not a
-   new tab component; .active just mirrors how a checked status pill looks. */
-.regression-view-tabs{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px;}
-.regression-view-tabs .view-tab.active{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);}
+.reg-filters{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:18px;}
+.reg-search{display:flex;align-items:center;gap:8px;background:var(--surface);border:1px solid var(--border-strong);border-radius:10px;padding:8px 12px;flex:1 1 150px;max-width:185px;color:var(--ink-faint);}
+.reg-search:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);}
+.reg-search input{flex:1;border:none;outline:none;background:none;color:var(--ink);font-size:13.5px;min-width:0;font-family:inherit;padding:0;}
+.reg-pill{appearance:none;cursor:pointer;display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:100px;font-size:12.5px;font-weight:700;border:1px solid var(--border-strong);background:var(--surface);color:var(--ink);font-family:inherit;}
+.reg-pill .pill-dot{width:7px;height:7px;border-radius:50%;background:currentColor;}
+.reg-pill.tone-info{background:var(--info-bg);color:var(--info-fg);border-color:var(--info-border);}
+.reg-pill.tone-danger{background:var(--danger-bg);color:var(--danger-fg);border-color:var(--danger-border);}
+.reg-pill.tone-warn{background:var(--warn-bg);color:var(--warn-fg);border-color:var(--warn-border);}
+.reg-pill.tone-go{background:var(--go-bg);color:var(--go-fg);border-color:var(--go-border);}
+.reg-pill.active{box-shadow:0 0 0 2px var(--surface),0 0 0 4px currentColor;}
+.reg-pill.plain.active{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);box-shadow:none;}
+.reg-filters select{border:1px solid var(--border-strong);border-radius:7px;padding:7px 10px;font-size:12.5px;font-family:inherit;background:var(--surface);color:var(--ink);margin-left:auto;}
 
-/* Compact regression module row: two tight lines (name, then status
-   pills+actions) instead of the old stacked title/status/notes block. Scoped
-   to .regression-service-row specifically so bugs/blockers/tickets, which
-   also use the shared .item-row/.item-row-actions classes, are untouched.
-   No owner control here — assignment is Entity-level only (see
-   .regression-owner-btn on the entity heading row below). */
-.item-row.regression-service-row{flex-direction:column;align-items:stretch;padding:9px 12px;gap:0;}
-.reg-row-top{display:flex;align-items:center;justify-content:space-between;gap:10px;}
-.reg-row-name{font-weight:700;font-size:13px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.reg-row-bottom{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:6px;flex-wrap:wrap;}
-.reg-row-actions{margin-left:auto;}
-.reg-row-notes{margin-top:6px;}
+.reg-list{display:flex;flex-direction:column;gap:12px;}
+.reg-groups{display:flex;flex-direction:column;gap:24px;}
+.reg-card{border:1px solid var(--border);border-radius:14px;background:var(--surface);}
+.reg-card-head{display:flex;align-items:center;gap:14px;padding:16px 18px;cursor:pointer;flex-wrap:wrap;}
+.reg-card-icon{width:40px;height:40px;border-radius:10px;background:var(--accent-soft);color:var(--accent);display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.reg-card-main{flex:1;min-width:180px;}
+.reg-card-name{font-family:var(--font-display);font-weight:800;font-size:16px;}
+.reg-card-sum{font-size:12px;color:var(--ink-faint);font-weight:600;margin-top:2px;}
+.reg-card-sum .c{font-weight:700;}
+.reg-card-sum .c.zero{opacity:.45;}
+.reg-card-sum .c-pass{color:var(--go-fg);}
+.reg-card-sum .c-fail{color:var(--danger-fg);}
+.reg-card-sum .c-warn{color:var(--warn-fg);}
+.reg-card-sum .c-nt{color:var(--info-fg);}
+.reg-card-sum .c-skip{color:var(--neutral-fg);}
+.reg-card-sum .dot{margin:0 5px;color:var(--ink-faint);}
+.reg .owner{display:inline-flex;align-items:center;gap:8px;border:none;background:none;cursor:pointer;font-size:13px;font-weight:700;color:var(--ink);padding:4px 6px;border-radius:8px;font-family:inherit;max-width:100%;}
+.reg .owner:hover{background:var(--surface-alt);}
+.reg .owner.none{color:var(--ink-faint);font-weight:600;}
+.reg .owner.is-override{box-shadow:inset 0 0 0 1px var(--accent-soft-border);}
+.reg .owner svg:last-child{color:var(--ink-faint);flex-shrink:0;}
+.reg .owner-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.reg .avatar{width:30px;height:30px;border-radius:50%;background:var(--accent-soft);color:var(--accent);display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;}
+.reg .owner.none .avatar{background:var(--neutral-bg);color:var(--ink-faint);}
+.reg .chev{width:34px;height:34px;border-radius:9px;border:1px solid var(--border-strong);background:var(--surface);display:flex;align-items:center;justify-content:center;color:var(--ink-soft);flex-shrink:0;transition:transform .15s;cursor:pointer;padding:0;}
+.reg-card.open .chev{transform:rotate(180deg);}
+.reg-card.open .reg-card-head{border-bottom:1px solid var(--border);}
+.reg-card-body{display:none;padding:6px 14px 12px;}
+.reg-card.open .reg-card-body{display:block;}
+
+.reg-table-head,.reg-row{display:grid;grid-template-columns:24px minmax(150px,2fr) 150px minmax(130px,1fr) minmax(130px,1.3fr) 30px;gap:12px;align-items:center;}
+.reg-table-head{padding:10px 8px;font-size:12px;font-weight:700;color:var(--ink-soft);background:var(--surface-alt);border-radius:9px;margin:8px 0 2px;}
+.row-wrap{position:relative;border-bottom:1px solid var(--border);}
+.row-wrap:last-child{border-bottom:none;}
+.reg-row{padding:11px 8px;}
+.reg .row-chev{border:none;background:none;color:var(--ink-faint);cursor:pointer;padding:2px;display:flex;border-radius:6px;transition:transform .15s;}
+.row-wrap.open .row-chev{transform:rotate(90deg);}
+.reg-row-name{font-weight:700;font-size:13.5px;min-width:0;overflow:hidden;text-overflow:ellipsis;}
+.reg .warn-flag{color:var(--warn-fg);margin-left:6px;font-size:12px;cursor:help;}
+.reg .c-notes,.reg .c-owner{min-width:0;display:flex;}
+.status-wrap{position:relative;display:inline-block;}
+.status-select{appearance:none;-webkit-appearance:none;border-radius:100px;padding:5px 26px 5px 22px;font-size:12px;font-weight:700;border:1px solid transparent;cursor:pointer;font-family:inherit;color:inherit;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6' fill='none' stroke='%23888' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1 1l4 4 4-4'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 9px center;}
+.status-wrap:before{content:"";position:absolute;left:9px;top:50%;width:7px;height:7px;margin-top:-3.5px;border-radius:50%;background:currentColor;pointer-events:none;z-index:1;}
+.status-wrap.st-info{color:var(--info-fg);}
+.status-wrap.st-go{color:var(--go-fg);}
+.status-wrap.st-warn{color:var(--warn-fg);}
+.status-wrap.st-danger{color:var(--danger-fg);}
+.status-wrap.st-neutral{color:var(--neutral-fg);}
+.status-wrap.st-info .status-select{background-color:var(--info-bg);border-color:var(--info-border);}
+.status-wrap.st-go .status-select{background-color:var(--go-bg);border-color:var(--go-border);}
+.status-wrap.st-warn .status-select{background-color:var(--warn-bg);border-color:var(--warn-border);}
+.status-wrap.st-danger .status-select{background-color:var(--danger-bg);border-color:var(--danger-border);}
+.status-wrap.st-neutral .status-select{background-color:var(--neutral-bg);border-color:var(--neutral-border);}
+.status-select option{color:var(--ink);background:var(--surface);}
+.reg .note-btn{display:inline-flex;align-items:center;gap:8px;border:none;background:none;cursor:pointer;color:var(--ink-faint);font-size:12.5px;font-weight:600;padding:4px 6px;border-radius:7px;max-width:100%;text-align:left;font-family:inherit;}
+.reg .note-btn:hover{background:var(--surface-alt);}
+.reg .note-btn.has{color:var(--ink-soft);}
+.reg .note-btn svg{flex-shrink:0;}
+.reg .note-btn span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.reg .kebab{width:30px;height:30px;border:none;background:none;border-radius:7px;cursor:pointer;color:var(--ink-soft);display:flex;align-items:center;justify-content:center;padding:0;}
+.reg .kebab:hover{background:var(--surface-alt);}
+.row-detail{display:none;margin:0 8px 10px 36px;padding:10px 12px;background:var(--surface-alt);border:1px solid var(--border);border-radius:9px;font-size:12.5px;color:var(--ink-soft);}
+.row-wrap.open .row-detail{display:block;}
+.reg-detail-note{white-space:pre-wrap;word-break:break-word;color:var(--ink);}
+.reg-detail-warn{margin-top:6px;color:var(--warn-fg);}
 @media (max-width:760px){
-  .reg-row-top{flex-wrap:wrap;}
-  .reg-row-name{white-space:normal;}
-  .reg-row-bottom{justify-content:flex-start;}
-  .reg-row-actions{margin-left:0;}
+  .section-card.reg{padding:14px;}
+  .reg-table-head{display:none;}
+  .reg-row{grid-template-columns:24px 1fr 30px;grid-template-areas:"chev name kebab" ". status status" ". owner owner" ". notes notes";row-gap:6px;}
+  .reg-row>.c-chev{grid-area:chev;}
+  .reg-row>.c-name{grid-area:name;}
+  .reg-row>.c-status{grid-area:status;}
+  .reg-row>.c-owner{grid-area:owner;}
+  .reg-row>.c-notes{grid-area:notes;}
+  .reg-row>.c-kebab{grid-area:kebab;}
+  .reg-filters select{margin-left:0;}
+  .reg-search{max-width:none;flex-basis:100%;}
 }
 
 /* Assign Regression (bulk) modal: one row per Entity or per module, a label
@@ -442,8 +512,6 @@ a{color:inherit;}
 .status-choice input:checked + label.tone-danger{background:var(--danger-bg);border-color:var(--danger-fg);color:var(--danger-fg);}
 .status-choice input:checked + label.tone-info{background:var(--info-bg);border-color:var(--info-fg);color:var(--info-fg);}
 .status-choice input:checked + label.tone-neutral{background:var(--neutral-bg);border-color:var(--neutral-fg);color:var(--neutral-fg);}
-.regression-status-choice{margin-top:8px;}
-.regression-status-choice label{padding:5px 10px;font-size:12px;}
 
 /* ================= RELEASE NOTES EDITOR ================= */
 .notes-toolbar{display:flex;gap:4px;padding:8px;border:1px solid var(--border);border-bottom:none;border-radius:var(--radius-md) var(--radius-md) 0 0;background:var(--surface-alt);flex-wrap:wrap;}
@@ -755,16 +823,6 @@ a{color:inherit;}
 /* Per-module assignee button: the same ghost button as the entity owner,
    dimmer when it merely follows the Entity owner and marked when the module
    carries an owner of its own. */
-.regression-module-owner{font-size:12px;font-weight:600;}
-.regression-module-owner:not(.is-override).has-owner{color:var(--ink-soft);}
-.regression-module-owner.is-override{color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent);}
-/* "Changed by another QA member" — a collapsed one-line note under a module.
-   Informational, deliberately quiet. */
-.reg-change-note{margin-top:6px;font-size:12px;color:var(--ink-soft);}
-.reg-change-note summary{cursor:pointer;color:var(--warn-fg);font-weight:600;list-style:none;display:inline-flex;align-items:center;gap:4px;}
-.reg-change-note summary::-webkit-details-marker{display:none;}
-.reg-change-note[open] summary{margin-bottom:4px;}
-.reg-change-note div{line-height:1.5;}
 /* Bulk assign: module rows sit indented under their entity row. */
 .bulk-assign-entity .bulk-assign-label{color:var(--ink);font-weight:700;}
 .bulk-assign-module{margin-left:18px;border-style:dashed;}

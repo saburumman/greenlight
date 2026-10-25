@@ -242,6 +242,12 @@ var state = {
   ticketCollapsed: {}, // groupKey -> true if collapsed
   regressionGroupBy: "Entity", // "Entity" (default list) or "Owner" (bucketed by assignee, see sectionRegression)
   regressionView: "All", // "All" | "Mine" | "Unassigned" — see filterRegressionEntitiesForView
+  // Regression list display state (never saved; reset per release in sectionRegression):
+  regressionSearch: "",       // text in the "Search by module or entity…" box
+  regressionStatusFilter: "", // "" | "NOT TESTED" | "FAIL" | "WARNING" | "PASS"
+  regressionOpen: {},         // entity id -> true/false once a card was opened/closed by hand
+  regressionOpenFor: "",      // release id the maps above belong to
+  regressionRowOpen: {},      // "entityId|moduleId" -> row detail open
   statsFilters: null, // Statistics page filters {range, from, to, releaseId, memberId} — created on first visit (see statsDefaultFilters)
   incidentFilters: {}, // releaseId -> {scope:"All"|"TICKET"|"RELEASE", severity, status} — the Incidents section's lightweight filters (see incidentFilterFor)
   pendingScrollTo: null, // section id to scroll to right after the next detail render (e.g. from a search result)
@@ -599,22 +605,6 @@ function regressionStatLine(r){
   if(c.skipped) parts.push(c.skipped+" skipped");
   return parts.join(" · ");
 }
-// One entity's own module count + status breakdown, for its compact
-// summary line under the heading ("3 modules · 0 passed · 2 not tested").
-function regressionEntityCounts(entity){
-  return regressionCountByStatus((entity && entity.services) || []);
-}
-function regressionEntitySummaryLine(entity){
-  var c = regressionEntityCounts(entity);
-  if(!c.total) return "No services configured for this entity.";
-  var parts = [c.total+" module"+pluralize(c.total,"","s"), c.passed+" passed"];
-  if(c.notTested) parts.push(c.notTested+" not tested");
-  if(c.warn) parts.push(c.warn+" warning"+pluralize(c.warn,"","s"));
-  if(c.fail) parts.push(c.fail+" failed");
-  if(c.skipped) parts.push(c.skipped+" skipped");
-  return parts.join(" · ");
-}
-
 /* ---- Regression assignment: Know the Team member ids, per release ----
    Two levels, stored on the release's own regression data (so one release's
    assignments never touch another's):
@@ -672,20 +662,6 @@ function filterRegressionEntitiesForView(entities, view){
     else if(kept.length) out.push(Object.assign({}, entity, {services:kept}));
   });
   return out;
-}
-// A small "who changed this" note under a module whose status was last
-// changed by someone other than the person it's assigned to. Compact on
-// purpose (a collapsed one-line <details>), informational only — the change
-// itself was never blocked. Shown only while the status still equals the
-// change it describes, so it doesn't linger after the status moves on.
-function regressionChangeNoteHtml(holder, currentStatus){
-  if(!canViewStatistics()) return ""; // only people with Statistics access see who changed what
-  var c = holder && holder.lastChange;
-  if(!c || !c.byOther || c.newStatus!==(currentStatus||"NOT TESTED")) return "";
-  var assignee = memberNameById(c.assignedTo);
-  var by = c.changedBy ? memberNameById(c.changedBy) : (c.changedByName || "someone not on the team list");
-  return '<details class="reg-change-note"><summary>⚠ Status changed by '+esc(by)+'</summary>'+
-    '<div>This regression is assigned to <b>'+esc(assignee)+'</b>, but the status was changed by <b>'+esc(by)+'</b> ('+esc(c.previousStatus||"")+' → '+esc(c.newStatus||"")+(c.at?', '+esc(fmtDateTime(c.at)):'')+').</div></details>';
 }
 // Shown right after a status change is saved when the person who made it
 // isn't the one it's assigned to. A heads-up only: the change already went
@@ -4459,108 +4435,195 @@ function statTile(n, label){
 }
 
 /* ---- Regression ---- */
-// A segmented row of status buttons for one service — clicking a status
-// saves immediately (no modal), same pattern as the Performance/Security
-// enable toggles. Notes are edited separately via a small popup (see
-// openRegressionNotesModal), reached through the row's notes button.
-function regressionStatusButtons(entityId, s){
-  return '<div class="status-choice regression-status-choice">'+REG_STATUSES.map(function(opt){
-    var inputId = "regstatus-"+s.id+"-"+opt.replace(/[^A-Za-z0-9]/g,"");
-    return '<input type="radio" name="regstatus-'+s.id+'" id="'+inputId+'" value="'+esc(opt)+'" '+
-      'data-action="set-regression-status" data-entity-id="'+esc(entityId)+'" data-id="'+esc(s.id)+'" '+(opt===s.status?"checked":"")+'>'+
-      '<label for="'+inputId+'" class="tone-'+toneForStatus(opt)+'">'+esc(opt)+'</label>';
-  }).join("")+'</div>';
+// Release-view Regression list. One collapsed-by-default card per Entity;
+// opening a card shows a Module | Status | Assignee | Notes table. Status is
+// a coloured <select> that saves the moment it changes (the same
+// "set-regression-status" change handler as always); notes open the existing
+// notes popup; assignment keeps module > entity > unassigned precedence behind
+// the same pick-lists. Which cards/rows are open, the search text and the
+// status filter are display-only state: never saved, and reset when a
+// different release is opened.
+function iconBuilding(){ return '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="3" width="16" height="18" rx="2"/><path d="M9 7h2M13 7h2M9 11h2M13 11h2M9 15h2M13 15h2"/></svg>'; }
+function iconRegressionHead(){ return '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/><path d="M8 12l3 3 5-6"/></svg>'; }
+function iconChevronRight(){ return '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>'; }
+function iconDotsVertical(){ return '<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="19" r="1.7"/></svg>'; }
+function iconExpandAll(){ return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 15l5 5 5-5"/><path d="M7 9l5-5 5 5"/></svg>'; }
+function iconCollapseAll(){ return '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 20l5-5 5 5"/><path d="M7 4l5 5 5-5"/></svg>'; }
+
+// True while any of search / status filter / My Regression / Unassigned is on.
+function regressionFiltersActive(){
+  return !!(state.regressionSearch.trim() || state.regressionStatusFilter || state.regressionView!=="All");
 }
-// Same segmented status control as regressionStatusButtons, but scoped to
-// the Entity itself rather than one of its services — used only when the
-// entity has no services configured, so there's otherwise no status control
-// for it at all (see renderRegressionEntityGroup).
-function regressionEntityStatusButtons(entity){
-  var current = entity.status || "NOT TESTED";
-  return '<div class="status-choice regression-status-choice">'+REG_STATUSES.map(function(opt){
-    var inputId = "regentstatus-"+entity.id+"-"+opt.replace(/[^A-Za-z0-9]/g,"");
-    return '<input type="radio" name="regentstatus-'+entity.id+'" id="'+inputId+'" value="'+esc(opt)+'" '+
-      'data-action="set-regression-entity-status" data-entity-id="'+esc(entity.id)+'" '+(opt===current?"checked":"")+'>'+
-      '<label for="'+inputId+'" class="tone-'+toneForStatus(opt)+'">'+esc(opt)+'</label>';
-  }).join("")+'</div>';
+// Cards start collapsed. A card the person opened or closed by hand keeps that
+// choice; otherwise it opens by itself while a search/filter is active so the
+// matches aren't hidden behind a closed card.
+function regressionCardOpen(entityId){
+  if(Object.prototype.hasOwnProperty.call(state.regressionOpen, entityId)) return !!state.regressionOpen[entityId];
+  return regressionFiltersActive();
 }
-// Compact horizontal card for one module: name + its assignee on the first
-// line, status pills + the existing notes ("comment") button on the second,
-// and — only when someone other than the assignee last changed the status —
-// a collapsed one-line "changed by another QA member" note. `entity` is
-// passed through so set-regression-status/edit-regression-notes can carry the
-// entity id they need (both re-look-up their real target by id — see the
-// click delegation switch — so this render never needs to be a live
-// reference).
-function regressionModuleAssigneeBtn(entity, s){
-  if(entity._legacy) return ""; // a legacy flat row IS its own entity — assigned via the entity control
+// View (All / Mine / Unassigned) + status pill + search, combined. Narrowing is
+// at the MODULE level and returns copies holding only the matching modules;
+// every action handler re-looks-up its target by id in the real release data,
+// so this is display-only. An entity whose own name matches the search keeps
+// all its modules (still subject to the status pill).
+function regressionFilterEntities(entities){
+  var list = filterRegressionEntitiesForView(entities, state.regressionView);
+  var q = state.regressionSearch.trim().toLowerCase();
+  var st = state.regressionStatusFilter;
+  if(!q && !st) return list;
+  var out = [];
+  list.forEach(function(entity){
+    var services = entity.services||[];
+    var entityHit = !q || String(entity.name||"").toLowerCase().indexOf(q)>-1;
+    if(!services.length){
+      if(entityHit && (!st || (entity.status||"NOT TESTED")===st)) out.push(entity);
+      return;
+    }
+    var kept = services.filter(function(s){
+      return (!st || (s.status||"NOT TESTED")===st) && (entityHit || String(s.name||"").toLowerCase().indexOf(q)>-1);
+    });
+    if(kept.length===services.length) out.push(entity);
+    else if(kept.length) out.push(Object.assign({}, entity, {services:kept}));
+  });
+  return out;
+}
+
+// "Status changed by another QA member" details, for people with Statistics
+// access only. Returns null when there is nothing to show; otherwise
+// { by, body } where body is ready-to-insert (already escaped) HTML. Shown
+// only while the status still equals the change it describes.
+function regressionChangeNoteInfo(holder, currentStatus){
+  if(!canViewStatistics()) return null;
+  var c = holder && holder.lastChange;
+  if(!c || !c.byOther || c.newStatus!==(currentStatus||"NOT TESTED")) return null;
+  var assignee = memberNameById(c.assignedTo);
+  var by = c.changedBy ? memberNameById(c.changedBy) : (c.changedByName || "someone not on the team list");
+  return { by: by, body: 'This regression is assigned to <b>'+esc(assignee)+'</b>, but the status was changed by <b>'+esc(by)+'</b> ('+esc(c.previousStatus||"")+' → '+esc(c.newStatus||"")+(c.at?', '+esc(fmtDateTime(c.at)):'')+').' };
+}
+
+// The status control: a <select> dressed as a coloured pill (the wrapper's
+// st-<tone> class carries the colour; it is refreshed when the value changes).
+function regressionStatusSelect(attrs, status, label){
+  return '<span class="status-wrap st-'+toneForStatus(status)+'"><select class="status-select" '+attrs+' aria-label="'+escAttr(label)+'">'+
+    REG_STATUSES.map(function(opt){ return '<option value="'+esc(opt)+'"'+(opt===status?" selected":"")+'>'+esc(opt)+'</option>'; }).join("")+
+  '</select></span>';
+}
+function regressionOwnerChip(attrs, label, hasOwner, title, extraClass){
+  return '<button type="button" class="owner'+(hasOwner?"":" none")+(extraClass?" "+extraClass:"")+'" '+attrs+' title="'+escAttr(title)+'">'+
+    '<span class="avatar">'+iconUser()+'</span><span class="owner-name">'+esc(label)+'</span>'+iconChevronDown()+'</button>';
+}
+function regressionEntityOwnerChip(entity){
+  var ownerId = entity.assignedTo || "";
+  var legacyOwner = !ownerId && entity.legacyOwner ? entity.legacyOwner : "";
+  var label = ownerId ? memberNameById(ownerId) : (legacyOwner ? legacyOwner+" (not in Know the Team)" : "Not assigned");
+  return regressionOwnerChip('data-action="edit-regression-owner" data-entity-id="'+escAttr(entity.id)+'"', label, !!(ownerId||legacyOwner), ownerId ? "Change owner" : "Assign an owner");
+}
+// A module's own assignee control. A legacy flat row IS its own entity, so it
+// is assigned through the entity control instead.
+function regressionModuleOwnerChip(entity, s){
+  if(entity._legacy) return regressionEntityOwnerChip(entity);
   var id = regressionModuleAssigneeId(entity, s);
   var override = regressionModuleHasOverride(s);
   var title = override ? (id ? "Assigned to this module — click to change" : "Deliberately unassigned — click to change")
                        : (id ? "Follows the Entity owner — click to give this module its own" : "No one — click to assign");
-  var label = id ? memberNameById(id) : (override ? "Unassigned" : "Assign");
-  return '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn regression-module-owner'+(id?" has-owner":"")+(override?" is-override":"")+'" data-action="edit-regression-module-owner" data-entity-id="'+escAttr(entity.id)+'" data-id="'+escAttr(s.id)+'" title="'+escAttr(title)+'">'+iconUser()+' '+esc(label)+'</button>';
+  var label = id ? memberNameById(id) : (override ? "Unassigned" : "Not assigned");
+  return regressionOwnerChip('data-action="edit-regression-module-owner" data-entity-id="'+escAttr(entity.id)+'" data-id="'+escAttr(s.id)+'"', label, !!id, title, override ? "is-override" : "");
 }
-function renderRegressionServiceRow(entity, s){
-  var holder = entity._legacy ? entity._legacy : s;
-  return '<div class="item-row regression-service-row'+(s.status==='FAIL'?' is-flagged':'')+'">'+
-    '<div class="reg-row-top">'+
-      '<div class="reg-row-name">'+esc(s.name||"Unnamed service")+'</div>'+
-      regressionModuleAssigneeBtn(entity, s)+
+
+// One table row (module, or an entity's single "Overall status" item).
+// c = { key, name, status, statusAttrs, ownerHtml, notes, noteAttrs, assignAttrs, change }
+function regressionRowHtml(c){
+  var open = !!state.regressionRowOpen[c.key];
+  var key = escAttr(c.key);
+  return '<div class="row-wrap'+(open?" open":"")+'" data-row-key="'+key+'">'+
+    '<div class="reg-row">'+
+      '<span class="c-chev"><button type="button" class="row-chev" data-action="toggle-regression-row" data-row-key="'+key+'" aria-expanded="'+(open?"true":"false")+'" aria-label="Show details">'+iconChevronRight()+'</button></span>'+
+      '<span class="c-name reg-row-name" title="'+escAttr(c.name)+'">'+esc(c.name)+(c.change ? '<span class="warn-flag" title="Status changed by another QA member — open the row for details">⚠</span>' : '')+'</span>'+
+      '<span class="c-status">'+regressionStatusSelect(c.statusAttrs, c.status, "Status of "+c.name)+'</span>'+
+      '<span class="c-owner">'+c.ownerHtml+'</span>'+
+      '<span class="c-notes"><button type="button" class="note-btn'+(c.notes?" has":"")+'" '+c.noteAttrs+' title="'+escAttr(c.notes || "Add a note")+'">'+iconNote()+'<span>'+(c.notes ? esc(c.notes) : "Add note")+'</span></button></span>'+
+      '<span class="c-kebab dd"><button type="button" class="kebab" data-action="toggle-regression-menu" aria-label="Actions for '+escAttr(c.name)+'">'+iconDotsVertical()+'</button>'+
+        '<div class="menu reg-row-menu">'+
+          '<button type="button" '+c.noteAttrs+'>'+iconNote()+' '+(c.notes ? "Edit note" : "Add note")+'</button>'+
+          '<button type="button" '+c.assignAttrs+'>'+iconUser()+' Change assignee</button>'+
+        '</div></span>'+
     '</div>'+
-    '<div class="reg-row-bottom">'+
-      regressionStatusButtons(entity.id, s)+
-      '<div class="item-row-actions reg-row-actions">'+
-        '<button type="button" class="btn btn-sm btn-icon" data-action="edit-regression-notes" data-entity-id="'+entity.id+'" data-id="'+s.id+'" aria-label="'+(s.notes?"Edit":"Add")+' notes" title="'+(s.notes?"Edit":"Add")+' notes">'+iconNote()+'</button>'+
-      '</div>'+
+    '<div class="row-detail">'+
+      '<div>'+(c.notes ? '<b>Note:</b> <span class="reg-detail-note">'+esc(c.notes)+'</span>' : 'No note yet.')+'</div>'+
+      (c.change ? '<div class="reg-detail-warn">⚠ Status changed by <b>'+esc(c.change.by)+'</b>. '+c.change.body+'</div>' : '')+
     '</div>'+
-    regressionChangeNoteHtml(holder, s.status)+
-    (s.notes? '<div class="item-row-desc reg-row-notes">'+esc(s.notes)+'</div>':'')+
   '</div>';
 }
-function renderRegressionEntityGroup(entity){
+function regressionModuleRowHtml(entity, s){
+  var holder = entity._legacy ? entity._legacy : s;
+  var status = s.status || "NOT TESTED";
+  var eid = escAttr(entity.id);
+  var target = 'data-entity-id="'+eid+'" data-id="'+escAttr(s.id)+'"';
+  return regressionRowHtml({
+    key: entity.id+"|"+s.id,
+    name: s.name || "Unnamed service",
+    status: status,
+    statusAttrs: 'data-action="set-regression-status" '+target,
+    ownerHtml: regressionModuleOwnerChip(entity, s),
+    notes: s.notes || "",
+    noteAttrs: 'data-action="edit-regression-notes" '+target,
+    assignAttrs: entity._legacy ? 'data-action="edit-regression-owner" data-entity-id="'+eid+'"' : 'data-action="edit-regression-module-owner" '+target,
+    change: regressionChangeNoteInfo(holder, status)
+  });
+}
+// An entity with no services is tracked as one item on the entity itself.
+function regressionEntityRowHtml(entity){
+  var status = entity.status || "NOT TESTED";
+  var eid = escAttr(entity.id);
+  return regressionRowHtml({
+    key: entity.id+"|overall",
+    name: "Overall status",
+    status: status,
+    statusAttrs: 'data-action="set-regression-entity-status" data-entity-id="'+eid+'"',
+    ownerHtml: regressionEntityOwnerChip(entity),
+    notes: entity.notes || "",
+    noteAttrs: 'data-action="edit-regression-entity-notes" data-entity-id="'+eid+'"',
+    assignAttrs: 'data-action="edit-regression-owner" data-entity-id="'+eid+'"',
+    change: regressionChangeNoteInfo(entity, status)
+  });
+}
+// "5 modules · 2 passed · 1 failed · 0 warning · 2 not tested", counts coloured
+// by status, zeros faded.
+function regressionSummaryHtml(entity){
   var services = entity.services||[];
-  var ownerId = entity.assignedTo || "";
-  var legacyOwner = !ownerId && entity.legacyOwner ? entity.legacyOwner : "";
-  var ownerLabel = ownerId ? memberNameById(ownerId) : (legacyOwner ? legacyOwner+" (not in Know the Team)" : "Assign owner");
-  var ownerBtnHtml = '<button type="button" class="btn btn-sm btn-ghost regression-owner-btn'+(ownerId?" has-owner":"")+'" data-action="edit-regression-owner" data-entity-id="'+entity.id+'" title="'+(ownerId?"Change owner":"Assign an owner")+'">'+iconUser()+' '+esc(ownerLabel)+'</button>';
-  if(!services.length){
-    // No services under this entity (e.g. a page that isn't broken into
-    // sub-services) — track regression status on the entity itself as a
-    // single item instead of leaving it with no status control at all.
-    // Reuses the same row markup/classes as a service row (regression-
-    // service-row, reg-row-*) so it looks and behaves consistently.
-    var entStatus = entity.status || "NOT TESTED";
-    return '<div class="regression-entity-group">'+
-      '<div class="regression-entity-heading-row">'+
-        '<div class="regression-entity-heading-main">'+
-          '<div class="regression-entity-heading">'+esc(entity.name||"Unnamed entity")+'</div>'+
-          '<div class="regression-entity-summary">No services configured — tracked as one item</div>'+
-        '</div>'+
-        ownerBtnHtml+
-      '</div>'+
-      '<div class="item-list"><div class="item-row regression-service-row'+(entStatus==="FAIL"?" is-flagged":"")+'">'+
-        '<div class="reg-row-top"><div class="reg-row-name">Overall status</div></div>'+
-        '<div class="reg-row-bottom">'+regressionEntityStatusButtons(entity)+
-          '<div class="item-row-actions reg-row-actions">'+
-            '<button type="button" class="btn btn-sm btn-icon" data-action="edit-regression-entity-notes" data-entity-id="'+entity.id+'" aria-label="'+(entity.notes?"Edit":"Add")+' notes" title="'+(entity.notes?"Edit":"Add")+' notes">'+iconNote()+'</button>'+
-          '</div>'+
-        '</div>'+
-        regressionChangeNoteHtml(entity, entStatus)+
-        (entity.notes? '<div class="item-row-desc reg-row-notes">'+esc(entity.notes)+'</div>':'')+
-      '</div></div>'+
-    '</div>';
-  }
-  var rows = services.map(function(s){ return renderRegressionServiceRow(entity, s); }).join("");
-  return '<div class="regression-entity-group">'+
-    '<div class="regression-entity-heading-row">'+
-      '<div class="regression-entity-heading-main">'+
-        '<div class="regression-entity-heading">'+esc(entity.name||"Unnamed entity")+'</div>'+
-        '<div class="regression-entity-summary">'+esc(regressionEntitySummaryLine(entity))+'</div>'+
-      '</div>'+
-      ownerBtnHtml+
+  var items = (services.length ? services : [{status: entity.status}]).map(function(s){ return {status: s.status || "NOT TESTED"}; });
+  var c = regressionCountByStatus(items);
+  function part(n, label, cls){ return '<span class="c '+cls+(n?"":" zero")+'">'+n+' '+label+'</span>'; }
+  var parts = [
+    services.length ? '<span class="c">'+c.total+' module'+pluralize(c.total,"","s")+'</span>' : '<span class="c">Tracked as one item</span>',
+    part(c.passed, "passed", "c-pass"),
+    part(c.fail, "failed", "c-fail"),
+    part(c.warn, "warning", "c-warn"),
+    part(c.notTested, "not tested", "c-nt")
+  ];
+  if(c.skipped) parts.push(part(c.skipped, "skipped", "c-skip"));
+  return parts.join('<span class="dot">·</span>');
+}
+// `countsFrom` = the entity the header summary describes (the whole entity
+// while filtering, so the header still tells the full story); defaults to the
+// entity being drawn.
+function renderRegressionEntityGroup(entity, countsFrom){
+  var services = entity.services||[];
+  var open = regressionCardOpen(entity.id);
+  var eid = escAttr(entity.id);
+  var name = entity.name || "Unnamed entity";
+  var rows = services.length ? services.map(function(s){ return regressionModuleRowHtml(entity, s); }).join("") : regressionEntityRowHtml(entity);
+  return '<div class="reg-card'+(open?" open":"")+'" data-entity-id="'+eid+'">'+
+    '<div class="reg-card-head" data-action="toggle-regression-entity" data-entity-id="'+eid+'">'+
+      '<div class="reg-card-icon">'+iconBuilding()+'</div>'+
+      '<div class="reg-card-main"><div class="reg-card-name">'+esc(name)+'</div><div class="reg-card-sum">'+regressionSummaryHtml(countsFrom || entity)+'</div></div>'+
+      regressionEntityOwnerChip(entity)+
+      '<button type="button" class="chev" data-action="toggle-regression-entity" data-entity-id="'+eid+'" aria-expanded="'+(open?"true":"false")+'" aria-label="Show modules of '+escAttr(name)+'">'+iconChevronDown()+'</button>'+
     '</div>'+
-    '<div class="item-list">'+rows+'</div>'+
+    '<div class="reg-card-body">'+
+      '<div class="reg-table-head"><span></span><span>Module</span><span>Status</span><span>Assignee</span><span>Notes</span><span></span></div>'+
+      rows+
+    '</div>'+
   '</div>';
 }
 // Buckets MODULES by their effective assignee (member id): each bucket holds
@@ -4588,35 +4651,17 @@ function groupRegressionByOwner(entities){
   if(buckets[""]) named.push(buckets[""]);
   return named;
 }
-function sectionRegression(r){
-  var skipped = !!r.regressionSkipped;
+function renderRegressionList(r){
   var entities = regressionEntities(r);
-  var overall = regressionOverallStatus(r);
-  // The three views (All/My Regression/Unassigned) narrow which modules
-  // render, by their effective assignee — regressionStatLine/the overall pill above
-  // still reflect the whole release regardless of view, same as Group By
-  // already only ever changed layout, never what counted toward the
-  // release's own status.
-  var viewEntities = filterRegressionEntitiesForView(entities, state.regressionView);
-  var groupsHtml;
-  if(state.regressionGroupBy === "Owner"){
-    groupsHtml = groupRegressionByOwner(viewEntities).map(function(g){
-      return '<div class="regression-owner-group">'+
-        '<div class="regression-owner-group-heading">'+iconUser()+' '+esc(g.label)+'<span class="regression-owner-group-count">('+g.entities.length+')</span></div>'+
-        g.entities.map(renderRegressionEntityGroup).join("")+
-      '</div>';
-    }).join("");
-  } else {
-    groupsHtml = viewEntities.map(renderRegressionEntityGroup).join("");
-  }
-  var viewTabs = '<div class="regression-view-tabs">'+["All","Mine","Unassigned"].map(function(v){
-    var label = v==="Mine" ? "My Regression" : v;
-    return '<button type="button" class="btn btn-sm view-tab'+(state.regressionView===v?" active":"")+'" data-action="set-regression-view" data-view="'+v+'">'+esc(label)+'</button>';
-  }).join("")+'</div>';
-  var listOrEmpty;
   if(!entities.length){
-    listOrEmpty = '<div class="empty-row">No regression modules on this release yet. Click “Sync Modules” to pull in your entity/service list (or “Manage Modules” to set one up first).</div>';
-  } else if(!viewEntities.length){
+    return '<div class="empty-row">No regression modules on this release yet. Use the ⋯ menu and choose “Sync Modules” to pull in your entity/service list (or “Manage Modules” to set one up first).</div>';
+  }
+  var viewEntities = regressionFilterEntities(entities);
+  if(!viewEntities.length){
+    // Search or a status filter is on, or the view is All: nothing matches.
+    if(state.regressionSearch.trim() || state.regressionStatusFilter || state.regressionView==="All"){
+      return '<div class="empty-row">No modules match your search or filters.</div>';
+    }
     // "My Regression" came up empty — before assuming nothing's actually
     // assigned, check for a Know the Team entry that's very likely the
     // signed-in user under a slightly different spelling (see
@@ -4624,35 +4669,87 @@ function sectionRegression(r){
     // here, instead of sending them off to Know the Team to link it by hand.
     var meSuggestion = state.regressionView==="Mine" ? suggestedMyTeamMember() : null;
     var needsLink = state.regressionView==="Mine" && !currentMemberId() && !meSuggestion && allTeamMembers().length;
-    listOrEmpty = '<div class="empty-row">'+(state.regressionView==="Mine"
+    return '<div class="empty-row">'+(state.regressionView==="Mine"
       ? ("Nothing is assigned to you yet."+(currentMemberId() ? "" : " Link yourself to your Know the Team entry so it can tell which regression is yours."))
       : "Everything has an owner.")+
       (meSuggestion ? '<div class="regression-me-suggestion">Is <strong>'+esc(meSuggestion.name)+'</strong> you? '+
         '<button type="button" class="btn btn-sm btn-primary" data-action="toggle-my-team-member" data-id="'+meSuggestion.id+'">'+iconUser()+' Yes, that’s me</button></div>' : '')+
       (needsLink ? '<div class="regression-me-suggestion"><button type="button" class="btn btn-sm btn-primary" data-action="link-identity">'+iconUser()+' Pick your Know the Team entry</button></div>' : '')+
       '</div>';
-  } else {
-    listOrEmpty = '<div class="regression-entity-list">'+groupsHtml+'</div>';
+  }
+  if(state.regressionGroupBy === "Owner"){
+    // Cards here hold only the modules of that owner, so their header counts
+    // describe exactly what the card shows.
+    return '<div class="reg-groups">'+groupRegressionByOwner(viewEntities).map(function(g){
+      return '<div class="regression-owner-group">'+
+        '<div class="regression-owner-group-heading">'+iconUser()+' '+esc(g.label)+'<span class="regression-owner-group-count">('+g.entities.length+')</span></div>'+
+        '<div class="reg-list">'+g.entities.map(function(en){ return renderRegressionEntityGroup(en); }).join("")+'</div>'+
+      '</div>';
+    }).join("")+'</div>';
+  }
+  var byId = {};
+  entities.forEach(function(en){ byId[en.id] = en; });
+  return '<div class="reg-list">'+viewEntities.map(function(en){ return renderRegressionEntityGroup(en, byId[en.id]); }).join("")+'</div>';
+}
+function regressionPillBtn(label, tone, active, attrs){
+  return '<button type="button" class="reg-pill '+(tone ? "tone-"+tone : "plain")+(active?" active":"")+'" '+attrs+' aria-pressed="'+(active?"true":"false")+'">'+
+    (tone ? '<span class="pill-dot"></span>' : '')+esc(label)+'</button>';
+}
+function sectionRegression(r){
+  // Display state belongs to one release: opening another starts collapsed
+  // and unfiltered again.
+  if(state.regressionOpenFor !== r._id){
+    state.regressionOpenFor = r._id;
+    state.regressionOpen = {};
+    state.regressionRowOpen = {};
+    state.regressionSearch = "";
+    state.regressionStatusFilter = "";
+  }
+  var skipped = !!r.regressionSkipped;
+  var entities = regressionEntities(r);
+  var overall = regressionOverallStatus(r);
+  var canWork = !skipped && entities.length;
+  // The overall pill / tooltip always describe the WHOLE release, whatever the
+  // filters below are showing.
+  var overallPill = skipped ? pill("⏭ SKIPPED","neutral")
+    : '<span title="'+escAttr(regressionStatLine(r))+'">'+pill(overall, regressionOverallTone(overall))+'</span>';
+  var head = '<div class="reg-head">'+
+    '<div class="reg-head-icon">'+iconRegressionHead()+'</div>'+
+    '<div class="reg-head-text"><h2>Regression</h2><p>Manage and track regression test results for this release.</p></div>'+
+    '<div class="reg-head-actions">'+
+      overallPill+
+      (canWork ? '<button type="button" class="btn btn-sm" data-action="regression-expand-all">'+iconExpandAll()+' Expand All</button>'+
+                 '<button type="button" class="btn btn-sm" data-action="regression-collapse-all">'+iconCollapseAll()+' Collapse All</button>'+
+                 '<button type="button" class="btn btn-sm btn-primary" data-action="open-assign-regression">'+iconUser()+' Assign</button>' : '')+
+      '<div class="dd">'+
+        '<button type="button" class="btn btn-sm btn-icon" data-action="toggle-regression-more" aria-label="More regression actions">'+iconDots()+'</button>'+
+        '<div class="menu reg-more-menu">'+
+          (skipped ? '' : '<button type="button" data-action="sync-regression-modules">'+iconRefresh()+' Sync Modules</button>')+
+          '<button type="button" data-action="manage-regression-modules">'+iconGear()+' Manage Modules</button>'+
+          '<div class="menu-row"><span>Skip regression</span>'+toggleSwitch("regression-skip", skipped, "Mark regression as not required for this release")+'</div>'+
+        '</div>'+
+      '</div>'+
+    '</div>'+
+  '</div>';
+  var filters = '';
+  if(canWork){
+    var allActive = !state.regressionStatusFilter && state.regressionView==="All";
+    filters = '<div class="reg-filters">'+
+      '<label class="reg-search"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.35-4.35"/></svg>'+
+        '<input id="regression-search" type="text" autocomplete="off" placeholder="Search by module or entity…" aria-label="Search regression by module or entity" value="'+escAttr(state.regressionSearch)+'"></label>'+
+      regressionPillBtn("All", "", allActive, 'data-action="reg-filter-all"')+
+      [["NOT TESTED","Not Tested"],["FAIL","Failed"],["WARNING","Warning"],["PASS","Passed"]].map(function(p){
+        return regressionPillBtn(p[1], toneForStatus(p[0]), state.regressionStatusFilter===p[0], 'data-action="set-regression-status-filter" data-status="'+p[0]+'"');
+      }).join("")+
+      regressionPillBtn("My Regression", "", state.regressionView==="Mine", 'data-action="set-regression-view" data-view="Mine"')+
+      regressionPillBtn("Unassigned", "", state.regressionView==="Unassigned", 'data-action="set-regression-view" data-view="Unassigned"')+
+      '<select id="regression-group-by" aria-label="Group by">'+REGRESSION_GROUP_MODES.map(function(m){return '<option value="'+m+'" '+(m===state.regressionGroupBy?"selected":"")+'>Group by: '+m+'</option>';}).join("")+'</select>'+
+    '</div>';
   }
   var body = skipped
     ? '<div class="disabled-note">Regression: marked as not required for this release</div>'
-    : '<p class="helper-text" style="margin-bottom:16px;">'+esc(regressionStatLine(r))+'</p>'+
-      (entities.length ? viewTabs : '')+
-      (entities.length ? '<div class="regression-controls"><label class="helper-text" for="regression-group-by">Group by</label>'+
-          '<select id="regression-group-by">'+REGRESSION_GROUP_MODES.map(function(m){return '<option value="'+m+'" '+(m===state.regressionGroupBy?"selected":"")+'>'+m+'</option>';}).join("")+'</select>'+
-        '</div>' : '')+
-      listOrEmpty;
-  return '<section class="card section-card" id="sec-regression">'+
-    '<div class="section-head"><div class="section-title"><span class="emoji">🔄</span> Regression</div>'+
-      '<div class="section-actions">'+
-        (skipped ? pill("⏭ SKIPPED","neutral") : pill(regressionStatusEmoji(overall)+" "+overall, regressionOverallTone(overall)))+
-        '<span class="regression-skip-toggle">Skip regression'+toggleSwitch("regression-skip", skipped, "Mark regression as not required for this release")+'</span>'+
-        (skipped || !entities.length ? '' : '<button class="btn btn-sm" data-action="open-assign-regression">'+iconUser()+' Assign Regression</button>')+
-        (skipped ? '' : '<button class="btn btn-sm" data-action="sync-regression-modules">'+iconRefresh()+' Sync Modules</button>')+
-        '<button class="btn btn-sm" data-action="manage-regression-modules">'+iconGear()+' Manage Modules</button>'+
-      '</div></div>'+
-    '<div class="section-body">'+body+'</div>'+
-  '</section>';
+    : filters+'<div id="reg-list-container">'+renderRegressionList(r)+'</div>';
+  return '<section class="card section-card reg" id="sec-regression">'+head+body+'</section>';
 }
 
 /* ---- Bugs ---- */
@@ -5605,7 +5702,7 @@ function openTicketAssigneeModal(r, ticket){
 /* ---- Regression / Bug / Platform / Blocker / Perf / Security modals ---- */
 // Entities and Services themselves come from the reusable master list (see
 // openManageRegressionModulesModal). Per release, status is set inline via
-// the row's status buttons (see regressionStatusButtons / the
+// the row's status pill (see regressionStatusSelect / the
 // "set-regression-status" change handler) — this modal only edits Notes.
 function openRegressionNotesModal(r, entity, existing){
   if(!existing) return;
@@ -6422,7 +6519,7 @@ document.addEventListener("click", function(e){
   // Closes the release-detail "⋮" menu and every per-row Test Data "⋮" menu
   // (there's normally at most one open at a time) whenever the click wasn't
   // on one of their own toggle buttons.
-  var menuBtn = e.target.closest('[data-action="toggle-release-menu"], [data-action="toggle-td-menu"], [data-action="toggle-team-menu"], [data-action="toggle-incident-menu"]');
+  var menuBtn = e.target.closest('[data-action="toggle-release-menu"], [data-action="toggle-td-menu"], [data-action="toggle-team-menu"], [data-action="toggle-incident-menu"], [data-action="toggle-regression-menu"], [data-action="toggle-regression-more"]');
   var openMenus = qsa(".menu.open");
   if(openMenus.length && !menuBtn) openMenus.forEach(function(m){ m.classList.remove("open"); });
   if(!e.target.closest(".search-wrap")) closeSearchDropdown();
@@ -6535,7 +6632,65 @@ document.addEventListener("click", function(e){
       }
       break;
     case "open-assign-regression": if(r) openBulkAssignRegressionModal(r); break;
-    case "set-regression-view": state.regressionView = el2.getAttribute("data-view")||"All"; render(); break;
+    case "set-regression-view":
+      // My Regression / Unassigned are toggles: clicking the active one goes back to All.
+      var regViewWanted = el2.getAttribute("data-view")||"All";
+      state.regressionView = state.regressionView===regViewWanted ? "All" : regViewWanted;
+      render();
+      break;
+    case "set-regression-status-filter":
+      var regStWanted = el2.getAttribute("data-status")||"";
+      state.regressionStatusFilter = state.regressionStatusFilter===regStWanted ? "" : regStWanted;
+      render();
+      break;
+    case "reg-filter-all":
+      state.regressionStatusFilter = "";
+      state.regressionView = "All";
+      render();
+      break;
+    case "toggle-regression-entity": {
+      if(!entityId) break;
+      var regCardOpen = !regressionCardOpen(entityId);
+      state.regressionOpen[entityId] = regCardOpen;
+      qsa(".reg-card").filter(function(c){ return c.getAttribute("data-entity-id")===entityId; }).forEach(function(c){
+        c.classList.toggle("open", regCardOpen);
+        var chevBtn = qs(".chev", c);
+        if(chevBtn) chevBtn.setAttribute("aria-expanded", regCardOpen ? "true" : "false");
+      });
+      break;
+    }
+    case "toggle-regression-row": {
+      var regRowKey = el2.getAttribute("data-row-key");
+      if(!regRowKey) break;
+      var regRowOpen = !state.regressionRowOpen[regRowKey];
+      state.regressionRowOpen[regRowKey] = regRowOpen;
+      qsa(".row-wrap").filter(function(w){ return w.getAttribute("data-row-key")===regRowKey; }).forEach(function(w){
+        w.classList.toggle("open", regRowOpen);
+        var rb = qs(".row-chev", w);
+        if(rb) rb.setAttribute("aria-expanded", regRowOpen ? "true" : "false");
+      });
+      break;
+    }
+    case "regression-expand-all":
+    case "regression-collapse-all":
+      if(r){
+        var regExpand = action==="regression-expand-all";
+        regressionEntities(r).forEach(function(en){ state.regressionOpen[en.id] = regExpand; });
+        qsa(".reg-card").forEach(function(c){
+          c.classList.toggle("open", regExpand);
+          var chevBtn2 = qs(".chev", c);
+          if(chevBtn2) chevBtn2.setAttribute("aria-expanded", regExpand ? "true" : "false");
+        });
+      }
+      break;
+    case "toggle-regression-menu":
+    case "toggle-regression-more": {
+      e.stopPropagation();
+      var regMenu = el2.parentNode ? qs(".menu", el2.parentNode) : null;
+      qsa(".menu.open").forEach(function(m){ if(m!==regMenu) m.classList.remove("open"); });
+      if(regMenu) regMenu.classList.toggle("open");
+      break;
+    }
     case "add-bug": if(r) openBugModal(r, null); break;
     case "edit-bug": if(r){ var bu=(r.bugs||[]).find(function(x){return x.id===id;}); if(bu) openBugModal(r,bu); } break;
     case "delete-bug": if(r){ r.bugs=(r.bugs||[]).filter(function(x){return x.id!==id;}); persistRelease(r); } break;
@@ -6784,6 +6939,8 @@ document.addEventListener("change", function(e){
     // display copy — write through to the real object so the save sticks.
     var target4 = ent4._legacy ? ent4._legacy : svc4;
     target4.status = elp.value;
+    var stWrap4 = elp.closest(".status-wrap");
+    if(stWrap4) stWrap4.className = "status-wrap st-"+toneForStatus(elp.value);
     // The audit event (assignedTo / changedBy / previous + new status) is
     // written by the server when this save lands; here we only show the
     // heads-up when the person changing it isn't who it's assigned to.
@@ -6796,6 +6953,8 @@ document.addEventListener("change", function(e){
     var ent9 = regressionEntities(r9).find(function(x){return x.id===entId9;});
     if(!ent9) return;
     ent9.status = elp.value;
+    var stWrap9 = elp.closest(".status-wrap");
+    if(stWrap9) stWrap9.className = "status-wrap st-"+toneForStatus(elp.value);
     var assignee9 = ent9.assignedTo || "";
     persistRelease(r9, function(){ warnIfChangedByOther(assignee9); });
   }
@@ -6857,6 +7016,13 @@ document.addEventListener("input", function(e){
     renderSearchDropdown();
     var clearBtn = qs(".search-clear");
     if(clearBtn) clearBtn.hidden = !state.searchQuery;
+  }
+  if(e.target && e.target.id==="regression-search"){
+    // Re-render only the list (not the search box) so typing keeps focus.
+    state.regressionSearch = e.target.value;
+    var rReg = state.releases[state.route.id];
+    var regListEl = qs("#reg-list-container");
+    if(rReg && regListEl) regListEl.innerHTML = renderRegressionList(rReg);
   }
   if(e.target && e.target.id==="td-search"){
     // Re-renders only the list, not the search input itself, so typing
