@@ -188,6 +188,8 @@ var api = {
   dailyReportMe: function(){ return apiCall("GET","/daily-reports/me"); },
   submitDailyReport: function(data){ return apiCall("POST","/daily-reports", data); },
   retryDailyReportSlack: function(id){ return apiCall("POST","/daily-reports/"+encodeURIComponent(id)+"/slack-retry"); },
+  editDailyReport: function(id, data){ return apiCall("PUT","/daily-reports/"+encodeURIComponent(id), data); },
+  postDailyReportUpdate: function(id){ return apiCall("POST","/daily-reports/"+encodeURIComponent(id)+"/slack-update"); },
   reportingPing: function(){ return apiCall("GET","/reporting/ping"); },
   reportingSettings: function(){ return apiCall("GET","/reporting/settings"); },
   saveReportingSettings: function(data){ return apiCall("PUT","/reporting/settings", data); },
@@ -266,7 +268,7 @@ var state = {
   statsDenied: false, // the server said 403 (no Statistics access)
   reportingReady: false,
   reportingDenied: false, // the server said 403 (no Reporting access)
-  dr: {ready:false, denied:false, data:null, error:"", form:{today:"",tomorrow:"",blockers:""}, errors:{}, submitting:false, retrying:{}}, // Daily QA Report page
+  dr: {ready:false, denied:false, data:null, error:"", form:{today:"",tomorrow:"",blockers:""}, errors:{}, submitting:false, retrying:{}, edit:null, posting:{}, open:{}}, // Daily QA Report page; edit = {id, form, errors, saving}
   rp: {dataLayer:false, needsPostgres:false, status:null, settings:null, error:null, saving:false, starting:false, pollTimer:null,
        tab:"reports", filters:null, options:null, presets:[], presetName:"", report:null, reportLoading:false, reportError:null, reportBooting:false, sheetId:"summary", chartTables:{}, exporting:false, deps:null, depsError:null, depStatuses:null},
   assessmentLoggedFor: {}, // releaseId -> true, so AI_ASSESSMENT_GENERATED logs once per viewing, not every re-render
@@ -1563,6 +1565,7 @@ var AUDIT_ACTION_LABELS = {
   REPORT_EXPORTED: "Exported a Report",
   REPORT_DEPENDENCY_CHANGED: "Changed a Reporting Dependency",
   DAILY_REPORT_SUBMITTED: "Submitted Daily QA Report",
+  DAILY_REPORT_EDITED: "Edited Daily QA Report",
   DAILY_REPORT_SLACK_FAILED: "Daily QA Report Not Posted to Slack"
 };
 function humanizeAuditAction(action){
@@ -1934,7 +1937,7 @@ function canUseDailyReport(){
 }
 function loadDailyReport(){
   return api.dailyReportMe().then(function(d){
-    state.dr.data = d; state.dr.denied = false; state.dr.error = ""; state.dr.ready = true;
+    state.dr.data = d; state.dr.denied = false; state.dr.error = ""; state.dr.ready = true; state.dr.edit = null;
   }).catch(function(e){
     state.dr.ready = true;
     if(e && e.status===403){ state.dr.denied = true; return; }
@@ -1949,16 +1952,24 @@ function renderDailyReportNoAccess(){
   return '<div class="list-head"><div><h1>Daily QA Report</h1></div></div>'+
     '<div class="empty-state"><h3>You don’t have access to the Daily QA Report</h3><p>'+why+'</p></div>';
 }
-// Where this report stands with Slack, plus the retry button when it isn't there yet.
+// Where this report stands with Slack, plus the button that fixes it when it
+// isn't there yet (Retry Slack) or is behind an edit (Post update to Slack).
 function drSlackStatusHtml(rep){
   var s = rep.slack || {status:"pending"};
-  var retrying = !!state.dr.retrying[rep.id];
+  var retrying = !!state.dr.retrying[rep.id], posting = !!state.dr.posting[rep.id];
+  if(s.status==="sent"){
+    if(s.sync==="edit_pending"){
+      return '<div class="dr-slack is-problem" role="status"><div class="dr-slack-main"><span class="pill tone-warn"><span class="pill-dot"></span>Edited — Slack still shows the earlier version</span>'+
+        (s.updateError ? '<span class="dr-slack-note">Last attempt failed: '+esc(s.updateError)+'</span>' : '<span class="dr-slack-note">Posting adds a new “Updated” message; the earlier one stays in the channel.</span>')+'</div>'+
+        '<button type="button" class="btn btn-sm btn-primary" data-action="post-daily-report-update" data-id="'+escAttr(rep.id)+'"'+(posting?" disabled":"")+'>'+
+        (posting ? '<span class="spinner"></span> Posting…' : 'Post update to Slack')+'</button></div>';
+    }
+    var latest = s.updatesPosted ? "Sent to Slack · update posted" : "Sent to Slack";
+    return '<div class="dr-slack is-sent"><span class="pill tone-go"><span class="pill-dot"></span>'+latest+'</span>'+
+      ((s.lastUpdateAt && s.updatesPosted) || s.sentAt ? '<span class="dr-slack-note">'+esc(fmtDateTime((s.updatesPosted && s.lastUpdateAt) || s.sentAt)||"")+'</span>' : '')+'</div>';
+  }
   var retryBtn = '<button type="button" class="btn btn-sm" data-action="retry-daily-report-slack" data-id="'+escAttr(rep.id)+'"'+(retrying?" disabled":"")+'>'+
     (retrying ? '<span class="spinner"></span> Sending…' : iconRefresh()+' Retry Slack')+'</button>';
-  if(s.status==="sent"){
-    return '<div class="dr-slack is-sent"><span class="pill tone-go"><span class="pill-dot"></span>Sent to Slack</span>'+
-      (s.sentAt ? '<span class="dr-slack-note">'+esc(fmtDateTime(s.sentAt)||"")+'</span>' : '')+'</div>';
-  }
   var title = s.status==="not_configured" ? "Saved — Slack isn’t set up yet" : s.status==="failed" ? "Saved — couldn’t post to Slack" : "Saved — not posted to Slack yet";
   return '<div class="dr-slack is-problem" role="status"><div class="dr-slack-main"><span class="pill tone-warn"><span class="pill-dot"></span>'+esc(title)+'</span>'+
     (s.error ? '<span class="dr-slack-note">'+esc(s.error)+'</span>' : '')+'</div>'+retryBtn+'</div>';
@@ -1967,45 +1978,74 @@ function drSectionsHtml(rep){
   function sec(label, text){ return '<div class="dr-sec"><div class="dr-sec-label">'+esc(label)+'</div><div class="dr-sec-text">'+esc(text)+'</div></div>'; }
   return sec("Today", rep.today)+sec("Tomorrow", rep.tomorrow)+sec("Blockers / help needed", rep.blockers && rep.blockers.trim() ? rep.blockers : "None");
 }
-function drFieldHtml(key, label, required, rows, placeholder, hint){
-  var dr = state.dr, err = dr.errors[key];
+// ctx is the object holding {form, errors, saving}: the page's new-report form
+// (state.dr, ids "dr-…") or an edit in progress (state.dr.edit, ids "dr-e-…").
+function drFieldHtml(key, label, required, rows, placeholder, ctx){
+  var isEdit = ctx === state.dr.edit, busy = isEdit ? ctx.saving : state.dr.submitting;
+  var err = ctx.errors[key], id = (isEdit ? "dr-e-" : "dr-")+key;
   return '<div class="field dr-field">'+
-    '<label for="dr-'+key+'">'+esc(label)+(required ? ' <span class="dr-req" title="Required">*</span>' : ' <span class="hint">(optional)</span>')+'</label>'+
-    '<textarea id="dr-'+key+'" rows="'+rows+'" placeholder="'+escAttr(placeholder)+'"'+(err?' class="is-invalid" aria-invalid="true"':'')+(required?' required':'')+(dr.submitting?' disabled':'')+'>'+esc(dr.form[key]||"")+'</textarea>'+
-    (hint ? '<div class="hint">'+esc(hint)+'</div>' : '')+
-    (err ? '<div class="dr-err" data-for="'+key+'" role="alert">'+esc(err)+'</div>' : '')+
+    '<label for="'+id+'">'+esc(label)+(required ? ' <span class="dr-req" title="Required">*</span>' : ' <span class="hint">(optional)</span>')+'</label>'+
+    '<textarea id="'+id+'" rows="'+rows+'" placeholder="'+escAttr(placeholder)+'"'+(err?' class="is-invalid" aria-invalid="true"':'')+(required?' required':'')+(busy?' disabled':'')+'>'+esc(ctx.form[key]||"")+'</textarea>'+
+    (err ? '<div class="dr-err" data-for="'+id+'" role="alert">'+esc(err)+'</div>' : '')+
   '</div>';
 }
+var DR_PH_TODAY = "What did you work on today? One item per line works well:\nSurvey\nDevice Binding\nFamily Record";
+var DR_PH_TOMORROW = "What are you planning to work on next working day?\nExample: Completion Rate";
+var DR_PH_BLOCKERS = "Anything blocking you or needing help — or type “None”";
 function drFormHtml(d){
   var dr = state.dr;
   return '<form id="daily-report-form" class="card dr-card" novalidate>'+
     '<div class="dr-name"><span class="dr-avatar" aria-hidden="true">'+iconUser()+'</span>'+
       '<div><div class="dr-name-label">Your Name</div><div class="dr-name-value">'+esc(d.member.name)+'</div></div>'+
       '<div class="dr-date">'+esc(d.reportDateLabel)+'<span> · Amman</span></div></div>'+
-    drFieldHtml("today", "Today", true, 6, "What did you work on today? One item per line works well:\nSurvey\nDevice Binding\nFamily Record", "")+
-    drFieldHtml("tomorrow", "Tomorrow", true, 4, "What are you planning to work on next working day?\nExample: Completion Rate", "")+
-    drFieldHtml("blockers", "Blockers / help needed", false, 3, "Anything blocking you or needing help — or type “None”", "")+
+    drFieldHtml("today", "Today", true, 6, DR_PH_TODAY, dr)+
+    drFieldHtml("tomorrow", "Tomorrow", true, 4, DR_PH_TOMORROW, dr)+
+    drFieldHtml("blockers", "Blockers / help needed", false, 3, DR_PH_BLOCKERS, dr)+
     '<div class="dr-actions"><button type="submit" class="btn btn-primary" id="dr-submit"'+(dr.submitting?" disabled":"")+'>'+
       (dr.submitting ? '<span class="spinner"></span> Submitting…' : 'Submit Report')+'</button>'+
       '<span class="helper-text">Saved first, then posted to Slack. One report per day.</span></div>'+
   '</form>';
 }
+// The edit form for one existing report (replaces the read-only text in place).
+function drEditFormHtml(rep){
+  var ed = state.dr.edit;
+  return '<form id="daily-report-edit-form" class="dr-edit" novalidate>'+
+    drFieldHtml("today", "Today", true, 6, DR_PH_TODAY, ed)+
+    drFieldHtml("tomorrow", "Tomorrow", true, 4, DR_PH_TOMORROW, ed)+
+    drFieldHtml("blockers", "Blockers / help needed", false, 3, DR_PH_BLOCKERS, ed)+
+    '<div class="dr-actions"><button type="submit" class="btn btn-primary" id="dr-e-save"'+(ed.saving?" disabled":"")+'>'+
+      (ed.saving ? '<span class="spinner"></span> Saving…' : 'Save changes')+'</button>'+
+      '<button type="button" class="btn" data-action="cancel-edit-daily-report"'+(ed.saving?" disabled":"")+'>Cancel</button>'+
+      '<span class="helper-text">Saving doesn’t post anything to Slack.</span></div>'+
+  '</form>';
+}
+// Report text (or its edit form) plus the small "Edited" line and Edit button.
+function drBodyHtml(rep){
+  var ed = state.dr.edit;
+  if(ed && ed.id===rep.id) return drEditFormHtml(rep);
+  var edited = rep.editedAt ? '<span class="dr-edited">Edited '+esc(fmtDateTime(rep.editedAt)||"")+'</span>' : '';
+  return drSectionsHtml(rep)+
+    '<div class="dr-edit-row">'+edited+'<button type="button" class="btn btn-sm" data-action="edit-daily-report" data-id="'+escAttr(rep.id)+'">Edit</button></div>';
+}
 function drTodayCardHtml(d){
   var rep = d.today;
   return '<section class="card dr-card"><div class="dr-card-head"><div><h2>Today’s report</h2><p class="helper-text">'+esc(d.reportDateLabel)+' · submitted by '+esc(rep.memberName)+'</p></div>'+
     '<span class="pill tone-go"><span class="pill-dot"></span>Submitted</span></div>'+
-    drSlackStatusHtml(rep)+drSectionsHtml(rep)+
-    '<p class="helper-text dr-once">You’ve submitted today’s report — the next one opens tomorrow.</p></section>';
+    drSlackStatusHtml(rep)+drBodyHtml(rep)+
+    '<p class="helper-text dr-once">You’ve submitted today’s report — the next one opens tomorrow. You can still edit it.</p></section>';
 }
 function drHistoryHtml(d){
   var rows = (d.history||[]).filter(function(r){ return !d.today || r.id!==d.today.id; });
   if(!rows.length) return "";
   return '<section class="card dr-card"><div class="dr-card-head"><h2>Your recent reports</h2></div><div class="dr-history">'+
     rows.map(function(r){
-      var s = r.slack && r.slack.status;
-      var chip = s==="sent" ? '<span class="pill tone-go"><span class="pill-dot"></span>Sent</span>' : '<span class="pill tone-warn"><span class="pill-dot"></span>Not sent</span>';
-      return '<details class="dr-hist-item"><summary><span class="dr-hist-date">'+esc(drDateLabel(r.reportDate))+'</span>'+chip+'</summary>'+
-        '<div class="dr-hist-body">'+(s==="sent" ? "" : drSlackStatusHtml(r))+drSectionsHtml(r)+'</div></details>';
+      var s = r.slack && r.slack.status, sync = r.slack && r.slack.sync;
+      var chip = s!=="sent" ? '<span class="pill tone-warn"><span class="pill-dot"></span>Not sent</span>'
+        : sync==="edit_pending" ? '<span class="pill tone-warn"><span class="pill-dot"></span>Edit not posted</span>'
+        : '<span class="pill tone-go"><span class="pill-dot"></span>Sent</span>';
+      var open = ((state.dr.edit && state.dr.edit.id===r.id) || state.dr.open[r.id]) ? " open" : "";
+      return '<details class="dr-hist-item" data-id="'+escAttr(r.id)+'"'+open+'><summary><span class="dr-hist-date">'+esc(drDateLabel(r.reportDate))+'</span>'+chip+'</summary>'+
+        '<div class="dr-hist-body">'+((s==="sent" && sync!=="edit_pending") ? "" : drSlackStatusHtml(r))+drBodyHtml(r)+'</div></details>';
     }).join("")+'</div></section>';
 }
 // "2026-10-26" -> "Mon 26 Oct 2026" (a plain calendar date, no time-zone maths)
@@ -2073,6 +2113,61 @@ function dailyReportRetry(id){
     showToast(res.report.slack.status==="sent" ? "Posted to Slack." : "Slack still didn’t accept it — "+(res.report.slack.error||"try again in a moment")+"");
   }).catch(function(e){
     delete dr.retrying[id];
+    if(e && e.data && e.data.report) drApply(e.data.report);
+    showToast((e && e.message) || "Couldn’t reach the server.");
+    render();
+  });
+}
+
+// ---- editing an existing report (author only, any date) ----
+// A history row stays open (or closed) the way the person left it across re-renders.
+document.addEventListener("toggle", function(e){
+  var el = e.target;
+  if(el && el.classList && el.classList.contains("dr-hist-item") && el.dataset.id){
+    if(el.open) state.dr.open[el.dataset.id] = true; else delete state.dr.open[el.dataset.id];
+  }
+}, true);
+function dailyReportEditStart(id){
+  var d = state.dr.data; if(!d) return;
+  if(state.dr.edit){ showToast("Save or cancel the edit you have open first."); return; }
+  var rep = (d.history||[]).find(function(x){ return x.id===id; }) || (d.today && d.today.id===id ? d.today : null);
+  if(!rep) return;
+  state.dr.edit = {id:id, form:{today:rep.today||"", tomorrow:rep.tomorrow||"", blockers:rep.blockers||""}, errors:{}, saving:false};
+  render();
+  var first = qs("#dr-e-today"); if(first){ first.focus(); first.setSelectionRange(first.value.length, first.value.length); }
+}
+function dailyReportEditSave(){
+  var ed = state.dr.edit; if(!ed || ed.saving) return;
+  var f = ed.form, errors = {};
+  if(!String(f.today||"").trim()) errors.today = "Tell the team what you worked on today.";
+  if(!String(f.tomorrow||"").trim()) errors.tomorrow = "Tell the team what you plan to work on tomorrow.";
+  ed.errors = errors;
+  if(Object.keys(errors).length){
+    render();
+    var first = qs("#dr-e-"+Object.keys(errors)[0]); if(first) first.focus();
+    return;
+  }
+  ed.saving = true; render();
+  api.editDailyReport(ed.id, {today:f.today, tomorrow:f.tomorrow, blockers:f.blockers}).then(function(res){
+    state.dr.edit = null; drApply(res.report); render();
+    if(!res.changed) showToast("No changes to save.");
+    else if(res.report.slack.sync==="edit_pending") showToast("Changes saved. Slack still shows the earlier version — use Post update to Slack when you’re ready.");
+    else showToast("Changes saved.");
+  }).catch(function(e){
+    ed.saving = false;
+    if(e && e.status===400 && e.data && e.data.fields){ ed.errors = e.data.fields; }
+    else showToast((e && e.message) || "Couldn’t save your changes.");
+    render();
+  });
+}
+function dailyReportPostUpdate(id){
+  var dr = state.dr; if(!id || dr.posting[id]) return;
+  dr.posting[id] = true; render();
+  api.postDailyReportUpdate(id).then(function(res){
+    delete dr.posting[id]; drApply(res.report); render();
+    showToast(res.report.slack.sync==="in_sync" ? "Update posted to Slack." : "Slack didn’t accept the update — "+(res.report.slack.updateError||"try again in a moment"));
+  }).catch(function(e){
+    delete dr.posting[id];
     if(e && e.data && e.data.report) drApply(e.data.report);
     showToast((e && e.message) || "Couldn’t reach the server.");
     render();
@@ -6754,6 +6849,9 @@ document.addEventListener("click", function(e){
     case "nav-daily-report": goTo("#/daily-report"); break;
     case "reload-daily-report": boot(); break;
     case "retry-daily-report-slack": dailyReportRetry(id); break;
+    case "edit-daily-report": dailyReportEditStart(id); break;
+    case "cancel-edit-daily-report": state.dr.edit = null; render(); break;
+    case "post-daily-report-update": dailyReportPostUpdate(id); break;
     case "rp-sync": rpStartSync(el2.getAttribute("data-mode")==="full" ? "full" : "incremental"); break;
     case "rp-tab":
       state.rp.tab = el2.getAttribute("data-tab") || "reports";
@@ -7116,6 +7214,7 @@ document.addEventListener("submit", function(e){
   if(e.target && e.target.id==="rp-settings-form"){ e.preventDefault(); rpSaveSettings(); }
   if(e.target && e.target.id==="rp-dep-form"){ e.preventDefault(); rpSaveDep(e.target); }
   if(e.target && e.target.id==="daily-report-form"){ e.preventDefault(); dailyReportSubmit(); }
+  if(e.target && e.target.id==="daily-report-edit-form"){ e.preventDefault(); dailyReportEditSave(); }
 });
 
 document.addEventListener("change", function(e){
@@ -7203,15 +7302,17 @@ document.addEventListener("click", function(e){
 
 var rpSearchTimer = null;
 document.addEventListener("input", function(e){
-  if(e.target && (e.target.id==="dr-today" || e.target.id==="dr-tomorrow" || e.target.id==="dr-blockers")){
+  var drm = e.target && /^dr-(e-)?(today|tomorrow|blockers)$/.exec(e.target.id||"");
+  if(drm){
     // Keep what's typed in state (a re-render never loses it) and clear that
     // field's error as soon as the person starts fixing it.
-    var drKey = e.target.id.slice(3);
-    state.dr.form[drKey] = e.target.value;
-    if(state.dr.errors[drKey]){
-      delete state.dr.errors[drKey];
+    var drCtx = drm[1] ? state.dr.edit : state.dr, drKey = drm[2];
+    if(!drCtx) return;
+    drCtx.form[drKey] = e.target.value;
+    if(drCtx.errors[drKey]){
+      delete drCtx.errors[drKey];
       e.target.classList.remove("is-invalid"); e.target.removeAttribute("aria-invalid");
-      var drErr = qs('.dr-err[data-for="'+drKey+'"]'); if(drErr) drErr.remove();
+      var drErr = qs('.dr-err[data-for="'+e.target.id+'"]'); if(drErr) drErr.remove();
     }
     return;
   }

@@ -290,6 +290,7 @@ Blockers / help needed:
 {blockers, or None}
 ```
 
+- **Editing:** the author can edit any of their own reports at any time (the **Edit** button on today's report or on a row under "Your recent reports"; nobody else can). Saving an edit changes only the report in Greenlight — it **never posts to Slack by itself**. If Slack already has the earlier version, the report shows "Edited — Slack still shows the earlier version" with a **Post update to Slack** button. Posting sends one **new** message, the same template with "· ✏️ Updated" added to the title line; the earlier message stays in the channel (an Incoming Webhook can't change a message that is already posted). A failed update post keeps the button and shows the reason. If Slack never received the report at all, **Retry Slack** posts the current text as the original instead. Edits are recorded in the Audit log ("Edited Daily QA Report", no report text in it).
 - **The daily reminder** is a separate Slack message sent every day at **3:45 PM Asia/Amman** (if the server was down at that minute it still goes out up to two hours late, and never twice a day — the day is claimed in the database first): "⏰ Daily QA Update Reminder — Please remember to submit your Daily QA Update for today." plus a link to the page. It never names anyone or implies a report was submitted. It runs inside the server (so it needs the service to be running — Render's `starter` plan or above, not a sleeping free instance).
 - **Setup:** create an [Incoming Webhook](https://api.slack.com/messaging/webhooks) for the channel and set `SLACK_WEBHOOK_URL` (a secret — environment only; it is never sent to the browser or logged, and only `hooks.slack.com` addresses are accepted). Optionally `SLACK_REMINDER_WEBHOOK_URL` sends the reminder to a different channel. Without `SLACK_WEBHOOK_URL` reports are still saved and a banner on the page says Slack isn't set up; no reminder is sent. On Postgres the two tables (`daily_qa_reports`, `daily_qa_reminders`) are created automatically on first use; `supabase/migrations/0006_daily_qa_reports.sql` does the same by hand.
 
@@ -386,7 +387,7 @@ greenlight-app/
       reporting.js                — guarded Reporting API (settings, sync, report JSON, Excel/CSV downloads, dependencies, presets)
       team.js                      — Know the Team CRUD, "This is me" link, per-page access switches
       testData.js               — the reusable Test Data library CRUD endpoints + Related Test Accounts (links between records)
-      dailyReports.js            — Daily QA Report API (save, then post to Slack; retry); guarded by the regression-flag rule
+      dailyReports.js            — Daily QA Report API (save, then post to Slack; retry; edit; post update); guarded by the regression-flag rule
       auth.js                  — /auth/login, /auth/callback, /auth/logout, /auth/me
   public/
     index.html, styles.css, app.js  — the dashboard itself (no build step, no framework)

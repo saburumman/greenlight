@@ -8,7 +8,10 @@
 //     today, tomorrow,                     // required multi-line text
 //     blockers,                            // optional multi-line text ("" = none; shown/sent as "None")
 //     submittedAt,
-//     slack: { status, attempts, lastAttemptAt, sentAt, error },
+//     revision, editedAt,                  // revision starts at 1 and goes up on every saved edit (author only, any time)
+//     slack: { status, attempts, lastAttemptAt, sentAt, error,
+//              postedRevision,             // which revision the Slack message shows
+//              updatesPosted, lastUpdateAt, updateError },
 //                                          // status: "pending" | "sent" | "failed" | "not_configured"
 //     createdAt, updatedAt
 //   }
@@ -101,6 +104,8 @@ function buildReport({ id, member, clean, reportDate, now }) {
     tomorrow: clean.tomorrow,
     blockers: clean.blockers,
     submittedAt: stamp,
+    revision: 1,
+    editedAt: null,
     slack: newSlackState(),
     createdAt: stamp,
     updatedAt: stamp,
@@ -114,8 +119,42 @@ function publicReport(r) {
     id: r.id, reportDate: r.reportDate, memberName: r.memberName,
     today: r.today, tomorrow: r.tomorrow, blockers: r.blockers || "",
     submittedAt: r.submittedAt,
-    slack: { status: s.status, attempts: s.attempts || 0, lastAttemptAt: s.lastAttemptAt || null, sentAt: s.sentAt || null, error: s.error || null },
+    revision: revisionOf(r), editedAt: r.editedAt || null,
+    slack: {
+      status: s.status, attempts: s.attempts || 0, lastAttemptAt: s.lastAttemptAt || null, sentAt: s.sentAt || null, error: s.error || null,
+      // "unsent" (never posted) | "in_sync" (Slack shows the current text) | "edit_pending" (posted, then edited)
+      sync: slackSync(r),
+      updatesPosted: s.updatesPosted || 0, lastUpdateAt: s.lastUpdateAt || null, updateError: s.updateError || null,
+    },
   };
+}
+// Reports saved before editing existed have no revision: they are revision 1.
+function revisionOf(r) {
+  return Number(r && r.revision) || 1;
+}
+// Does the Slack message match what the report says now?
+function slackSync(r) {
+  const s = r && r.slack;
+  if (!s || s.status !== "sent") return "unsent";
+  return (Number(s.postedRevision) || 1) >= revisionOf(r) ? "in_sync" : "edit_pending";
+}
+// Applies an author's edit to a report in place. Returns true when something
+// actually changed (saving identical text does not create a new revision).
+function applyEdit(report, clean, now) {
+  if (report.today === clean.today && report.tomorrow === clean.tomorrow && (report.blockers || "") === clean.blockers) return false;
+  const stamp = (now instanceof Date ? now : new Date(now || Date.now())).toISOString();
+  report.today = clean.today;
+  report.tomorrow = clean.tomorrow;
+  report.blockers = clean.blockers;
+  report.revision = revisionOf(report) + 1;
+  report.editedAt = stamp;
+  report.updatedAt = stamp;
+  // A failed attempt to post an older edit says nothing about this text.
+  if (report.slack) report.slack.updateError = null;
+  return true;
+}
+function canPostUpdate(report) {
+  return slackSync(report) === "edit_pending";
 }
 function canRetrySlack(report) {
   return !!report && !!report.slack && report.slack.status !== "sent";
@@ -152,10 +191,15 @@ const DIVIDER = "━━━━━━━━━━━━━━━━━━━━━
 //
 //   Blockers / help needed:
 //   {blockers or None}
-function buildReportMessage(report) {
+//
+// When `updated` is true (an edited report posted a second time) the title line
+// ends with "· ✏️ Updated" so the channel can tell the newer message from the
+// earlier one; nothing else changes.
+function buildReportMessage(report, opts) {
+  const updated = !!(opts && opts.updated);
   const blockers = report.blockers && String(report.blockers).trim() ? slackBody(report.blockers) : "None";
   return [
-    "🧪 *Daily QA Update* · " + formatReportDate(report.reportDate),
+    "🧪 *Daily QA Update* · " + formatReportDate(report.reportDate) + (updated ? " · ✏️ _Updated_" : ""),
     DIVIDER,
     "*Your Name*",
     escapeSlack(report.memberName),
@@ -208,6 +252,7 @@ module.exports = {
   REMINDER_HOUR, REMINDER_MINUTE, REMINDER_GRACE_MINUTES,
   ammanParts, reportDateFor, formatReportDate,
   normalizeText, validateSubmission, newSlackState, buildReport, publicReport, canRetrySlack,
+  revisionOf, slackSync, applyEdit, canPostUpdate,
   escapeSlack, slackBody, buildReportMessage, buildReminderMessage,
   reminderDue, memberHasRegressionFlag,
 };

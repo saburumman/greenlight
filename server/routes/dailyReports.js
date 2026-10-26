@@ -6,10 +6,18 @@
 //   GET  /api/daily-reports/me            today's report (if any), recent reports, Slack status
 //   POST /api/daily-reports               save a report, then post it to Slack
 //   POST /api/daily-reports/:id/slack-retry   try the Slack post again for one of your reports
+//   PUT  /api/daily-reports/:id           edit one of your own reports (any date); saves only, never posts
+//   POST /api/daily-reports/:id/slack-update  post an edited report to Slack as a new "Updated" message
 //
 // Order of events on submit: validate -> SAVE (one report per member per day,
 // enforced by the store) -> post to Slack -> record the outcome on the report.
 // A Slack failure never removes or blocks the saved report.
+//
+// Editing: the author can change any of their reports at any time. Saving an
+// edit only changes the saved report; it never posts. If Slack already shows
+// an earlier version, the author chooses "Post update to Slack", which adds a
+// NEW message marked "Updated" (an Incoming Webhook can't change a message that
+// is already in the channel).
 
 const express = require("express");
 const crypto = require("crypto");
@@ -36,7 +44,7 @@ async function deliverToSlack(report, actor) {
   const result = await slack.sendMessage(logic.buildReportMessage(report), { kind: "report" });
   const prev = report.slack || logic.newSlackState();
   report.slack = result.ok
-    ? { status: "sent", attempts: (prev.attempts || 0) + 1, lastAttemptAt: startedAt, sentAt: new Date().toISOString(), error: null }
+    ? { status: "sent", attempts: (prev.attempts || 0) + 1, lastAttemptAt: startedAt, sentAt: new Date().toISOString(), error: null, postedRevision: logic.revisionOf(report), updatesPosted: 0, lastUpdateAt: null, updateError: null }
     : { status: result.code === "not_configured" ? "not_configured" : "failed", attempts: (prev.attempts || 0) + 1, lastAttemptAt: startedAt, sentAt: null, error: result.error };
   report.updatedAt = new Date().toISOString();
   try {
@@ -128,6 +136,91 @@ router.post("/:id/slack-retry", asyncHandler(async (req, res) => {
     sending.delete(report.id);
   }
   res.json({ report: logic.publicReport(report) });
+}));
+
+// Marks a report as busy for the length of an operation. Edits and Slack posts
+// on the same report take turns, so an edit can't slip in between "read the
+// text" and "post it".
+async function withReportLock(id, res, fn) {
+  if (sending.has(id)) {
+    res.status(409).json({ error: "This report is being saved or sent right now — give it a moment." });
+    return;
+  }
+  sending.add(id);
+  try {
+    await fn();
+  } finally {
+    sending.delete(id);
+  }
+}
+// Loads one of the signed-in member's own reports; anyone else's looks missing.
+async function ownReport(req, res) {
+  const report = await db.dailyReports.get(req.params.id);
+  if (!report || report.teamMemberId !== req.dailyMember.id) {
+    res.status(404).json({ error: "Report not found." });
+    return null;
+  }
+  return report;
+}
+
+router.put("/:id", asyncHandler(async (req, res) => {
+  await withReportLock(req.params.id, res, async () => {
+    const report = await ownReport(req, res);
+    if (!report) return;
+    const { clean, errors } = logic.validateSubmission(req.body);
+    if (Object.keys(errors).length) {
+      return res.status(400).json({ error: "Please fill in the highlighted fields.", fields: errors });
+    }
+    const changed = logic.applyEdit(report, clean, new Date());
+    if (changed) {
+      await db.dailyReports.set(report.id, report);
+      await recordEvents(db, resolveActor(req.authUser, req.team), [{
+        action: "DAILY_REPORT_EDITED", entityType: "DailyReport", entityId: report.id,
+        details: "Edited the Daily QA report for " + report.reportDate, meta: { page: "dailyReport" },
+      }]);
+    }
+    res.json({ report: logic.publicReport(report), changed });
+  });
+}));
+
+router.post("/:id/slack-update", asyncHandler(async (req, res) => {
+  await withReportLock(req.params.id, res, async () => {
+    const report = await ownReport(req, res);
+    if (!report) return;
+    if (!logic.canPostUpdate(report)) {
+      const msg = report.slack && report.slack.status === "sent"
+        ? "Slack already shows the latest version of this report."
+        : "This report hasn’t been posted to Slack yet — use Retry Slack to post it.";
+      return res.status(409).json({ error: msg, report: logic.publicReport(report) });
+    }
+    const actor = resolveActor(req.authUser, req.team);
+    const revision = logic.revisionOf(report);
+    const startedAt = new Date().toISOString();
+    const result = await slack.sendMessage(logic.buildReportMessage(report, { updated: true }), { kind: "report" });
+    const s = report.slack;
+    s.lastUpdateAt = startedAt;
+    if (result.ok) {
+      s.postedRevision = revision;
+      s.updatesPosted = (s.updatesPosted || 0) + 1;
+      s.updateError = null;
+    } else {
+      s.updateError = result.error;
+    }
+    report.updatedAt = new Date().toISOString();
+    try {
+      await db.dailyReports.set(report.id, report);
+    } catch (e) {
+      console.error("daily report: could not record the Slack update outcome:", e && e.message);
+    }
+    if (!result.ok) {
+      await recordEvents(db, actor, [{
+        action: "DAILY_REPORT_SLACK_FAILED", entityType: "DailyReport", entityId: report.id,
+        details: "Updated Daily QA report for " + report.reportDate + " was saved but the update was not posted to Slack — " + result.error,
+        meta: { page: "dailyReport" },
+      }]);
+    }
+    res.json({ report: logic.publicReport(report) });
+  });
 }));
 
 module.exports = router;
