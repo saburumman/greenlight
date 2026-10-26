@@ -28,7 +28,7 @@ async function tick(now) {
   if (lastFailureAt && at.getTime() - lastFailureAt < RETRY_AFTER_FAILURE_MS) return { skipped: "backing_off" };
   const date = logic.reportDateFor(at);
   if (!(await db.dailyReminders.claim(date))) return { skipped: "already_sent" };
-  const result = await slack.sendMessage(logic.buildReminderMessage(process.env.APP_BASE_URL), { kind: "reminder" });
+  const result = await slack.sendMessage(logic.buildReminderMessage(process.env.DAILY_REPORT_LINK), { kind: "reminder" });
   if (!result.ok) {
     lastFailureAt = at.getTime();
     await db.dailyReminders.release(date); // not sent -> try again on a later tick

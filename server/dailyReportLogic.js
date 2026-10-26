@@ -316,15 +316,24 @@ function buildReportMessage(report, opts) {
     blockers,
   ].join("\n");
 }
+// The link the reminder carries. Always present — it does not depend on
+// APP_BASE_URL being set. DAILY_REPORT_LINK overrides it (e.g. a custom domain).
+const DEFAULT_REPORT_LINK = "https://greenlight-0foe.onrender.com/#/daily-report";
+function reportLink(override) {
+  const v = String(override || "").trim();
+  return /^https?:\/\/[^\s<>|]+$/i.test(v) ? v : DEFAULT_REPORT_LINK;
+}
 // The reminder only ever reminds: it never names anyone or claims a report was
 // submitted.
-function buildReminderMessage(appBaseUrl) {
-  const base = String(appBaseUrl || "").trim().replace(/\/+$/, "");
-  const link = base ? "<" + base + "/#/daily-report|Daily QA Report>" : "Daily QA Report";
+//
+//   ⏰ Daily QA Update Reminder
+//   Please remember to submit your Daily QA Update for today.
+//   Fill using this link: <page link>
+function buildReminderMessage(linkOverride) {
   return [
     "⏰ *Daily QA Update Reminder*",
     "Please remember to submit your Daily QA Update for today.",
-    link,
+    "Fill using this link: <" + reportLink(linkOverride) + ">",
   ].join("\n");
 }
 
@@ -360,6 +369,6 @@ module.exports = {
   normalizeText, validateSubmission, newSlackState, buildReport, publicReport, canRetrySlack,
   revisionOf, slackSync, applyEdit, canPostUpdate, canResend,
   teamReport, matchesSearch, cleanDate, coverage,
-  escapeSlack, slackBody, buildReportMessage, buildReminderMessage,
+  escapeSlack, slackBody, buildReportMessage, buildReminderMessage, reportLink, DEFAULT_REPORT_LINK,
   reminderDue, memberHasRegressionFlag,
 };
