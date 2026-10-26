@@ -191,6 +191,7 @@ var api = {
   dailyReportTeam: function(qs){ return apiCall("GET","/daily-reports/team"+(qs?"?"+qs:"")); },
   dailyReportStats: function(qs){ return apiCall("GET","/statistics/daily-reports"+(qs?"?"+qs:"")); },
   editDailyReport: function(id, data){ return apiCall("PUT","/daily-reports/"+encodeURIComponent(id), data); },
+  resendDailyReport: function(id){ return apiCall("POST","/daily-reports/"+encodeURIComponent(id)+"/slack-resend"); },
   postDailyReportUpdate: function(id){ return apiCall("POST","/daily-reports/"+encodeURIComponent(id)+"/slack-update"); },
   reportingPing: function(){ return apiCall("GET","/reporting/ping"); },
   reportingSettings: function(){ return apiCall("GET","/reporting/settings"); },
@@ -271,7 +272,7 @@ var state = {
   statsDenied: false, // the server said 403 (no Statistics access)
   reportingReady: false,
   reportingDenied: false, // the server said 403 (no Reporting access)
-  dr: {ready:false, denied:false, data:null, error:"", form:{today:"",tomorrow:"",blockers:""}, errors:{}, submitting:false, retrying:{}, edit:null, posting:{}, team:{f:{range:"30", from:"", to:"", member:"", q:""}, data:null, members:[], loading:false, error:"", open:{}, token:0}}, // Daily QA Report page; edit = {id, form, errors, saving}
+  dr: {ready:false, denied:false, data:null, error:"", form:{today:"",tomorrow:"",blockers:""}, errors:{}, submitting:false, retrying:{}, edit:null, posting:{}, resending:{}, resendConfirm:"", team:{f:{range:"30", from:"", to:"", member:"", q:""}, data:null, members:[], loading:false, error:"", open:{}, token:0}}, // Daily QA Report page; edit = {id, form, errors, saving}
   rp: {dataLayer:false, needsPostgres:false, status:null, settings:null, error:null, saving:false, starting:false, pollTimer:null,
        tab:"reports", filters:null, options:null, presets:[], presetName:"", report:null, reportLoading:false, reportError:null, reportBooting:false, sheetId:"summary", chartTables:{}, exporting:false, deps:null, depsError:null, depStatuses:null},
   assessmentLoggedFor: {}, // releaseId -> true, so AI_ASSESSMENT_GENERATED logs once per viewing, not every re-render
@@ -1996,8 +1997,16 @@ function drSlackStatusHtml(rep){
         (posting ? '<span class="spinner"></span> Posting…' : 'Post update to Slack')+'</button></div>';
     }
     var latest = s.updatesPosted ? "Sent to Slack · update posted" : "Sent to Slack";
-    return '<div class="dr-slack is-sent"><span class="pill tone-go"><span class="pill-dot"></span>'+latest+'</span>'+
-      ((s.lastUpdateAt && s.updatesPosted) || s.sentAt ? '<span class="dr-slack-note">'+esc(fmtDateTime((s.updatesPosted && s.lastUpdateAt) || s.sentAt)||"")+'</span>' : '')+'</div>';
+    var when = (s.lastResendAt && s.resends) ? s.lastResendAt : (s.updatesPosted && s.lastUpdateAt) ? s.lastUpdateAt : s.sentAt;
+    var resending = !!state.dr.resending[rep.id], confirming = state.dr.resendConfirm===rep.id;
+    var resendHtml = resending
+      ? '<button type="button" class="btn btn-sm" disabled><span class="spinner"></span> Re-sending…</button>'
+      : confirming
+        ? '<span class="dr-confirm"><span>Post it to Slack again?</span><button type="button" class="btn btn-sm btn-primary" data-action="resend-daily-report-slack" data-id="'+escAttr(rep.id)+'">Yes, re-send</button><button type="button" class="btn btn-sm" data-action="cancel-resend-daily-report">Cancel</button></span>'
+        : '<button type="button" class="btn btn-sm" data-action="ask-resend-daily-report" data-id="'+escAttr(rep.id)+'">'+iconRefresh()+' Re-send to Slack</button>';
+    return '<div class="dr-slack is-sent"><div class="dr-slack-main"><span class="pill tone-go"><span class="pill-dot"></span>'+latest+(s.resends ? ' · re-sent '+s.resends+'×' : '')+'</span>'+
+      (when ? '<span class="dr-slack-note">'+esc(fmtDateTime(when)||"")+'</span>' : '')+
+      (s.resendError ? '<span class="dr-slack-note dr-slack-err">Re-send failed: '+esc(s.resendError)+'</span>' : '')+'</div>'+resendHtml+'</div>';
   }
   var retryBtn = '<button type="button" class="btn btn-sm" data-action="retry-daily-report-slack" data-id="'+escAttr(rep.id)+'"'+(retrying?" disabled":"")+'>'+
     (retrying ? '<span class="spinner"></span> Sending…' : iconRefresh()+' Retry Slack')+'</button>';
@@ -2290,6 +2299,19 @@ function dailyReportEditSave(){
     ed.saving = false;
     if(e && e.status===400 && e.data && e.data.fields){ ed.errors = e.data.fields; }
     else showToast((e && e.message) || "Couldn’t save your changes.");
+    render();
+  });
+}
+function dailyReportResend(id){
+  var dr = state.dr; if(!id || dr.resending[id]) return;
+  dr.resendConfirm = ""; dr.resending[id] = true; render();
+  api.resendDailyReport(id).then(function(res){
+    delete dr.resending[id]; drApply(res.report); render();
+    showToast(res.report.slack.resendError ? "Slack didn’t accept it — "+res.report.slack.resendError : "Report re-sent to Slack.");
+  }).catch(function(e){
+    delete dr.resending[id];
+    if(e && e.data && e.data.report) drApply(e.data.report);
+    showToast((e && e.message) || "Couldn’t reach the server.");
     render();
   });
 }
@@ -7046,6 +7068,9 @@ document.addEventListener("click", function(e){
     case "reload-dr-team": drTeamLoad(); break;
     case "cancel-edit-daily-report": state.dr.edit = null; render(); break;
     case "post-daily-report-update": dailyReportPostUpdate(id); break;
+    case "ask-resend-daily-report": state.dr.resendConfirm = id; render(); break;
+    case "cancel-resend-daily-report": state.dr.resendConfirm = ""; render(); break;
+    case "resend-daily-report-slack": dailyReportResend(id); break;
     case "rp-sync": rpStartSync(el2.getAttribute("data-mode")==="full" ? "full" : "incremental"); break;
     case "rp-tab":
       state.rp.tab = el2.getAttribute("data-tab") || "reports";

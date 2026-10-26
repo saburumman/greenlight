@@ -1152,6 +1152,8 @@ a.rp-key:hover{text-decoration:underline;}
 .dr-slack{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:14px;}
 .dr-slack.is-problem{padding:10px 12px;border-radius:10px;background:var(--warn-bg);border:1px solid var(--warn-border);}
 .dr-slack-main{display:flex;align-items:center;gap:10px;flex-wrap:wrap;min-width:0;}
+.dr-slack-err{color:var(--danger-fg);font-weight:600;}
+.dr-confirm{display:inline-flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:13px;font-weight:600;}
 .dr-slack-note{font-size:12.5px;color:var(--ink-soft);}
 .dr-sec{margin-top:14px;}
 .dr-sec-label{font-size:12px;font-weight:800;color:var(--ink-soft);text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px;}

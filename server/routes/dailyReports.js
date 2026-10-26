@@ -8,6 +8,7 @@
 //   POST /api/daily-reports               save a report, then post it to Slack
 //   POST /api/daily-reports/:id/slack-retry   try the Slack post again for one of your reports
 //   PUT  /api/daily-reports/:id           edit one of your own reports (any date); saves only, never posts
+//   POST /api/daily-reports/:id/slack-resend  post an already-sent report again, marked "Re-sent"
 //   POST /api/daily-reports/:id/slack-update  post an edited report to Slack as a new "Updated" message
 //
 // Order of events on submit: validate -> SAVE (one report per member per day,
@@ -205,6 +206,41 @@ router.put("/:id", asyncHandler(async (req, res) => {
       }]);
     }
     res.json({ report: logic.publicReport(report), changed });
+  });
+}));
+
+router.post("/:id/slack-resend", asyncHandler(async (req, res) => {
+  await withReportLock(req.params.id, res, async () => {
+    const report = await ownReport(req, res);
+    if (!report) return;
+    if (!logic.canResend(report)) {
+      const sync = logic.slackSync(report);
+      const msg = sync === "edit_pending"
+        ? "This report was edited after it was posted — use Post update to Slack."
+        : "This report hasn’t been posted to Slack yet — use Retry Slack to post it.";
+      return res.status(409).json({ error: msg, report: logic.publicReport(report) });
+    }
+    const actor = resolveActor(req.authUser, req.team);
+    const startedAt = new Date().toISOString();
+    const result = await slack.sendMessage(logic.buildReportMessage(report, { resent: true }), { kind: "report" });
+    const s = report.slack;
+    s.lastResendAt = startedAt;
+    if (result.ok) { s.resends = (s.resends || 0) + 1; s.resendError = null; }
+    else s.resendError = result.error;
+    report.updatedAt = new Date().toISOString();
+    try {
+      await db.dailyReports.set(report.id, report);
+    } catch (e) {
+      console.error("daily report: could not record the Slack re-send outcome:", e && e.message);
+    }
+    if (!result.ok) {
+      await recordEvents(db, actor, [{
+        action: "DAILY_REPORT_SLACK_FAILED", entityType: "DailyReport", entityId: report.id,
+        details: "Re-sending the Daily QA report for " + report.reportDate + " to Slack failed — " + result.error,
+        meta: { page: "dailyReport" },
+      }]);
+    }
+    res.json({ report: logic.publicReport(report) });
   });
 }));
 

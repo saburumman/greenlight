@@ -145,6 +145,7 @@ function publicReport(r) {
       // "unsent" (never posted) | "in_sync" (Slack shows the current text) | "edit_pending" (posted, then edited)
       sync: slackSync(r),
       updatesPosted: s.updatesPosted || 0, lastUpdateAt: s.lastUpdateAt || null, updateError: s.updateError || null,
+      resends: s.resends || 0, lastResendAt: s.lastResendAt || null, resendError: s.resendError || null,
     },
   };
 }
@@ -172,6 +173,11 @@ function applyEdit(report, clean, now) {
   // A failed attempt to post an older edit says nothing about this text.
   if (report.slack) report.slack.updateError = null;
   return true;
+}
+// "Re-send to Slack": the report is already there and Slack shows its current
+// text, but the author wants it posted again (message deleted, wrong channel…).
+function canResend(report) {
+  return slackSync(report) === "in_sync";
 }
 function canPostUpdate(report) {
   return slackSync(report) === "edit_pending";
@@ -285,14 +291,17 @@ const DIVIDER = "━━━━━━━━━━━━━━━━━━━━━
 //   Blockers / help needed:
 //   {blockers or None}
 //
+// When `resent` is true (the same text posted again on request) it ends with
+// "· 🔁 Re-sent" instead.
 // When `updated` is true (an edited report posted a second time) the title line
 // ends with "· ✏️ Updated" so the channel can tell the newer message from the
 // earlier one; nothing else changes.
 function buildReportMessage(report, opts) {
   const updated = !!(opts && opts.updated);
+  const resent = !!(opts && opts.resent);
   const blockers = report.blockers && String(report.blockers).trim() ? slackBody(report.blockers) : "None";
   return [
-    "🧪 *Daily QA Update* · " + formatReportDate(report.reportDate) + (updated ? " · ✏️ _Updated_" : ""),
+    "🧪 *Daily QA Update* · " + formatReportDate(report.reportDate) + (updated ? " · ✏️ _Updated_" : resent ? " · 🔁 _Re-sent_" : ""),
     DIVIDER,
     "*Your Name*",
     escapeSlack(report.memberName),
@@ -349,7 +358,7 @@ module.exports = {
   WORKING_WEEKDAYS, weekdayOf, isWorkingDay, addDays,
   ammanParts, reportDateFor, formatReportDate,
   normalizeText, validateSubmission, newSlackState, buildReport, publicReport, canRetrySlack,
-  revisionOf, slackSync, applyEdit, canPostUpdate,
+  revisionOf, slackSync, applyEdit, canPostUpdate, canResend,
   teamReport, matchesSearch, cleanDate, coverage,
   escapeSlack, slackBody, buildReportMessage, buildReminderMessage,
   reminderDue, memberHasRegressionFlag,
