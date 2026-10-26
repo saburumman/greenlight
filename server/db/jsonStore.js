@@ -11,7 +11,8 @@
 //
 // Shape on disk: { releases: { <id>: {...} }, regressionModules: [{id,name,services:[{id,name}]}],
 //                   auditLog: [{id,teamMemberId,userName,action,entityType,entityId,details,meta?,createdAt}],
-//                   testData: { <id>: {...} }, testAccountRelationships: { <id>: {...} }, team: { <id>: {...} },
+//                   testData: { <id>: {...} }, testAccountRelationships: { <id>: {...} },
+//                   dailyReports: { <id>: {...} }, dailyReminders: { <YYYY-MM-DD>: {date,claimedAt} }, team: { <id>: {...} },
 //                   atlassianTokens: { <accountId>: {accountId,accessToken,refreshToken,expiresAt,scope,updatedAt} } }
 //
 // testData is a reusable QA data library — see routes/testData.js. It is
@@ -110,6 +111,8 @@ function ensureStore() {
           auditLog: [],
           testData: {},
           testAccountRelationships: {},
+          dailyReports: {},
+          dailyReminders: {},
           team: buildDefaultTeam(),
           atlassianTokens: {},
         },
@@ -164,6 +167,16 @@ function readAll() {
       parsed.testAccountRelationships = {};
       dirty = true;
     }
+    // Additive: stores created before the Daily QA Report existed just get empty
+    // collections — nothing else about them changes.
+    if (!parsed.dailyReports || typeof parsed.dailyReports !== "object" || Array.isArray(parsed.dailyReports)) {
+      parsed.dailyReports = {};
+      dirty = true;
+    }
+    if (!parsed.dailyReminders || typeof parsed.dailyReminders !== "object" || Array.isArray(parsed.dailyReminders)) {
+      parsed.dailyReminders = {};
+      dirty = true;
+    }
     // Additive: Test Data records saved before Entity became a multi-value
     // field carry a single `entity` string — convert each to the new
     // `entities` array (dropping the old key) so every record has a
@@ -215,6 +228,8 @@ function readAll() {
       auditLog: [],
       testData: {},
       testAccountRelationships: {},
+      dailyReports: {},
+      dailyReminders: {},
       team: buildDefaultTeam(),
       atlassianTokens: {},
     };
@@ -371,6 +386,60 @@ const testAccountRelationships = {
   },
 };
 
+// Daily QA Reports — one per team member per report date (Amman). The
+// uniqueness rule lives here, in the same synchronous read-modify-write as the
+// insert, so two near-simultaneous submits can never both be stored.
+const dailyReports = {
+  async insertIfNew(record) {
+    const data = readAll();
+    const existing = Object.values(data.dailyReports).find(
+      (r) => r && r.teamMemberId === record.teamMemberId && r.reportDate === record.reportDate
+    );
+    if (existing) return { inserted: false, existing };
+    data.dailyReports[record.id] = record;
+    writeAll(data);
+    return { inserted: true, record };
+  },
+  async get(id) {
+    const data = readAll();
+    return data.dailyReports[id] || null;
+  },
+  async set(id, record) {
+    const data = readAll();
+    data.dailyReports[id] = record;
+    writeAll(data);
+    return record;
+  },
+  // This member's reports, newest report date first.
+  async listForMember(memberId, limit) {
+    const data = readAll();
+    return Object.values(data.dailyReports)
+      .filter((r) => r && r.teamMemberId === memberId)
+      .sort((a, b) => String(b.reportDate).localeCompare(String(a.reportDate)))
+      .slice(0, limit || 30);
+  },
+};
+
+// One row per day the reminder was claimed — makes "send the reminder once a
+// day" survive restarts. claim() is true for exactly one caller per date.
+const dailyReminders = {
+  async claim(date) {
+    const data = readAll();
+    if (data.dailyReminders[date]) return false;
+    data.dailyReminders[date] = { date, claimedAt: new Date().toISOString() };
+    writeAll(data);
+    return true;
+  },
+  // Gives the day back when the Slack post failed, so the next tick retries.
+  async release(date) {
+    const data = readAll();
+    if (data.dailyReminders[date]) {
+      delete data.dailyReminders[date];
+      writeAll(data);
+    }
+  },
+};
+
 // "Know the Team" roster — independent of releases, same list/get/set/delete
 // shape as `testData`. Starts from buildDefaultTeam()'s starter entries (see
 // above); every entry is freely editable and deletable from the UI, this is
@@ -429,6 +498,8 @@ module.exports = {
   auditLog,
   testData,
   testAccountRelationships,
+  dailyReports,
+  dailyReminders,
   team,
   atlassianTokens,
   DEFAULT_REGRESSION_MODULES,

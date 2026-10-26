@@ -185,6 +185,9 @@ var api = {
   linkMeToTeamMember: function(id, linked){ return apiCall("PUT","/team/"+id+"/link-me", {linked: !!linked}); },
   setPageAccess: function(id, page, enabled){ return apiCall("PUT","/team/"+id+"/access/"+page, {enabled: !!enabled}); },
   statsActivity: function(){ return apiCall("GET","/statistics/activity"); },
+  dailyReportMe: function(){ return apiCall("GET","/daily-reports/me"); },
+  submitDailyReport: function(data){ return apiCall("POST","/daily-reports", data); },
+  retryDailyReportSlack: function(id){ return apiCall("POST","/daily-reports/"+encodeURIComponent(id)+"/slack-retry"); },
   reportingPing: function(){ return apiCall("GET","/reporting/ping"); },
   reportingSettings: function(){ return apiCall("GET","/reporting/settings"); },
   saveReportingSettings: function(data){ return apiCall("PUT","/reporting/settings", data); },
@@ -263,6 +266,7 @@ var state = {
   statsDenied: false, // the server said 403 (no Statistics access)
   reportingReady: false,
   reportingDenied: false, // the server said 403 (no Reporting access)
+  dr: {ready:false, denied:false, data:null, error:"", form:{today:"",tomorrow:"",blockers:""}, errors:{}, submitting:false, retrying:{}}, // Daily QA Report page
   rp: {dataLayer:false, needsPostgres:false, status:null, settings:null, error:null, saving:false, starting:false, pollTimer:null,
        tab:"reports", filters:null, options:null, presets:[], presetName:"", report:null, reportLoading:false, reportError:null, reportBooting:false, sheetId:"summary", chartTables:{}, exporting:false, deps:null, depsError:null, depStatuses:null},
   assessmentLoggedFor: {}, // releaseId -> true, so AI_ASSESSMENT_GENERATED logs once per viewing, not every re-render
@@ -1037,6 +1041,7 @@ function parseHash(){
   if(h==="audit") return {view:"audit"};
   if(h==="statistics") return {view:"statistics"};
   if(h==="reporting") return {view:"reporting"};
+  if(h==="daily-report") return {view:"dailyReport"};
   if(h==="test-data") return {view:"testData"};
   if(h==="team") return {view:"team"};
   var m = h.match(/^r\/([^\/]+)$/);
@@ -1192,6 +1197,8 @@ function boot(){
     tasks.push(teamTask.then(function(){ return canViewStatistics() ? loadStatsActivity() : null; }));
   } else if(state.route.view==="reporting"){
     tasks.push(teamTask.then(function(){ return canViewReporting() ? loadReportingAccess() : null; }));
+  } else if(state.route.view==="dailyReport"){
+    tasks.push(teamTask.then(function(){ return canUseDailyReport() ? loadDailyReport() : null; }));
   } else if(state.route.view==="testData"){
     tasks.push(loadTestData());
   } else if(state.route.view==="home"){
@@ -1238,6 +1245,8 @@ function render(){
     app.innerHTML = renderAuditLog();
   } else if(state.route.view==="statistics"){
     app.innerHTML = renderStatistics();
+  } else if(state.route.view==="dailyReport"){
+    app.innerHTML = renderDailyReport();
   } else if(state.route.view==="reporting"){
     app.innerHTML = renderReporting();
     rpAfterRender();
@@ -1269,6 +1278,7 @@ var SIDENAV_ITEMS = [
   {icon:"🧪", label:"Test Data", action:"nav-test-data", match:["testData"]},
   {icon:"📊", label:"Statistics", action:"nav-statistics", match:["statistics"], needs:"statistics"},
   {icon:"📑", label:"Reporting", action:"nav-reporting", match:["reporting"], needs:"reporting"},
+  {icon:"📝", label:"Daily QA Report", action:"nav-daily-report", match:["dailyReport"], needs:"dailyReport"},
   {icon:"📋", label:"Audit", action:"nav-audit", match:["audit"]},
   {icon:"👥", label:"Know the Team", action:"nav-team", match:["team"]}
 ];
@@ -1304,7 +1314,7 @@ function accessChangeBlockedReason(target, ap, enable){
 }
 function sidenavHtml(){
   return SIDENAV_ITEMS.filter(function(it){
-    return !it.needs || (it.needs==="statistics" && canViewStatistics()) || (it.needs==="reporting" && canViewReporting());
+    return !it.needs || (it.needs==="statistics" && canViewStatistics()) || (it.needs==="reporting" && canViewReporting()) || (it.needs==="dailyReport" && canUseDailyReport());
   }).map(function(it){
     var active = it.match.indexOf(state.route.view) > -1;
     return '<button type="button" class="sidenav-item'+(active?" active":"")+'" data-action="'+it.action+'">'+
@@ -1398,10 +1408,11 @@ function renderHome(){
     {icon:"🧪", title:"Test Data", desc:"Manage reusable QA test data, scenarios, entities and tags.", btn:"Open Test Data →", action:"nav-test-data"},
     {icon:"📊", title:"Statistics", desc:"See QA workload and activity by date, release and team member.", btn:"Open Statistics →", action:"nav-statistics"},
     {icon:"📑", title:"Reporting", desc:"PMO delivery and variance reporting from Jira, in hours.", btn:"Open Reporting →", action:"nav-reporting"},
+    {icon:"📝", title:"Daily QA Report", desc:"Share today’s QA work, tomorrow’s plan and any blockers with the team.", btn:"Submit a Report →", action:"nav-daily-report"},
     {icon:"📋", title:"Audit", desc:"Track important changes and see who performed them.", btn:"View Audit →", action:"nav-audit"},
     {icon:"👥", title:"Know the Team", desc:"Meet the people behind the quality.", btn:"Meet the Team →", action:"nav-team"}
   ].filter(function(c){
-    return (c.action!=="nav-statistics" || canViewStatistics()) && (c.action!=="nav-reporting" || canViewReporting());
+    return (c.action!=="nav-statistics" || canViewStatistics()) && (c.action!=="nav-reporting" || canViewReporting()) && (c.action!=="nav-daily-report" || canUseDailyReport());
   });
   var cardsHtml = '<section class="home-section"><div class="feature-grid">'+
     cards.map(function(c){
@@ -1550,7 +1561,9 @@ var AUDIT_ACTION_LABELS = {
   REPORT_SYNC_RUN: "Ran Reporting Sync",
   REPORT_SETTINGS_UPDATED: "Changed Reporting Sync Settings",
   REPORT_EXPORTED: "Exported a Report",
-  REPORT_DEPENDENCY_CHANGED: "Changed a Reporting Dependency"
+  REPORT_DEPENDENCY_CHANGED: "Changed a Reporting Dependency",
+  DAILY_REPORT_SUBMITTED: "Submitted Daily QA Report",
+  DAILY_REPORT_SLACK_FAILED: "Daily QA Report Not Posted to Slack"
 };
 function humanizeAuditAction(action){
   return AUDIT_ACTION_LABELS[action] || action;
@@ -1907,6 +1920,165 @@ function renderStatisticsNoAccess(){
    Phase 0: the page shell. The Jira data layer (Phase 1) and the reports and
    exports (Phases 2–3) are built on top of it.
    ============================================================ */
+/* ============================================================
+   DAILY QA REPORT
+   Today / Tomorrow / Blockers, one report per team member per day (Amman).
+   The author is always the signed-in person's Know the Team card (the server
+   decides; there is no name field). The server saves the report first and then
+   posts it to Slack; if Slack fails the report is still saved and "Retry Slack"
+   tries again. Available to members with the regression flag on.
+   ============================================================ */
+function canUseDailyReport(){
+  var me = currentMember();
+  return !!(me && me.regression!==false);
+}
+function loadDailyReport(){
+  return api.dailyReportMe().then(function(d){
+    state.dr.data = d; state.dr.denied = false; state.dr.error = ""; state.dr.ready = true;
+  }).catch(function(e){
+    state.dr.ready = true;
+    if(e && e.status===403){ state.dr.denied = true; return; }
+    state.dr.error = (e && e.message) || "Couldn’t load the Daily QA Report.";
+  });
+}
+function renderDailyReportNoAccess(){
+  var me = currentMember();
+  var why = !me
+    ? 'Link your sign-in to your <b>Know the Team</b> entry first (top bar → Link to team) — your report is filed under that entry.'
+    : 'The Daily QA Report is for team members who are <b>available for regression assignment</b>. Ask a teammate to switch that on for you in Know the Team → Edit.';
+  return '<div class="list-head"><div><h1>Daily QA Report</h1></div></div>'+
+    '<div class="empty-state"><h3>You don’t have access to the Daily QA Report</h3><p>'+why+'</p></div>';
+}
+// Where this report stands with Slack, plus the retry button when it isn't there yet.
+function drSlackStatusHtml(rep){
+  var s = rep.slack || {status:"pending"};
+  var retrying = !!state.dr.retrying[rep.id];
+  var retryBtn = '<button type="button" class="btn btn-sm" data-action="retry-daily-report-slack" data-id="'+escAttr(rep.id)+'"'+(retrying?" disabled":"")+'>'+
+    (retrying ? '<span class="spinner"></span> Sending…' : iconRefresh()+' Retry Slack')+'</button>';
+  if(s.status==="sent"){
+    return '<div class="dr-slack is-sent"><span class="pill tone-go"><span class="pill-dot"></span>Sent to Slack</span>'+
+      (s.sentAt ? '<span class="dr-slack-note">'+esc(fmtDateTime(s.sentAt)||"")+'</span>' : '')+'</div>';
+  }
+  var title = s.status==="not_configured" ? "Saved — Slack isn’t set up yet" : s.status==="failed" ? "Saved — couldn’t post to Slack" : "Saved — not posted to Slack yet";
+  return '<div class="dr-slack is-problem" role="status"><div class="dr-slack-main"><span class="pill tone-warn"><span class="pill-dot"></span>'+esc(title)+'</span>'+
+    (s.error ? '<span class="dr-slack-note">'+esc(s.error)+'</span>' : '')+'</div>'+retryBtn+'</div>';
+}
+function drSectionsHtml(rep){
+  function sec(label, text){ return '<div class="dr-sec"><div class="dr-sec-label">'+esc(label)+'</div><div class="dr-sec-text">'+esc(text)+'</div></div>'; }
+  return sec("Today", rep.today)+sec("Tomorrow", rep.tomorrow)+sec("Blockers / help needed", rep.blockers && rep.blockers.trim() ? rep.blockers : "None");
+}
+function drFieldHtml(key, label, required, rows, placeholder, hint){
+  var dr = state.dr, err = dr.errors[key];
+  return '<div class="field dr-field">'+
+    '<label for="dr-'+key+'">'+esc(label)+(required ? ' <span class="dr-req" title="Required">*</span>' : ' <span class="hint">(optional)</span>')+'</label>'+
+    '<textarea id="dr-'+key+'" rows="'+rows+'" placeholder="'+escAttr(placeholder)+'"'+(err?' class="is-invalid" aria-invalid="true"':'')+(required?' required':'')+(dr.submitting?' disabled':'')+'>'+esc(dr.form[key]||"")+'</textarea>'+
+    (hint ? '<div class="hint">'+esc(hint)+'</div>' : '')+
+    (err ? '<div class="dr-err" data-for="'+key+'" role="alert">'+esc(err)+'</div>' : '')+
+  '</div>';
+}
+function drFormHtml(d){
+  var dr = state.dr;
+  return '<form id="daily-report-form" class="card dr-card" novalidate>'+
+    '<div class="dr-name"><span class="dr-avatar" aria-hidden="true">'+iconUser()+'</span>'+
+      '<div><div class="dr-name-label">Your Name</div><div class="dr-name-value">'+esc(d.member.name)+'</div></div>'+
+      '<div class="dr-date">'+esc(d.reportDateLabel)+'<span> · Amman</span></div></div>'+
+    drFieldHtml("today", "Today", true, 6, "What did you work on today? One item per line works well:\nSurvey\nDevice Binding\nFamily Record", "")+
+    drFieldHtml("tomorrow", "Tomorrow", true, 4, "What are you planning to work on next working day?\nExample: Completion Rate", "")+
+    drFieldHtml("blockers", "Blockers / help needed", false, 3, "Anything blocking you or needing help — or type “None”", "")+
+    '<div class="dr-actions"><button type="submit" class="btn btn-primary" id="dr-submit"'+(dr.submitting?" disabled":"")+'>'+
+      (dr.submitting ? '<span class="spinner"></span> Submitting…' : 'Submit Report')+'</button>'+
+      '<span class="helper-text">Saved first, then posted to Slack. One report per day.</span></div>'+
+  '</form>';
+}
+function drTodayCardHtml(d){
+  var rep = d.today;
+  return '<section class="card dr-card"><div class="dr-card-head"><div><h2>Today’s report</h2><p class="helper-text">'+esc(d.reportDateLabel)+' · submitted by '+esc(rep.memberName)+'</p></div>'+
+    '<span class="pill tone-go"><span class="pill-dot"></span>Submitted</span></div>'+
+    drSlackStatusHtml(rep)+drSectionsHtml(rep)+
+    '<p class="helper-text dr-once">You’ve submitted today’s report — the next one opens tomorrow.</p></section>';
+}
+function drHistoryHtml(d){
+  var rows = (d.history||[]).filter(function(r){ return !d.today || r.id!==d.today.id; });
+  if(!rows.length) return "";
+  return '<section class="card dr-card"><div class="dr-card-head"><h2>Your recent reports</h2></div><div class="dr-history">'+
+    rows.map(function(r){
+      var s = r.slack && r.slack.status;
+      var chip = s==="sent" ? '<span class="pill tone-go"><span class="pill-dot"></span>Sent</span>' : '<span class="pill tone-warn"><span class="pill-dot"></span>Not sent</span>';
+      return '<details class="dr-hist-item"><summary><span class="dr-hist-date">'+esc(drDateLabel(r.reportDate))+'</span>'+chip+'</summary>'+
+        '<div class="dr-hist-body">'+(s==="sent" ? "" : drSlackStatusHtml(r))+drSectionsHtml(r)+'</div></details>';
+    }).join("")+'</div></section>';
+}
+// "2026-10-26" -> "Mon 26 Oct 2026" (a plain calendar date, no time-zone maths)
+function drDateLabel(ymd){
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd||""));
+  if(!m) return String(ymd||"");
+  var dt = new Date(Date.UTC(+m[1], +m[2]-1, +m[3]));
+  return ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][dt.getUTCDay()]+" "+(+m[3])+" "+["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][+m[2]-1]+" "+m[1];
+}
+function renderDailyReport(){
+  var head = '<div class="list-head"><div><h1>Daily QA Report</h1><p>Share what you worked on today and what’s next. Submitting posts your update to Slack.</p></div></div>';
+  if(!state.teamReady) return head+'<div class="empty-state"><h3>Loading…</h3></div>';
+  if(!canUseDailyReport() || state.dr.denied) return renderDailyReportNoAccess();
+  var dr = state.dr, d = dr.data;
+  if(!d){
+    return head+'<div class="empty-state"><h3>Can’t load the Daily QA Report</h3><p>'+esc(dr.error||"Please try again.")+'</p>'+
+      '<div style="margin-top:14px;"><button type="button" class="btn" data-action="reload-daily-report">'+iconRefresh()+' Try again</button></div></div>';
+  }
+  var banner = d.slackConfigured ? "" :
+    '<div class="dr-banner" role="status">Slack isn’t set up on the server yet, so reports are saved here but not posted. Once <code>SLACK_WEBHOOK_URL</code> is set, use <b>Retry Slack</b> to send them.</div>';
+  return head+banner+'<div class="dr-wrap">'+(d.today ? drTodayCardHtml(d) : drFormHtml(d))+drHistoryHtml(d)+'</div>';
+}
+// Puts a report the server just returned into the page's data (today + history).
+function drApply(rep){
+  var d = state.dr.data; if(!rep || !d) return;
+  if(rep.reportDate===d.reportDate) d.today = rep;
+  var i = (d.history||[]).findIndex(function(x){ return x.id===rep.id; });
+  if(i>-1) d.history[i] = rep; else (d.history = d.history||[]).unshift(rep);
+}
+function drSlackToast(rep){
+  var s = rep.slack && rep.slack.status;
+  if(s==="sent") return "Report submitted and posted to Slack.";
+  if(s==="not_configured") return "Report saved. Slack isn’t set up yet, so nothing was posted.";
+  return "Report saved, but posting to Slack failed — use Retry Slack.";
+}
+function dailyReportSubmit(){
+  var dr = state.dr; if(dr.submitting) return;
+  var f = dr.form, errors = {};
+  if(!String(f.today||"").trim()) errors.today = "Tell the team what you worked on today.";
+  if(!String(f.tomorrow||"").trim()) errors.tomorrow = "Tell the team what you plan to work on tomorrow.";
+  dr.errors = errors;
+  if(Object.keys(errors).length){
+    render();
+    var first = qs("#dr-"+Object.keys(errors)[0]); if(first) first.focus();
+    return;
+  }
+  dr.submitting = true; render();
+  api.submitDailyReport({today:f.today, tomorrow:f.tomorrow, blockers:f.blockers}).then(function(res){
+    dr.submitting = false; dr.errors = {}; dr.form = {today:"", tomorrow:"", blockers:""};
+    drApply(res.report); render();
+    showToast(drSlackToast(res.report));
+  }).catch(function(e){
+    dr.submitting = false;
+    if(e && e.status===409 && e.data && e.data.report){ drApply(e.data.report); showToast(e.message); }
+    else if(e && e.status===400 && e.data && e.data.fields){ dr.errors = e.data.fields; }
+    else showToast((e && e.message) || "Couldn’t save the report.");
+    render();
+  });
+}
+function dailyReportRetry(id){
+  var dr = state.dr; if(!id || dr.retrying[id]) return;
+  dr.retrying[id] = true; render();
+  api.retryDailyReportSlack(id).then(function(res){
+    delete dr.retrying[id]; drApply(res.report); render();
+    showToast(res.report.slack.status==="sent" ? "Posted to Slack." : "Slack still didn’t accept it — "+(res.report.slack.error||"try again in a moment")+"");
+  }).catch(function(e){
+    delete dr.retrying[id];
+    if(e && e.data && e.data.report) drApply(e.data.report);
+    showToast((e && e.message) || "Couldn’t reach the server.");
+    render();
+  });
+}
+
 function renderReportingNoAccess(){
   var me = currentMember();
   var why = !me
@@ -6579,6 +6751,9 @@ document.addEventListener("click", function(e){
     case "nav-audit": goTo("#/audit"); break;
     case "nav-statistics": goTo("#/statistics"); break;
     case "nav-reporting": goTo("#/reporting"); break;
+    case "nav-daily-report": goTo("#/daily-report"); break;
+    case "reload-daily-report": boot(); break;
+    case "retry-daily-report-slack": dailyReportRetry(id); break;
     case "rp-sync": rpStartSync(el2.getAttribute("data-mode")==="full" ? "full" : "incremental"); break;
     case "rp-tab":
       state.rp.tab = el2.getAttribute("data-tab") || "reports";
@@ -6940,6 +7115,7 @@ document.addEventListener("click", function(e){
 document.addEventListener("submit", function(e){
   if(e.target && e.target.id==="rp-settings-form"){ e.preventDefault(); rpSaveSettings(); }
   if(e.target && e.target.id==="rp-dep-form"){ e.preventDefault(); rpSaveDep(e.target); }
+  if(e.target && e.target.id==="daily-report-form"){ e.preventDefault(); dailyReportSubmit(); }
 });
 
 document.addEventListener("change", function(e){
@@ -7027,6 +7203,18 @@ document.addEventListener("click", function(e){
 
 var rpSearchTimer = null;
 document.addEventListener("input", function(e){
+  if(e.target && (e.target.id==="dr-today" || e.target.id==="dr-tomorrow" || e.target.id==="dr-blockers")){
+    // Keep what's typed in state (a re-render never loses it) and clear that
+    // field's error as soon as the person starts fixing it.
+    var drKey = e.target.id.slice(3);
+    state.dr.form[drKey] = e.target.value;
+    if(state.dr.errors[drKey]){
+      delete state.dr.errors[drKey];
+      e.target.classList.remove("is-invalid"); e.target.removeAttribute("aria-invalid");
+      var drErr = qs('.dr-err[data-for="'+drKey+'"]'); if(drErr) drErr.remove();
+    }
+    return;
+  }
   if(e.target && e.target.id==="rp-preset-name"){ state.rp.presetName = e.target.value; return; }
   if(e.target && e.target.id==="rp-dep-search"){
     var rpForm = document.getElementById("rp-dep-form"), rpq = e.target.value;

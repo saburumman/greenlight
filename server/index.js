@@ -11,6 +11,7 @@ const testDataRouter = require("./routes/testData");
 const teamRouter = require("./routes/team");
 const statisticsRouter = require("./routes/statistics");
 const reportingRouter = require("./routes/reporting");
+const dailyReportsRouter = require("./routes/dailyReports");
 const authRouter = require("./routes/auth");
 const oauth = require("./auth/atlassianOAuth");
 const { requireAuth } = require("./auth/middleware");
@@ -19,6 +20,8 @@ const db = require("./db");
 const { migrateAllReleases } = require("./migrateAssignments");
 const reportingService = require("./reportingService");
 const { recordEvents } = require("./auditWriter");
+const dailyReportReminder = require("./dailyReportReminder");
+const slack = require("./slack");
 
 // Authentication is mandatory — there is no guest fallback. Refuse to start
 // at all unless every Atlassian login variable is set, rather than silently
@@ -55,6 +58,8 @@ app.use("/api/regression-modules", regressionModulesRouter);
 app.use("/api/audit", auditRouter);
 app.use("/api/test-data", testDataRouter);
 app.use("/api/team", teamRouter);
+// Daily QA Report: guarded by pageAccess.requireDailyReportAccess (regression flag).
+app.use("/api/daily-reports", dailyReportsRouter);
 // Restricted areas: every route inside is guarded by pageAccess.requirePageAccess.
 app.use("/api/statistics", statisticsRouter);
 app.use("/api/reporting", reportingRouter);
@@ -98,6 +103,13 @@ app.listen(PORT, HOST, () => {
         details: "Scheduled Reporting sync (" + mode + ") started.", meta: { page: "reporting" },
       }])
     );
+  }
+  // Daily QA Update reminder (3:45 PM Asia/Amman) — only when Slack is set up.
+  if (slack.isConfigured("reminder")) {
+    dailyReportReminder.start();
+    console.log("  Daily QA reminder: scheduled for 3:45 PM Asia/Amman\n");
+  } else {
+    console.log("  Daily QA reminder: off (set SLACK_WEBHOOK_URL to post the daily reports and the reminder to Slack)\n");
   }
   // Moves any name-based QA assignments (older releases) onto Know the Team
   // member ids. Idempotent; a no-op once everything is converted.

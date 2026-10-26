@@ -86,7 +86,41 @@ function requirePageAccess(page) {
   });
 }
 
+// ---- Daily QA Report ----
+// Not an opt-in flag like Statistics/Reporting: it follows the regression flag
+// ("Available for regression assignment" in Know the Team), so the whole QA
+// team is in by default and a person is only left out by switching that off.
+// The caller must still be linked to a Know the Team card (that card IS their
+// identity on the report). Pure -> { ok:true, member } | { ok:false, status, error }
+function dailyReportAccess(authUser, team) {
+  const { memberHasRegressionFlag } = require("./dailyReportLogic");
+  const member = memberForUser(authUser, team);
+  if (!member) {
+    return { ok: false, status: 403, error: "Link your sign-in to your Know the Team entry first (top bar → Link to team) to use the Daily QA Report." };
+  }
+  if (!memberHasRegressionFlag(member)) {
+    return { ok: false, status: 403, error: "The Daily QA Report is for team members who are available for regression assignment." };
+  }
+  return { ok: true, member };
+}
+// Express guard for every Daily QA Report route; puts the caller's card on
+// req.dailyMember (the report's author is always this member).
+function requireDailyReportAccess() {
+  const { asyncHandler } = require("./asyncHandler");
+  return asyncHandler(async (req, res, next) => {
+    const db = require("./db");
+    const team = await db.team.list();
+    const access = dailyReportAccess(req.authUser, team);
+    if (!access.ok) return res.status(access.status).json({ error: access.error, page: "dailyReport" });
+    req.dailyMember = access.member;
+    req.team = team;
+    next();
+  });
+}
+
 module.exports = {
+  dailyReportAccess,
+  requireDailyReportAccess,
   RESTRICTED_PAGES,
   pageConfig,
   memberForUser,

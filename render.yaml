@@ -56,3 +56,11 @@ services:
         sync: false
       - key: GEMINI_MODEL
         sync: false
+
+      # ---- Slack: Daily QA Report + reminder (optional) -------------------
+      # Incoming Webhook URL of the channel the daily reports are posted to.
+      # Leave empty to keep reports in Greenlight only.
+      - key: SLACK_WEBHOOK_URL
+        sync: false
+      - key: SLACK_REMINDER_WEBHOOK_URL
+        sync: false

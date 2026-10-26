@@ -66,6 +66,8 @@ const VALID_ACTIONS = new Set([
   "REPORT_SETTINGS_UPDATED",
   "REPORT_EXPORTED",
   "REPORT_DEPENDENCY_CHANGED",
+  "DAILY_REPORT_SUBMITTED",
+  "DAILY_REPORT_SLACK_FAILED",
 ]);
 
 // Assignment events and regression status changes are written by the SERVER
@@ -94,6 +96,8 @@ const SERVER_ONLY_ACTIONS = new Set([
   "REPORT_SETTINGS_UPDATED",
   "REPORT_EXPORTED",
   "REPORT_DEPENDENCY_CHANGED",
+  "DAILY_REPORT_SUBMITTED",
+  "DAILY_REPORT_SLACK_FAILED",
 ]);
 
 // Who changed whose access to a restricted page, and Reporting sync/settings

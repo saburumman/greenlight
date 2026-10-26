@@ -247,3 +247,22 @@ create table if not exists reporting_dependencies (
   updated_at timestamptz not null default now(),
   constraint reporting_dependencies_status check (status in ('Requested','In progress','Received','Cancelled'))
 );
+
+-- Daily QA Report (one per team member per Amman date) + the once-a-day Slack
+-- reminder claim. Same as migrations/0006_daily_qa_reports.sql.
+create table if not exists daily_qa_reports (
+  id uuid primary key,
+  team_member_id text not null,
+  report_date text not null check (report_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'),
+  data jsonb not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint daily_qa_reports_one_per_member_per_day unique (team_member_id, report_date)
+);
+comment on table daily_qa_reports is 'Daily QA Report: today / tomorrow / blockers per team member per Amman date, plus the Slack delivery outcome (data.slack) — see server/dailyReportLogic.js.';
+create index if not exists idx_daily_qa_reports_member_date on daily_qa_reports (team_member_id, report_date desc);
+
+create table if not exists daily_qa_reminders (
+  report_date text primary key,
+  claimed_at timestamptz not null default now()
+);

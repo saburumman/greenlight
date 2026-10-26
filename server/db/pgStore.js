@@ -328,4 +328,91 @@ function rowToTokenRecord(row) {
   };
 }
 
-module.exports = { releases, regressionModules, auditLog, testData, testAccountRelationships, team, atlassianTokens };
+// Daily QA Reports. The document is JSONB like its siblings, but the owner and
+// the report date are real columns under a UNIQUE constraint, so the database
+// itself guarantees one report per team member per day even if two requests
+// race. No foreign key to `team` on purpose: removing a person from Know the
+// Team must not erase the reports they already submitted (the name is stored on
+// the report). Tables are created on first use (idempotent) — also available as
+// supabase/migrations/0006_daily_qa_reports.sql.
+const DAILY_DDL = `
+create table if not exists daily_qa_reports (
+  id uuid primary key,
+  team_member_id text not null,
+  report_date text not null check (report_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'),
+  data jsonb not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  constraint daily_qa_reports_one_per_member_per_day unique (team_member_id, report_date)
+);
+create index if not exists idx_daily_qa_reports_member_date on daily_qa_reports (team_member_id, report_date desc);
+create table if not exists daily_qa_reminders (
+  report_date text primary key,
+  claimed_at timestamptz not null default now()
+);
+`;
+let dailyTablePromise = null;
+function ensureDailyTables() {
+  if (!dailyTablePromise) {
+    dailyTablePromise = pgPool.query(DAILY_DDL).catch((e) => {
+      dailyTablePromise = null;
+      throw e;
+    });
+  }
+  return dailyTablePromise;
+}
+const dailyReports = {
+  async insertIfNew(record) {
+    await ensureDailyTables();
+    const { rows } = await pgPool.query(
+      `INSERT INTO daily_qa_reports (id, team_member_id, report_date, data, created_at, updated_at)
+       VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+       ON CONFLICT (team_member_id, report_date) DO NOTHING
+       RETURNING data`,
+      [record.id, record.teamMemberId, record.reportDate, JSON.stringify(record), isoOrNow(record.createdAt), isoOrNow(record.updatedAt)]
+    );
+    if (rows.length) return { inserted: true, record: rows[0].data };
+    const found = await pgPool.query(
+      `SELECT data FROM daily_qa_reports WHERE team_member_id = $1 AND report_date = $2`,
+      [record.teamMemberId, record.reportDate]
+    );
+    return { inserted: false, existing: found.rows.length ? found.rows[0].data : null };
+  },
+  async get(id) {
+    await ensureDailyTables();
+    const { rows } = await pgPool.query(`SELECT data FROM daily_qa_reports WHERE id = $1`, [id]);
+    return rows.length ? rows[0].data : null;
+  },
+  async set(id, record) {
+    await ensureDailyTables();
+    await pgPool.query(
+      `UPDATE daily_qa_reports SET data = $2::jsonb, updated_at = $3 WHERE id = $1`,
+      [id, JSON.stringify(record), isoOrNow(record.updatedAt)]
+    );
+    return record;
+  },
+  async listForMember(memberId, limit) {
+    await ensureDailyTables();
+    const { rows } = await pgPool.query(
+      `SELECT data FROM daily_qa_reports WHERE team_member_id = $1 ORDER BY report_date DESC LIMIT $2`,
+      [memberId, limit || 30]
+    );
+    return rows.map((r) => r.data);
+  },
+};
+const dailyReminders = {
+  async claim(date) {
+    await ensureDailyTables();
+    const { rows } = await pgPool.query(
+      `INSERT INTO daily_qa_reminders (report_date) VALUES ($1) ON CONFLICT (report_date) DO NOTHING RETURNING report_date`,
+      [date]
+    );
+    return rows.length > 0;
+  },
+  async release(date) {
+    await ensureDailyTables();
+    await pgPool.query(`DELETE FROM daily_qa_reminders WHERE report_date = $1`, [date]);
+  },
+};
+
+module.exports = { releases, regressionModules, auditLog, testData, testAccountRelationships, dailyReports, dailyReminders, team, atlassianTokens };

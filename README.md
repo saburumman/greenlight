@@ -264,11 +264,40 @@ Click **⬆ Import** (next to Add Test Data) and pick a **CSV** file — export 
 
 Import support is CSV-only for now — not raw `.xlsx` — since parsing real Excel binaries needs a third-party library, and the option on npm currently carries an unpatched high-severity vulnerability. CSV covers the same data with no new dependency.
 
+## Daily QA Report
+
+**Sidebar → Daily QA Report** (`#/daily-report`) is a short end-of-day form. Each QA member files one report a day; it is saved in Greenlight and posted to a Slack channel.
+
+- **The form** has **Your Name** (filled in from your Know the Team card — there is nothing to type), **Today** (required, several items allowed — one per line works well), **Tomorrow** (required) and **Blockers / help needed** (optional — leave it empty or type "None"), and a **Submit Report** button. The report date is today's date in Jordan (Asia/Amman), set by the server.
+- **Who can use it:** signed-in people linked to their Know the Team card whose **Available for regression assignment** switch is on (the same flag that makes someone a QA member everywhere else; a member saved before that switch existed counts as on). Anyone else doesn't see the menu item or landing card and gets a "no access" message; the server refuses their requests too.
+- **One report per person per day.** A second submit is refused (and shows the report you already filed); the database enforces it with a unique constraint on member + date, so two clicks or two tabs can't create two reports. Whoever you are is always your Know the Team card — the browser can't submit on someone else's behalf.
+- **Save first, then Slack.** The report is stored before anything is sent. If Slack fails (not set up, offline, wrong webhook), the report stays saved, the page says so, and **Retry Slack** posts it again — never twice (a report already posted can't be re-sent). Failed posts are also noted in the Audit Log (without the report text).
+- **The Slack message** (one message per report — no separate "X submitted" notice) follows the template below, using Slack's own bold (`*…*`). Whatever people type is escaped, so `<!channel>`, mentions and links can't be smuggled in, and typed `-` / `*` bullets become `•`. The report date is shown on the title line.
+
+```
+🧪 Daily QA Update · Mon 26 Oct 2026
+━━━━━━━━━━━━━━━━━━━━━━
+Your Name
+{team member name}
+
+Today:
+{today}
+
+Tomorrow:
+{tomorrow}
+
+Blockers / help needed:
+{blockers, or None}
+```
+
+- **The daily reminder** is a separate Slack message sent every day at **3:45 PM Asia/Amman** (if the server was down at that minute it still goes out up to two hours late, and never twice a day — the day is claimed in the database first): "⏰ Daily QA Update Reminder — Please remember to submit your Daily QA Update for today." plus a link to the page. It never names anyone or implies a report was submitted. It runs inside the server (so it needs the service to be running — Render's `starter` plan or above, not a sleeping free instance).
+- **Setup:** create an [Incoming Webhook](https://api.slack.com/messaging/webhooks) for the channel and set `SLACK_WEBHOOK_URL` (a secret — environment only; it is never sent to the browser or logged, and only `hooks.slack.com` addresses are accepted). Optionally `SLACK_REMINDER_WEBHOOK_URL` sends the reminder to a different channel. Without `SLACK_WEBHOOK_URL` reports are still saved and a banner on the page says Slack isn't set up; no reminder is sent. On Postgres the two tables (`daily_qa_reports`, `daily_qa_reminders`) are created automatically on first use; `supabase/migrations/0006_daily_qa_reports.sql` does the same by hand.
+
 ## Home / Landing page
 
 The root URL (`/`) is now a landing page instead of the releases list (which moved to its own explicit `/#/releases` route — every existing "back to releases" link and the sidebar's **Release Monitor** item still take you there). It's intentionally lightweight — an orientation and jumping-off point, not another full dashboard:
 
-- A short welcome section, quick-access cards straight to Release Monitor, Test Data, Statistics, Audit, and Know the Team.
+- A short welcome section, quick-access cards straight to Release Monitor, Test Data, Statistics, Reporting, Daily QA Report, Audit, and Know the Team (Statistics, Reporting and Daily QA Report only for people who have access).
 - **At a Glance** — Active Releases, Open Blockers, Releases with GO, and Releases with NO-GO, computed live from your existing release data (the same `computeAssessment()` engine used everywhere else) — never invented or hardcoded numbers.
 - **Recent Releases** — the 5 most recently updated releases with their current status, linking straight to each release's page, plus a "View all releases" link.
 - **Recent Activity** — the 5 most recent Audit Log entries, shown only when the Audit Log already has data. Viewing the landing page itself never writes a new audit entry.
@@ -326,7 +355,10 @@ greenlight-app/
     assignmentLogic.js       — team-member-id assignment model: legacy name→id migration, actor resolution, save-diff → audit events
     auditWriter.js           — builds/writes audit entries (teamMemberId + allow-listed meta)
     migrateAssignments.js    — startup pass that migrates stored releases to the id-based model
-    pageAccess.js            — restricted-page access rules + the requirePageAccess(page) guard (Statistics, Reporting)
+    pageAccess.js            — restricted-page access rules + the requirePageAccess(page) guard (Statistics, Reporting) and the Daily QA Report guard
+    dailyReportLogic.js      — Daily QA Report: validation, Amman dates, Slack message text, reminder timing, access rule (pure, no I/O)
+    slack.js                 — posts to a Slack Incoming Webhook (built-in fetch, no dependency); the URL is never logged or exposed
+    dailyReportReminder.js   — the 3:45 PM Asia/Amman reminder (claims the day in the database so it is sent once)
     reportingLogic.js        — Reporting: Jira issue → cache rows + derived fields (hours, variance, lifecycle, blocked days); pure, no I/O
     reportingJira.js         — Reporting: read-only Jira HTTP (pagination, 429/5xx backoff with Retry-After)
     reportingStore.js        — Reporting: Postgres tables + queries for the Jira cache
@@ -354,13 +386,14 @@ greenlight-app/
       reporting.js                — guarded Reporting API (settings, sync, report JSON, Excel/CSV downloads, dependencies, presets)
       team.js                      — Know the Team CRUD, "This is me" link, per-page access switches
       testData.js               — the reusable Test Data library CRUD endpoints + Related Test Accounts (links between records)
+      dailyReports.js            — Daily QA Report API (save, then post to Slack; retry); guarded by the regression-flag rule
       auth.js                  — /auth/login, /auth/callback, /auth/logout, /auth/me
   public/
     index.html, styles.css, app.js  — the dashboard itself (no build step, no framework)
     reportingCharts.js              — Reporting charts (SVG; shared by the page and the server-side Excel export)
   data/                    — created automatically when running on the JSON-file backend; your releases, audit log, and every signed-in user's own Jira OAuth tokens live here
   supabase/
-    migrations/             — incremental SQL (0002 adds audit_log.team_member_id / meta; 0003 adds the Reporting cache tables, 0004 the dependency tracker, 0005 the Related Test Accounts table; the app also creates all of these automatically)
+    migrations/             — incremental SQL (0002 adds audit_log.team_member_id / meta; 0003 adds the Reporting cache tables, 0004 the dependency tracker, 0005 the Related Test Accounts table, 0006 the Daily QA Report tables; the app also creates all of these automatically)
     schema.sql              — the Postgres table definitions (run once against a new database — see "Deploying to Render + Supabase" below)
   scripts/
     migrate-json-to-supabase.js  — one-time (safely re-runnable) import of an existing data/store.json into Postgres
@@ -437,6 +470,7 @@ In the service's **Environment** tab:
 | `ATLASSIAN_CLIENT_ID` / `ATLASSIAN_CLIENT_SECRET` | Yes | From your Atlassian OAuth app — and update its callback URL registration to match the `APP_BASE_URL` above. |
 | `SESSION_SECRET` | Yes | Generate with `openssl rand -hex 32` (or let Render generate it — `render.yaml` does this for you). |
 | `GEMINI_API_KEY` / `GEMINI_MODEL` | No | Optional AI-assisted Release Notes — see "Release notes" above. |
+| `SLACK_WEBHOOK_URL` / `SLACK_REMINDER_WEBHOOK_URL` | No | Slack Incoming Webhook(s) for the Daily QA Report and its 3:45 PM Asia/Amman reminder — see "Daily QA Report" above. Without it reports are saved but not posted. |
 | `MYMEMORY_CONTACT_EMAIL` | No | Raises the free Arabic-translation fallback's daily quota (see "Mobile Release Note" above) — MyMemory's anonymous tier is capped low enough that routine testing can hit a `429` error; including a contact email in the request raises that cap. Set to any address you're fine with MyMemory seeing (used only for their own abuse contact, never shown to end users). |
 
 `DATABASE_SSL` doesn't need to be set on Render — the app connects to Supabase over TLS by default.
