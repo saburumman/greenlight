@@ -399,6 +399,21 @@ const dailyReports = {
     );
     return rows.map((r) => r.data);
   },
+  async listRange(from, to) {
+    await ensureDailyTables();
+    const { rows } = await pgPool.query(
+      `SELECT data FROM daily_qa_reports
+        WHERE ($1::text IS NULL OR report_date >= $1) AND ($2::text IS NULL OR report_date <= $2)
+        ORDER BY report_date DESC, data->>'memberName' ASC`,
+      [from || null, to || null]
+    );
+    return rows.map((r) => r.data);
+  },
+  async listAllDates() {
+    await ensureDailyTables();
+    const { rows } = await pgPool.query(`SELECT team_member_id, report_date FROM daily_qa_reports`);
+    return rows.map((r) => ({ teamMemberId: r.team_member_id, reportDate: r.report_date }));
+  },
 };
 const dailyReminders = {
   async claim(date) {

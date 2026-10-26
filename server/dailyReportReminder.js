@@ -1,4 +1,5 @@
-// The Daily QA Update reminder: ONE Slack message a day at 3:45 PM Asia/Amman,
+// The Daily QA Update reminder: ONE Slack message a working day (Sunday to
+// Thursday) at 3:45 PM Asia/Amman,
 // separate from the reports themselves. It only reminds — it never names
 // anyone and never implies a report has been submitted.
 //
@@ -22,6 +23,7 @@ let lastFailureAt = 0;
 async function tick(now) {
   const at = now instanceof Date ? now : new Date(now || Date.now());
   if (!slack.isConfigured("reminder")) return { skipped: "not_configured" };
+  if (!logic.isWorkingDay(logic.reportDateFor(at))) return { skipped: "weekend" };
   if (!logic.reminderDue(at)) return { skipped: "not_due" };
   if (lastFailureAt && at.getTime() - lastFailureAt < RETRY_AFTER_FAILURE_MS) return { skipped: "backing_off" };
   const date = logic.reportDateFor(at);

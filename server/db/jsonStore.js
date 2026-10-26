@@ -418,6 +418,19 @@ const dailyReports = {
       .sort((a, b) => String(b.reportDate).localeCompare(String(a.reportDate)))
       .slice(0, limit || 30);
   },
+  // Everyone's reports with from <= reportDate <= to (either bound optional),
+  // newest first (then by name so the order is stable).
+  async listRange(from, to) {
+    const data = readAll();
+    return Object.values(data.dailyReports)
+      .filter((r) => r && (!from || r.reportDate >= from) && (!to || r.reportDate <= to))
+      .sort((a, b) => String(b.reportDate).localeCompare(String(a.reportDate)) || String(a.memberName).localeCompare(String(b.memberName)));
+  },
+  // Just the (member, date) pairs of every report — what the Statistics counts need.
+  async listAllDates() {
+    const data = readAll();
+    return Object.values(data.dailyReports).filter(Boolean).map((r) => ({ teamMemberId: r.teamMemberId, reportDate: r.reportDate }));
+  },
 };
 
 // One row per day the reminder was claimed — makes "send the reminder once a

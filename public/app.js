@@ -188,6 +188,8 @@ var api = {
   dailyReportMe: function(){ return apiCall("GET","/daily-reports/me"); },
   submitDailyReport: function(data){ return apiCall("POST","/daily-reports", data); },
   retryDailyReportSlack: function(id){ return apiCall("POST","/daily-reports/"+encodeURIComponent(id)+"/slack-retry"); },
+  dailyReportTeam: function(qs){ return apiCall("GET","/daily-reports/team"+(qs?"?"+qs:"")); },
+  dailyReportStats: function(qs){ return apiCall("GET","/statistics/daily-reports"+(qs?"?"+qs:"")); },
   editDailyReport: function(id, data){ return apiCall("PUT","/daily-reports/"+encodeURIComponent(id), data); },
   postDailyReportUpdate: function(id){ return apiCall("POST","/daily-reports/"+encodeURIComponent(id)+"/slack-update"); },
   reportingPing: function(){ return apiCall("GET","/reporting/ping"); },
@@ -263,12 +265,13 @@ var state = {
   blockingModal: false, // true while the sign-in modal is open
   auditLog: [],
   auditReady: false,
+  dailyStats: {key:"", data:null, loading:false, error:""}, // Statistics → Daily QA Report counts (filled / missed), from /api/statistics/daily-reports
   statsActivity: [], // regression status-change events WITH their structured meta — from the access-guarded /api/statistics/activity
   statsReady: false,
   statsDenied: false, // the server said 403 (no Statistics access)
   reportingReady: false,
   reportingDenied: false, // the server said 403 (no Reporting access)
-  dr: {ready:false, denied:false, data:null, error:"", form:{today:"",tomorrow:"",blockers:""}, errors:{}, submitting:false, retrying:{}, edit:null, posting:{}, open:{}}, // Daily QA Report page; edit = {id, form, errors, saving}
+  dr: {ready:false, denied:false, data:null, error:"", form:{today:"",tomorrow:"",blockers:""}, errors:{}, submitting:false, retrying:{}, edit:null, posting:{}, team:{f:{range:"30", from:"", to:"", member:"", q:""}, data:null, members:[], loading:false, error:"", open:{}, token:0}}, // Daily QA Report page; edit = {id, form, errors, saving}
   rp: {dataLayer:false, needsPostgres:false, status:null, settings:null, error:null, saving:false, starting:false, pollTimer:null,
        tab:"reports", filters:null, options:null, presets:[], presetName:"", report:null, reportLoading:false, reportError:null, reportBooting:false, sheetId:"summary", chartTables:{}, exporting:false, deps:null, depsError:null, depStatuses:null},
   assessmentLoggedFor: {}, // releaseId -> true, so AI_ASSESSMENT_GENERATED logs once per viewing, not every re-render
@@ -1098,6 +1101,33 @@ function loadStatsActivity(){
     state.loadError = e.message;
   });
 }
+// Daily QA Report counts for Statistics. Follows the page's Date Range and QA
+// Member filters (not the Release filter — a daily report isn't tied to one).
+function dailyStatsQuery(){
+  var f = state.statsFilters || statsDefaultFilters(), parts = [];
+  if(f.range==="7d") parts.push("last=7"); else if(f.range==="30d") parts.push("last=30");
+  else if(f.range==="custom"){ if(f.from) parts.push("from="+encodeURIComponent(f.from)); if(f.to) parts.push("to="+encodeURIComponent(f.to)); }
+  if(f.memberId) parts.push("member="+encodeURIComponent(f.memberId));
+  return parts.join("&");
+}
+var dailyStatsToken = 0;
+function loadDailyStats(){
+  var ds = state.dailyStats, q = dailyStatsQuery(), token = ++dailyStatsToken;
+  ds.loading = true; ds.error = "";
+  statsDailyPaint();
+  return api.dailyReportStats(q).then(function(res){
+    if(token!==dailyStatsToken) return;
+    ds.data = res; ds.key = q; ds.loading = false; statsDailyPaint();
+  }).catch(function(e){
+    if(token!==dailyStatsToken) return;
+    ds.loading = false;
+    if(!(e && e.status===403)) ds.error = (e && e.message) || "Couldn’t load the Daily QA Report numbers.";
+    statsDailyPaint();
+  });
+}
+function statsDailyPaint(){
+  var box = qs("#stats-daily-container"); if(box) box.innerHTML = statsDailyBodyHtml();
+}
 // Opening Reporting asks the server once; a 403 (access never granted, or
 // just revoked) switches the page to its no-access state.
 function loadReportingAccess(){
@@ -1196,7 +1226,7 @@ function boot(){
     // (audit events with their structured data) — read-only GETs, so simply
     // viewing it never writes an audit event. Without access, no request.
     tasks.push(loadList());
-    tasks.push(teamTask.then(function(){ return canViewStatistics() ? loadStatsActivity() : null; }));
+    tasks.push(teamTask.then(function(){ return canViewStatistics() ? Promise.all([loadStatsActivity(), loadDailyStats()]) : null; }));
   } else if(state.route.view==="reporting"){
     tasks.push(teamTask.then(function(){ return canViewReporting() ? loadReportingAccess() : null; }));
   } else if(state.route.view==="dailyReport"){
@@ -1938,6 +1968,7 @@ function canUseDailyReport(){
 function loadDailyReport(){
   return api.dailyReportMe().then(function(d){
     state.dr.data = d; state.dr.denied = false; state.dr.error = ""; state.dr.ready = true; state.dr.edit = null;
+    drTeamLoad();
   }).catch(function(e){
     state.dr.ready = true;
     if(e && e.status===403){ state.dr.denied = true; return; }
@@ -2034,20 +2065,124 @@ function drTodayCardHtml(d){
     drSlackStatusHtml(rep)+drBodyHtml(rep)+
     '<p class="helper-text dr-once">You’ve submitted today’s report — the next one opens tomorrow. You can still edit it.</p></section>';
 }
-function drHistoryHtml(d){
-  var rows = (d.history||[]).filter(function(r){ return !d.today || r.id!==d.today.id; });
-  if(!rows.length) return "";
-  return '<section class="card dr-card"><div class="dr-card-head"><h2>Your recent reports</h2></div><div class="dr-history">'+
-    rows.map(function(r){
-      var s = r.slack && r.slack.status, sync = r.slack && r.slack.sync;
-      var chip = s!=="sent" ? '<span class="pill tone-warn"><span class="pill-dot"></span>Not sent</span>'
-        : sync==="edit_pending" ? '<span class="pill tone-warn"><span class="pill-dot"></span>Edit not posted</span>'
-        : '<span class="pill tone-go"><span class="pill-dot"></span>Sent</span>';
-      var open = ((state.dr.edit && state.dr.edit.id===r.id) || state.dr.open[r.id]) ? " open" : "";
-      return '<details class="dr-hist-item" data-id="'+escAttr(r.id)+'"'+open+'><summary><span class="dr-hist-date">'+esc(drDateLabel(r.reportDate))+'</span>'+chip+'</summary>'+
-        '<div class="dr-hist-body">'+((s==="sent" && sync!=="edit_pending") ? "" : drSlackStatusHtml(r))+drBodyHtml(r)+'</div></details>';
-    }).join("")+'</div></section>';
+
+// ---- Team reports table (under today's report): filters by date, name and a generic search ----
+function drPad(n){ return (n<10?"0":"")+n; }
+function drAddDays(ymd, n){
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd||"")); if(!m) return ymd;
+  var d = new Date(Date.UTC(+m[1], +m[2]-1, +m[3]+n));
+  return d.getUTCFullYear()+"-"+drPad(d.getUTCMonth()+1)+"-"+drPad(d.getUTCDate());
 }
+function drTeamFiltersActive(){
+  var f = state.dr.team.f;
+  return !!(f.q.trim() || f.member || f.range!=="30");
+}
+function drTeamQuery(){
+  var f = state.dr.team.f, today = state.dr.data ? state.dr.data.reportDate : "", from = "", to = "";
+  if(f.range==="today"){ from = to = today; }
+  else if(f.range==="7"){ from = drAddDays(today, -6); to = today; }
+  else if(f.range==="30"){ from = drAddDays(today, -29); to = today; }
+  else if(f.range==="custom"){ from = f.from; to = f.to; }
+  var parts = [];
+  if(from) parts.push("from="+encodeURIComponent(from));
+  if(to) parts.push("to="+encodeURIComponent(to));
+  if(f.member) parts.push("member="+encodeURIComponent(f.member));
+  if(f.q.trim()) parts.push("q="+encodeURIComponent(f.q.trim()));
+  return parts.join("&");
+}
+function drTeamLoad(){
+  var t = state.dr.team; if(!state.dr.data) return;
+  var token = ++t.token;
+  t.loading = true; t.error = "";
+  drTeamPaint();
+  api.dailyReportTeam(drTeamQuery()).then(function(res){
+    if(token!==t.token) return;
+    var before = JSON.stringify(t.members);
+    t.data = res; t.loading = false; t.members = res.members || t.members;
+    if(JSON.stringify(t.members)!==before){ var sel = qs('select[data-dr-team="member"]'); if(sel) sel.innerHTML = drMemberOptionsHtml(); }
+    drTeamPaint();
+  }).catch(function(e){
+    if(token!==t.token) return;
+    t.loading = false; t.error = (e && e.message) || "Couldn’t load the team’s reports.";
+    drTeamPaint();
+  });
+}
+// Repaints just the table (and its count line) so the search box keeps focus while typing.
+function drTeamPaint(){
+  var box = qs("#dr-team-container"); if(box) box.innerHTML = drTeamBodyHtml();
+  var cnt = qs("#dr-team-count"); if(cnt) cnt.textContent = drTeamCountText();
+}
+function drTeamCountText(){
+  var t = state.dr.team;
+  if(t.loading && !t.data) return "Loading…";
+  if(!t.data) return "";
+  var n = t.data.reports.length;
+  if(t.data.truncated) return "Showing the newest "+n+" of "+t.data.total+" reports — narrow the filters to see the rest.";
+  return n+" report"+(n===1?"":"s")+(drTeamFiltersActive() ? " match these filters" : "");
+}
+function drMemberOptionsHtml(){
+  var t = state.dr.team, me = state.dr.data && state.dr.data.member;
+  return '<option value="">All members</option>'+(t.members||[]).map(function(m){
+    return '<option value="'+escAttr(m.id)+'"'+(t.f.member===m.id?" selected":"")+'>'+esc(m.name)+(me && m.id===me.id ? " (you)" : "")+'</option>';
+  }).join("");
+}
+function drTeamFiltersHtml(){
+  var t = state.dr.team, f = t.f;
+  var ranges = [["today","Today"],["7","Last 7 days"],["30","Last 30 days"],["all","All time"],["custom","Custom range"]];
+  return '<div class="dr-team-filters">'+
+    '<label class="dr-fl"><span>Date</span><select data-dr-team="range" aria-label="Filter by date">'+
+      ranges.map(function(r){ return '<option value="'+r[0]+'"'+(f.range===r[0]?" selected":"")+'>'+r[1]+'</option>'; }).join("")+'</select></label>'+
+    (f.range==="custom" ? '<label class="dr-fl"><span>From</span><input type="date" data-dr-team="from" value="'+escAttr(f.from)+'" max="'+escAttr(f.to||"")+'"></label>'+
+      '<label class="dr-fl"><span>To</span><input type="date" data-dr-team="to" value="'+escAttr(f.to)+'" min="'+escAttr(f.from||"")+'"></label>' : '')+
+    '<label class="dr-fl"><span>Name</span><select data-dr-team="member" aria-label="Filter by name">'+drMemberOptionsHtml()+'</select></label>'+
+    '<label class="dr-fl dr-fl-search"><span>Search</span><div class="dr-search"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.35-4.35"/></svg>'+
+      '<input id="dr-team-search" type="text" autocomplete="off" placeholder="Search names, dates or report text…" aria-label="Search reports" value="'+escAttr(f.q)+'"></div></label>'+
+    (drTeamFiltersActive() ? '<button type="button" class="btn btn-sm dr-fl-clear" data-action="clear-dr-team-filters">Clear filters</button>' : '')+
+  '</div>';
+}
+function drTeamCell(text, label){
+  var t = String(text||"").trim();
+  return '<td data-label="'+label+'"><div class="dr-clamp'+(t ? '' : ' is-none')+'">'+esc(t || "None")+'</div></td>';
+}
+function drTeamRowHtml(r){
+  var t = state.dr.team, ed = state.dr.edit;
+  // Today's own report is also the card above the table; while it's being
+  // edited the form lives in that card only (one form, one set of field ids).
+  var inCard = !!(state.dr.data && state.dr.data.today && state.dr.data.today.id===r.id);
+  var open = !!t.open[r.id] || !!(ed && ed.id===r.id && !inCard);
+  var chip = "";
+  if(r.mine && r.slack){
+    if(r.slack.status!=="sent") chip = '<span class="pill tone-warn"><span class="pill-dot"></span>Not sent</span>';
+    else if(r.slack.sync==="edit_pending") chip = '<span class="pill tone-warn"><span class="pill-dot"></span>Edit not posted</span>';
+  }
+  var detail = '';
+  if(open){
+    detail = '<tr class="dr-tdetail"><td colspan="5"><div class="dr-tdetail-in">'+
+      (r.mine ? drSlackStatusHtml(r) : '')+
+      (r.mine ? (inCard ? drSectionsHtml(r)+'<div class="dr-edit-row"><button type="button" class="btn btn-sm" data-action="edit-daily-report" data-id="'+escAttr(r.id)+'">Edit</button></div>' : drBodyHtml(r)) : drSectionsHtml(r)+(r.editedAt ? '<div class="dr-edit-row"><span class="dr-edited">Edited '+esc(fmtDateTime(r.editedAt)||"")+'</span></div>' : ''))+
+    '</div></td></tr>';
+  }
+  return '<tr class="dr-trow'+(open?" is-open":"")+(r.mine?" is-mine":"")+'" data-action="toggle-dr-row" data-id="'+escAttr(r.id)+'">'+
+    '<td data-label="Date"><button type="button" class="dr-row-toggle" data-action="toggle-dr-row" data-id="'+escAttr(r.id)+'" aria-expanded="'+(open?"true":"false")+'"><span class="dr-caret" aria-hidden="true">'+(open?"▾":"▸")+'</span> '+esc(drDateLabel(r.reportDate))+'</button>'+(chip?'<div class="dr-row-chip">'+chip+'</div>':'')+'</td>'+
+    '<td data-label="Name"><span class="dr-tname">'+esc(r.memberName)+'</span>'+(r.mine?' <span class="badge badge-me">You</span>':'')+'</td>'+
+    drTeamCell(r.today, "Today")+drTeamCell(r.tomorrow, "Tomorrow")+drTeamCell(r.blockers, "Blockers / help needed")+
+  '</tr>'+detail;
+}
+function drTeamBodyHtml(){
+  var t = state.dr.team;
+  if(t.error) return '<div class="empty-state"><h3>Can’t load the team’s reports</h3><p>'+esc(t.error)+'</p><div style="margin-top:14px;"><button type="button" class="btn" data-action="reload-dr-team">'+iconRefresh()+' Try again</button></div></div>';
+  if(!t.data) return '<div class="dr-team-empty"><span class="spinner"></span> Loading reports…</div>';
+  if(!t.data.reports.length){
+    return '<div class="dr-team-empty">No reports match these filters.'+(drTeamFiltersActive() ? ' <button type="button" class="btn btn-sm" data-action="clear-dr-team-filters">Clear filters</button>' : '')+'</div>';
+  }
+  return '<div class="dr-table-wrap'+(t.loading?" is-loading":"")+'"><table class="dr-table"><thead><tr><th>Date</th><th>Name</th><th>Today</th><th>Tomorrow</th><th>Blockers / help needed</th></tr></thead><tbody>'+
+    t.data.reports.map(drTeamRowHtml).join("")+'</tbody></table></div>';
+}
+function drTeamHtml(d){
+  return '<section class="card dr-card dr-team"><div class="dr-card-head"><div><h2>Team reports</h2><p class="helper-text" id="dr-team-count">'+esc(drTeamCountText())+'</p></div></div>'+
+    drTeamFiltersHtml()+'<div id="dr-team-container">'+drTeamBodyHtml()+'</div></section>';
+}
+var drSearchTimer = null;
 // "2026-10-26" -> "Mon 26 Oct 2026" (a plain calendar date, no time-zone maths)
 function drDateLabel(ymd){
   var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd||""));
@@ -2066,7 +2201,7 @@ function renderDailyReport(){
   }
   var banner = d.slackConfigured ? "" :
     '<div class="dr-banner" role="status">Slack isn’t set up on the server yet, so reports are saved here but not posted. Once <code>SLACK_WEBHOOK_URL</code> is set, use <b>Retry Slack</b> to send them.</div>';
-  return head+banner+'<div class="dr-wrap">'+(d.today ? drTodayCardHtml(d) : drFormHtml(d))+drHistoryHtml(d)+'</div>';
+  return head+banner+'<div class="dr-wrap">'+(d.today ? drTodayCardHtml(d) : drFormHtml(d))+drTeamHtml(d)+'</div>';
 }
 // Puts a report the server just returned into the page's data (today + history).
 function drApply(rep){
@@ -2074,6 +2209,9 @@ function drApply(rep){
   if(rep.reportDate===d.reportDate) d.today = rep;
   var i = (d.history||[]).findIndex(function(x){ return x.id===rep.id; });
   if(i>-1) d.history[i] = rep; else (d.history = d.history||[]).unshift(rep);
+  var rows = state.dr.team.data && state.dr.team.data.reports;
+  var j = rows ? rows.findIndex(function(x){ return x.id===rep.id; }) : -1;
+  if(j>-1) Object.assign(rows[j], {today:rep.today, tomorrow:rep.tomorrow, blockers:rep.blockers, editedAt:rep.editedAt, revision:rep.revision, slack:rep.slack});
 }
 function drSlackToast(rep){
   var s = rep.slack && rep.slack.status;
@@ -2096,6 +2234,7 @@ function dailyReportSubmit(){
   api.submitDailyReport({today:f.today, tomorrow:f.tomorrow, blockers:f.blockers}).then(function(res){
     dr.submitting = false; dr.errors = {}; dr.form = {today:"", tomorrow:"", blockers:""};
     drApply(res.report); render();
+    drTeamLoad();
     showToast(drSlackToast(res.report));
   }).catch(function(e){
     dr.submitting = false;
@@ -2120,17 +2259,11 @@ function dailyReportRetry(id){
 }
 
 // ---- editing an existing report (author only, any date) ----
-// A history row stays open (or closed) the way the person left it across re-renders.
-document.addEventListener("toggle", function(e){
-  var el = e.target;
-  if(el && el.classList && el.classList.contains("dr-hist-item") && el.dataset.id){
-    if(el.open) state.dr.open[el.dataset.id] = true; else delete state.dr.open[el.dataset.id];
-  }
-}, true);
 function dailyReportEditStart(id){
   var d = state.dr.data; if(!d) return;
   if(state.dr.edit){ showToast("Save or cancel the edit you have open first."); return; }
-  var rep = (d.history||[]).find(function(x){ return x.id===id; }) || (d.today && d.today.id===id ? d.today : null);
+  var teamRows = (state.dr.team.data && state.dr.team.data.reports) || [];
+  var rep = (d.today && d.today.id===id ? d.today : null) || teamRows.find(function(x){ return x.id===id && x.mine; }) || (d.history||[]).find(function(x){ return x.id===id; });
   if(!rep) return;
   state.dr.edit = {id:id, form:{today:rep.today||"", tomorrow:rep.tomorrow||"", blockers:rep.blockers||""}, errors:{}, saving:false};
   render();
@@ -2937,6 +3070,63 @@ function statsTablesHtml(st){
     '<p class="stats-note">Assigned = regression modules currently assigned · Status Changes = changes the member made to their own assigned regression · Changed By Others = changes to the member’s assigned regression made by someone else (counted for the assignee only, not as the other person’s status change).</p>'+
   '</details>';
 }
+
+// ---- Daily QA Report: days filled / missed per QA member ----
+function statsDailyShortDate(ymd){
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd||"")); if(!m) return String(ymd||"");
+  return (+m[3])+" "+["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][+m[2]-1];
+}
+function statsDailyLongDate(ymd){ return typeof drDateLabel==="function" ? drDateLabel(ymd) : ymd; }
+function statsDailyCardsHtml(t){
+  function card(cls, glyph, label, value, foot){
+    return '<div class="sv-kpi sv-kpi-'+cls+'"><div class="sv-kpi-top"><span class="sv-kpi-ico" aria-hidden="true">'+glyph+'</span><span class="sv-kpi-label">'+esc(label)+'</span></div>'+
+      '<div class="sv-kpi-num">'+value+'</div><div class="sv-kpi-foot">'+foot+'</div></div>';
+  }
+  return '<div class="sv-kpis">'+
+    card("pass","✓","Reports Filled", t.filled, "on working days")+
+    card("block","○","Days Missed", t.missed, t.missed ? "working days with no report" : "no missed working days")+
+  '</div>';
+}
+function statsDailyBodyHtml(){
+  var ds = state.dailyStats, d = ds.data;
+  if(ds.error) return '<div class="sv-empty"><span class="sv-empty-ico" aria-hidden="true">!</span><span>'+esc(ds.error)+'</span></div>';
+  if(!d) return '<div class="sv-empty"><span class="spinner"></span><span>Loading…</span></div>';
+  if(!d.hasData) return '<div class="sv-empty"><span class="sv-empty-ico" aria-hidden="true">◌</span><span>No Daily QA Reports have been submitted yet.</span></div>';
+  var rows = d.members.map(function(m){
+    var counted = m.filled+m.missed;
+    var mem = state.team && state.team[m.id];
+    var avatar = mem && mem.photo ? '<img src="'+escAttr(mem.photo)+'" alt="">' : esc(initials(m.name));
+    var tip = m.name+"\n"+m.filled+" filled · "+m.missed+" missed\nof "+counted+" working "+pluralize(counted,"day")+(m.extra?"\n"+m.extra+" filed on a day off":"");
+    var bar = counted
+      ? '<div class="sv-m-bar" data-tip="'+escAttr(tip)+'" tabindex="0"><div class="sv-track"><div class="sv-bar" style="width:100%">'+
+          (m.filled?'<span class="sv-seg sv-d-fill" style="flex-grow:'+m.filled+'"></span>':'')+(m.missed?'<span class="sv-seg sv-d-miss" style="flex-grow:'+m.missed+'"></span>':'')+
+        '</div></div></div>'
+      : '<span class="sv-m-none">No working days counted yet</span>';
+    var counts = '<span class="sv-d-count"><span class="sv-g-pass" aria-hidden="true">✓</span> Filled <b>'+m.filled+'</b></span>'+
+      '<span class="sv-d-count"><span class="sv-g-block" aria-hidden="true">○</span> Missed <b>'+m.missed+'</b></span>';
+    var note = counted ? 'of '+counted+' working '+pluralize(counted,"day") : '';
+    if(m.pendingToday) note += (note?' · ':'')+'today still open';
+    return '<div class="sv-member"><div class="sv-m-name"><span class="sv-avatar">'+avatar+'</span><span class="sv-m-label">'+esc(m.name)+'</span></div>'+
+      '<div class="sv-m-cell" data-label="Working days">'+bar+'</div>'+
+      '<div class="sv-m-cell sv-d-counts" data-label="Filled / missed">'+counts+'</div>'+
+      '<div class="sv-m-cell sv-m-tix" data-label="Days counted">'+(note ? esc(note) : '<span class="sv-m-none">—</span>')+'</div></div>';
+  }).join("");
+  var tableRows = d.members.map(function(m){
+    return '<tr><td>'+esc(m.name)+'</td>'+statsNumCell(m.filled)+statsNumCell(m.missed)+statsNumCell(m.filled+m.missed)+statsNumCell(m.extra)+
+      '<td>'+(m.lastReportDate ? esc(statsDailyLongDate(m.lastReportDate)) : '—')+'</td>'+
+      '<td>'+(m.missedDates.length ? esc(m.missedDates.map(statsDailyShortDate).join(", ")) : '—')+'</td></tr>';
+  }).join("");
+  return '<div class="sv-members"><div class="sv-member sv-member-head" aria-hidden="true"><span>QA member</span><span>Working days</span><span>Filled / missed</span><span></span></div>'+rows+'</div>'+
+    '<ul class="sv-legend"><li><span class="sv-key sv-d-fill" aria-hidden="true"></span><span class="sv-glyph sv-g-pass" aria-hidden="true">✓</span>Filled</li><li><span class="sv-key sv-d-miss" aria-hidden="true"></span><span class="sv-glyph sv-g-block" aria-hidden="true">○</span>Missed</li></ul>'+
+    '<details class="sv-tables"><summary>View the numbers as a table</summary>'+
+      '<div class="sv-table-scroll">'+statsTable(["QA Member","Filled","Missed","Working days","Filed on a day off","Last report","Missed days"], tableRows)+'</div></details>'+
+    '<p class="stats-note">Period counted: '+esc(statsDailyLongDate(d.from))+' to '+esc(statsDailyLongDate(d.to))+'. Working days are Sunday to Thursday. Counting starts on the day the Daily QA Report was first used or the day the member joined Know the Team, whichever is later; today is not counted as missed until it is over. Public holidays and leave are not tracked, so they appear as missed days. A report filed on a Friday or Saturday is shown as “filed on a day off” and does not change the other numbers. Not filtered by release.</p>';
+}
+function statsDailySectionHtml(){
+  var d = state.dailyStats.data;
+  return (d && d.hasData ? statsDailyCardsHtml(d.totals) : '')+
+    statsSection("Daily QA Report", "How many Daily QA Reports each QA member filled and how many working days went by without one. Listed alphabetically — a view of reporting coverage, not of performance.", '<div id="stats-daily-container">'+statsDailyBodyHtml()+'</div>');
+}
 function renderStatistics(){
   if(!state.teamReady) return '<div class="list-head"><div><h1>QA Statistics</h1></div></div><div class="empty-state"><h3>Loading…</h3></div>';
   if(!canViewStatistics()) return renderStatisticsNoAccess();
@@ -2947,7 +3137,7 @@ function renderStatistics(){
   var st = computeStatistics(f);
   var filtersHtml = statsFiltersHtml(f);
   if(!st.hasData){
-    return head+filtersHtml+'<div class="sv-panel">'+statsEmptyHtml()+'</div>';
+    return head+filtersHtml+'<div class="sv-panel">'+statsEmptyHtml()+'</div>'+statsDailySectionHtml();
   }
   var c = st.cards;
   var tlSub = st.timeline ? "Regression status changes by "+(st.timeline.unit==="day"?"day":(st.timeline.unit==="week"?"week":"month"))+", split by the status they were changed to." : "Regression status changes over time.";
@@ -2957,6 +3147,7 @@ function renderStatistics(){
       statsSection("Regression Overview", "Where assigned regression stands right now.", statsRegressionOverviewHtml(c))+
     '</div>'+
     statsSection("QA Member Activity", "Assigned regression next to the status changes recorded in the period. Listed alphabetically — a view of workload, not of performance.", statsMemberActivityHtml(st))+
+    statsDailySectionHtml()+
     statsSection("Release Overview", "Regression status mix and tickets for each release.", statsReleaseOverviewHtml(st))+
     statsSection("Recent QA Activity", "The latest regression status changes from the Audit Log.", statsRecentHtml(st))+
     statsTablesHtml(st)+
@@ -6850,6 +7041,9 @@ document.addEventListener("click", function(e){
     case "reload-daily-report": boot(); break;
     case "retry-daily-report-slack": dailyReportRetry(id); break;
     case "edit-daily-report": dailyReportEditStart(id); break;
+    case "toggle-dr-row": if(state.dr.team.open[id]) delete state.dr.team.open[id]; else state.dr.team.open[id] = true; if(state.dr.edit && state.dr.edit.id===id) break; drTeamPaint(); break;
+    case "clear-dr-team-filters": state.dr.team.f = {range:"30", from:"", to:"", member:"", q:""}; render(); drTeamLoad(); break;
+    case "reload-dr-team": drTeamLoad(); break;
     case "cancel-edit-daily-report": state.dr.edit = null; render(); break;
     case "post-daily-report-update": dailyReportPostUpdate(id); break;
     case "rp-sync": rpStartSync(el2.getAttribute("data-mode")==="full" ? "full" : "incremental"); break;
@@ -7219,6 +7413,15 @@ document.addEventListener("submit", function(e){
 
 document.addEventListener("change", function(e){
   var elp = e.target;
+  var drf = elp && elp.getAttribute && elp.getAttribute("data-dr-team");
+  if(drf){
+    var tf = state.dr.team.f;
+    tf[drf] = elp.value;
+    if(drf==="range" && elp.value==="custom" && !tf.from && !tf.to && state.dr.data){ tf.to = state.dr.data.reportDate; tf.from = drAddDays(tf.to, -6); }
+    render();
+    if(drf!=="range" || elp.value!=="custom" || (tf.from || tf.to)) drTeamLoad();
+    return;
+  }
   if(elp && elp.getAttribute && (elp.getAttribute("data-rp-ms") || elp.getAttribute("data-rp-f")) && rpFilterChange(elp)) return;
   if(elp.matches('[data-action="toggle-performance"]')){
     var r = state.releases[state.route.id]; if(!r) return;
@@ -7271,8 +7474,10 @@ document.addEventListener("change", function(e){
   }
   if(elp.matches && elp.matches('[data-stats-field]')){
     var sf = state.statsFilters || (state.statsFilters = statsDefaultFilters());
-    sf[elp.getAttribute("data-stats-field")] = elp.value;
+    var sfKey = elp.getAttribute("data-stats-field");
+    sf[sfKey] = elp.value;
     render();
+    if(sfKey!=="releaseId" && !(sfKey==="range" && elp.value==="custom" && !sf.from && !sf.to)) loadDailyStats();
   }
   if(elp.id === "ticket-group-by"){
     state.ticketGroupBy = elp.value;
@@ -7302,6 +7507,13 @@ document.addEventListener("click", function(e){
 
 var rpSearchTimer = null;
 document.addEventListener("input", function(e){
+  if(e.target && e.target.id==="dr-team-search"){
+    // Only the table repaints, so the box keeps focus while typing.
+    state.dr.team.f.q = e.target.value;
+    clearTimeout(drSearchTimer);
+    drSearchTimer = setTimeout(drTeamLoad, 250);
+    return;
+  }
   var drm = e.target && /^dr-(e-)?(today|tomorrow|blockers)$/.exec(e.target.id||"");
   if(drm){
     // Keep what's typed in state (a re-render never loses it) and clear that

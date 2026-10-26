@@ -4,6 +4,7 @@
 // from the request body.
 //
 //   GET  /api/daily-reports/me            today's report (if any), recent reports, Slack status
+//   GET  /api/daily-reports/team          the team's reports, filtered (?from&to&member&q) — read-only for everyone but the author
 //   POST /api/daily-reports               save a report, then post it to Slack
 //   POST /api/daily-reports/:id/slack-retry   try the Slack post again for one of your reports
 //   PUT  /api/daily-reports/:id           edit one of your own reports (any date); saves only, never posts
@@ -75,6 +76,30 @@ router.get("/me", asyncHandler(async (req, res) => {
     slackConfigured: slack.isConfigured("report"),
     today: logic.publicReport(today),
     history: mine.map(logic.publicReport),
+  });
+}));
+
+const TEAM_LIMIT = 200;
+// The team table under today's report. Every member who can open this page can
+// read it (the reports already go to a shared Slack channel); only the author's
+// own rows carry Slack state and can be edited.
+router.get("/team", asyncHandler(async (req, res) => {
+  const me = req.dailyMember;
+  const from = logic.cleanDate(req.query.from);
+  const to = logic.cleanDate(req.query.to);
+  const memberId = String(req.query.member || "").trim();
+  const q = String(req.query.q || "").slice(0, 200);
+  const all = await db.dailyReports.listRange(from || null, to || null);
+  const rows = all.filter((r) => (!memberId || r.teamMemberId === memberId) && logic.matchesSearch(r, q));
+  const people = Object.values(req.team || {}).filter((m) => m && logic.memberHasRegressionFlag(m))
+    .map((m) => ({ id: m.id, name: m.name || "" }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  res.json({
+    reports: rows.slice(0, TEAM_LIMIT).map((r) => logic.teamReport(r, me.id)),
+    total: rows.length,
+    truncated: rows.length > TEAM_LIMIT,
+    members: people,
+    today: logic.reportDateFor(new Date()),
   });
 }));
 

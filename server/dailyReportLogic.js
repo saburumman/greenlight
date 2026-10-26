@@ -59,6 +59,26 @@ function formatReportDate(dateStr) {
   return WEEKDAYS[dt.getUTCDay()] + " " + Number(m[3]) + " " + MONTHS[Number(m[2]) - 1] + " " + m[1];
 }
 
+// Working week in Amman: Sunday to Thursday (Friday and Saturday are the
+// weekend). The reminder goes out on working days only, and "filled" / "missed"
+// in Statistics are counted over working days only.
+const WORKING_WEEKDAYS = [0, 1, 2, 3, 4]; // Date#getUTCDay(): 0 = Sunday
+function weekdayOf(dateStr) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ""));
+  if (!m) return -1;
+  return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))).getUTCDay();
+}
+function isWorkingDay(dateStr) {
+  return WORKING_WEEKDAYS.indexOf(weekdayOf(dateStr)) !== -1;
+}
+// "YYYY-MM-DD" + n days (pure calendar arithmetic, no time zones)
+function addDays(dateStr, n) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ""));
+  if (!m) return dateStr;
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]) + n));
+  return d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0");
+}
+
 // ---------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------
@@ -156,6 +176,79 @@ function applyEdit(report, clean, now) {
 function canPostUpdate(report) {
   return slackSync(report) === "edit_pending";
 }
+// A row of the team table. Everyone sees the report text; only the author also
+// gets the Slack state (and with it the Edit / Retry / Post update controls).
+function teamReport(r, viewerMemberId) {
+  if (!r) return null;
+  const mine = r.teamMemberId === viewerMemberId;
+  const base = {
+    id: r.id, reportDate: r.reportDate, memberId: r.teamMemberId, memberName: r.memberName,
+    today: r.today, tomorrow: r.tomorrow, blockers: r.blockers || "",
+    submittedAt: r.submittedAt, editedAt: r.editedAt || null, mine,
+  };
+  if (mine) {
+    const pub = publicReport(r);
+    base.revision = pub.revision; base.slack = pub.slack;
+  }
+  return base;
+}
+// Generic search: every word typed must appear somewhere in the name, the date
+// ("26 Oct", "Mon", "2026-10-26") or any of the three texts (case-insensitive).
+function matchesSearch(r, q) {
+  const words = String(q || "").toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return true;
+  const hay = [r.memberName, r.reportDate, formatReportDate(r.reportDate), r.today, r.tomorrow, r.blockers && r.blockers.trim() ? r.blockers : "None"]
+    .join("\n").toLowerCase();
+  return words.every((w) => hay.indexOf(w) !== -1);
+}
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+function cleanDate(v) {
+  const s = String(v || "").trim();
+  return DATE_RE.test(s) && weekdayOf(s) !== -1 && !Number.isNaN(Date.parse(s + "T00:00:00Z")) ? s : "";
+}
+
+// Filled / missed days per member, over working days (Sunday to Thursday).
+//   reports  every report in the system, {teamMemberId, reportDate}
+//   members  the people counted [{id, name, createdAt}] (QA members)
+//   from/to  optional range ("" = open); today = Amman date now
+// Counting starts on the day the feature was first used (the earliest report
+// anywhere) or the day the member joined Know the Team, whichever is later, and
+// never reaches past today. Today is "filled" if there's a report, and is NOT
+// "missed" while it is still open. A report filed on Friday/Saturday counts as
+// filled-on-a-day-off (`extra`) and never changes the working-day numbers.
+function coverage({ reports, members, from, to, today }) {
+  const list = (reports || []).filter((r) => r && DATE_RE.test(String(r.reportDate)));
+  if (!list.length) return { hasData: false, members: [], totals: { filled: 0, missed: 0, extra: 0 } };
+  let launch = list[0].reportDate;
+  for (const r of list) if (r.reportDate < launch) launch = r.reportDate;
+  const start = from && from > launch ? from : launch;
+  const end = to && to < today ? to : today;
+  const out = [];
+  const totals = { filled: 0, missed: 0, extra: 0 };
+  for (const m of members || []) {
+    const mine = new Set(list.filter((r) => r.teamMemberId === m.id).map((r) => r.reportDate));
+    const joined = m.createdAt ? ammanParts(m.createdAt).date : launch;
+    let first = joined;
+    for (const d of mine) if (d < first) first = d;
+    const mStart = first > start ? first : start;
+    const row = { id: m.id, name: m.name || "", filled: 0, missed: 0, extra: 0, missedDates: [], pendingToday: false, lastReportDate: null };
+    for (const d of mine) if (!row.lastReportDate || d > row.lastReportDate) row.lastReportDate = d;
+    if (mStart <= end) {
+      for (let d = mStart, n = 0; d <= end && n < 3700; d = addDays(d, 1), n++) {
+        const has = mine.has(d);
+        if (!isWorkingDay(d)) { if (has) row.extra++; continue; }
+        if (has) row.filled++;
+        else if (d < today) { row.missed++; row.missedDates.push(d); }
+        else row.pendingToday = true;
+      }
+    }
+    totals.filled += row.filled; totals.missed += row.missed; totals.extra += row.extra;
+    out.push(row);
+  }
+  out.sort((a, b) => a.name.localeCompare(b.name));
+  return { hasData: true, from: start, to: end, launch, today, members: out, totals };
+}
+
 function canRetrySlack(report) {
   return !!report && !!report.slack && report.slack.status !== "sent";
 }
@@ -229,9 +322,12 @@ function buildReminderMessage(appBaseUrl) {
 // ---------------------------------------------------------------------
 // Reminder timing
 // ---------------------------------------------------------------------
-// True from 3:45 PM Amman until GRACE_MINUTES later.
+// True from 3:45 PM Amman until GRACE_MINUTES later, on working days only
+// (Sunday to Thursday) — nothing is sent on Friday or Saturday.
 function reminderDue(now) {
-  const t = ammanParts(now).minutesOfDay;
+  const parts = ammanParts(now);
+  if (!isWorkingDay(parts.date)) return false;
+  const t = parts.minutesOfDay;
   const start = REMINDER_HOUR * 60 + REMINDER_MINUTE;
   return t >= start && t < start + REMINDER_GRACE_MINUTES;
 }
@@ -250,9 +346,11 @@ function memberHasRegressionFlag(member) {
 module.exports = {
   TIME_ZONE, MAX_TEXT, MAX_BLOCKERS, DIVIDER,
   REMINDER_HOUR, REMINDER_MINUTE, REMINDER_GRACE_MINUTES,
+  WORKING_WEEKDAYS, weekdayOf, isWorkingDay, addDays,
   ammanParts, reportDateFor, formatReportDate,
   normalizeText, validateSubmission, newSlackState, buildReport, publicReport, canRetrySlack,
   revisionOf, slackSync, applyEdit, canPostUpdate,
+  teamReport, matchesSearch, cleanDate, coverage,
   escapeSlack, slackBody, buildReportMessage, buildReminderMessage,
   reminderDue, memberHasRegressionFlag,
 };
