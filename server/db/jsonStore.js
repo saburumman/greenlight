@@ -112,6 +112,7 @@ function ensureStore() {
           testData: {},
           testAccountRelationships: {},
           dailyReports: {},
+          dailyAbsences: {},
           dailyReminders: {},
           team: buildDefaultTeam(),
           atlassianTokens: {},
@@ -173,6 +174,10 @@ function readAll() {
       parsed.dailyReports = {};
       dirty = true;
     }
+    if (!parsed.dailyAbsences || typeof parsed.dailyAbsences !== "object" || Array.isArray(parsed.dailyAbsences)) {
+      parsed.dailyAbsences = {};
+      dirty = true;
+    }
     if (!parsed.dailyReminders || typeof parsed.dailyReminders !== "object" || Array.isArray(parsed.dailyReminders)) {
       parsed.dailyReminders = {};
       dirty = true;
@@ -229,6 +234,7 @@ function readAll() {
       testData: {},
       testAccountRelationships: {},
       dailyReports: {},
+      dailyAbsences: {},
       dailyReminders: {},
       team: buildDefaultTeam(),
       atlassianTokens: {},
@@ -433,6 +439,52 @@ const dailyReports = {
   },
 };
 
+// Days a team member marked themselves absent — one per member per date.
+// They are not "missed" in Statistics. Same unique-in-one-synchronous-step idea
+// as dailyReports.insertIfNew.
+const dailyAbsences = {
+  async insertIfNew(record) {
+    const data = readAll();
+    const existing = Object.values(data.dailyAbsences).find(
+      (r) => r && r.teamMemberId === record.teamMemberId && r.absentDate === record.absentDate
+    );
+    if (existing) return { inserted: false, existing };
+    data.dailyAbsences[record.id] = record;
+    writeAll(data);
+    return { inserted: true, record };
+  },
+  // true when a row was removed
+  async remove(memberId, date) {
+    const data = readAll();
+    const hit = Object.values(data.dailyAbsences).find((r) => r && r.teamMemberId === memberId && r.absentDate === date);
+    if (!hit) return false;
+    delete data.dailyAbsences[hit.id];
+    writeAll(data);
+    return true;
+  },
+  async find(memberId, date) {
+    const data = readAll();
+    return Object.values(data.dailyAbsences).find((r) => r && r.teamMemberId === memberId && r.absentDate === date) || null;
+  },
+  async listForMember(memberId, limit) {
+    const data = readAll();
+    return Object.values(data.dailyAbsences)
+      .filter((r) => r && r.teamMemberId === memberId)
+      .sort((a, b) => String(b.absentDate).localeCompare(String(a.absentDate)))
+      .slice(0, limit || 30);
+  },
+  async listRange(from, to) {
+    const data = readAll();
+    return Object.values(data.dailyAbsences)
+      .filter((r) => r && (!from || r.absentDate >= from) && (!to || r.absentDate <= to))
+      .sort((a, b) => String(b.absentDate).localeCompare(String(a.absentDate)) || String(a.memberName).localeCompare(String(b.memberName)));
+  },
+  async listAllDates() {
+    const data = readAll();
+    return Object.values(data.dailyAbsences).filter(Boolean).map((r) => ({ teamMemberId: r.teamMemberId, absentDate: r.absentDate }));
+  },
+};
+
 // One row per day the reminder was claimed — makes "send the reminder once a
 // day" survive restarts. claim() is true for exactly one caller per date.
 const dailyReminders = {
@@ -512,6 +564,7 @@ module.exports = {
   testData,
   testAccountRelationships,
   dailyReports,
+  dailyAbsences,
   dailyReminders,
   team,
   atlassianTokens,

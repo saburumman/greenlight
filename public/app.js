@@ -190,6 +190,8 @@ var api = {
   retryDailyReportSlack: function(id){ return apiCall("POST","/daily-reports/"+encodeURIComponent(id)+"/slack-retry"); },
   dailyReportTeam: function(qs){ return apiCall("GET","/daily-reports/team"+(qs?"?"+qs:"")); },
   dailyReportStats: function(qs){ return apiCall("GET","/statistics/daily-reports"+(qs?"?"+qs:"")); },
+  addDailyAbsence: function(data){ return apiCall("POST","/daily-reports/absences", data); },
+  removeDailyAbsence: function(date){ return apiCall("DELETE","/daily-reports/absences/"+encodeURIComponent(date)); },
   editDailyReport: function(id, data){ return apiCall("PUT","/daily-reports/"+encodeURIComponent(id), data); },
   resendDailyReport: function(id){ return apiCall("POST","/daily-reports/"+encodeURIComponent(id)+"/slack-resend"); },
   postDailyReportUpdate: function(id){ return apiCall("POST","/daily-reports/"+encodeURIComponent(id)+"/slack-update"); },
@@ -272,7 +274,7 @@ var state = {
   statsDenied: false, // the server said 403 (no Statistics access)
   reportingReady: false,
   reportingDenied: false, // the server said 403 (no Reporting access)
-  dr: {ready:false, denied:false, data:null, error:"", form:{today:"",tomorrow:"",blockers:""}, errors:{}, submitting:false, retrying:{}, edit:null, posting:{}, resending:{}, resendConfirm:"", team:{f:{range:"30", from:"", to:"", member:"", q:""}, data:null, members:[], loading:false, error:"", open:{}, token:0}}, // Daily QA Report page; edit = {id, form, errors, saving}
+  dr: {ready:false, denied:false, data:null, error:"", form:{today:"",tomorrow:"",blockers:""}, errors:{}, submitting:false, retrying:{}, edit:null, posting:{}, resending:{}, resendConfirm:"", absence:{date:"", note:"", saving:false, errors:{}, removing:{}}, team:{f:{range:"30", from:"", to:"", member:"", q:""}, data:null, members:[], loading:false, error:"", open:{}, token:0}}, // Daily QA Report page; edit = {id, form, errors, saving}
   rp: {dataLayer:false, needsPostgres:false, status:null, settings:null, error:null, saving:false, starting:false, pollTimer:null,
        tab:"reports", filters:null, options:null, presets:[], presetName:"", report:null, reportLoading:false, reportError:null, reportBooting:false, sheetId:"summary", chartTables:{}, exporting:false, deps:null, depsError:null, depStatuses:null},
   assessmentLoggedFor: {}, // releaseId -> true, so AI_ASSESSMENT_GENERATED logs once per viewing, not every re-render
@@ -1597,6 +1599,8 @@ var AUDIT_ACTION_LABELS = {
   REPORT_DEPENDENCY_CHANGED: "Changed a Reporting Dependency",
   DAILY_REPORT_SUBMITTED: "Submitted Daily QA Report",
   DAILY_REPORT_EDITED: "Edited Daily QA Report",
+  DAILY_REPORT_ABSENCE_ADDED: "Marked Absent (Daily QA Report)",
+  DAILY_REPORT_ABSENCE_REMOVED: "Removed Absence (Daily QA Report)",
   DAILY_REPORT_SLACK_FAILED: "Daily QA Report Not Posted to Slack"
 };
 function humanizeAuditAction(action){
@@ -2075,6 +2079,61 @@ function drTodayCardHtml(d){
     '<p class="helper-text dr-once">You’ve submitted today’s report — the next one opens tomorrow. You can still edit it.</p></section>';
 }
 
+
+// ---- Mark myself absent (own days only; not counted as missed; nothing goes to Slack) ----
+function drAbsenceHtml(d){
+  var ab = state.dr.absence, today = d.reportDate;
+  if(!ab.date) ab.date = today;
+  var list = (d.absences||[]).slice(0, 8);
+  var err = ab.errors.date || ab.errors.note || "";
+  return '<section class="card dr-card dr-absence"><div class="dr-card-head"><div><h2>Mark myself absent</h2>'+
+    '<p class="helper-text">Were you away on a working day? Mark it here so it isn’t counted as missed. Nothing is posted to Slack.</p></div></div>'+
+    '<form id="dr-absence-form" class="dr-abs-form" novalidate>'+
+      '<label class="dr-fl"><span>Day</span><input type="date" id="dr-abs-date" value="'+escAttr(ab.date)+'"'+(ab.saving?' disabled':'')+'></label>'+
+      '<label class="dr-fl dr-fl-grow"><span>Note <i>(optional)</i></span><input type="text" id="dr-abs-note" maxlength="200" placeholder="e.g. sick leave, annual leave" value="'+escAttr(ab.note)+'"'+(ab.saving?' disabled':'')+'></label>'+
+      '<button type="submit" class="btn btn-primary" id="dr-abs-submit"'+(ab.saving?' disabled':'')+'>'+(ab.saving?'<span class="spinner"></span> Saving…':'Mark absent')+'</button>'+
+    '</form>'+
+    (err ? '<div class="dr-err" role="alert" id="dr-abs-err">'+esc(err)+'</div>' : '')+
+    (list.length ? '<div class="dr-abs-list"><div class="dr-sec-label">Your absences</div>'+list.map(function(a){
+      var busy = !!ab.removing[a.date];
+      return '<div class="dr-abs-item"><span class="dr-abs-date">'+esc(drDateLabel(a.date))+'</span>'+(a.note?'<span class="dr-abs-note">'+esc(a.note)+'</span>':'')+
+        '<button type="button" class="btn btn-sm" data-action="remove-daily-absence" data-date="'+escAttr(a.date)+'"'+(busy?' disabled':'')+'>'+(busy?'Removing…':'Remove')+'</button></div>';
+    }).join("")+'</div>' : '')+
+  '</section>';
+}
+function dailyAbsenceAdd(){
+  var ab = state.dr.absence, d = state.dr.data; if(!d || ab.saving) return;
+  ab.errors = {};
+  if(!ab.date){ ab.errors.date = "Pick the day you were absent."; render(); return; }
+  ab.saving = true; render();
+  api.addDailyAbsence({date:ab.date, note:ab.note}).then(function(res){
+    ab.saving = false; ab.note = ""; ab.errors = {};
+    d.absences = [res.absence].concat((d.absences||[]).filter(function(x){ return x.date!==res.absence.date; }))
+      .sort(function(a,b){ return a.date<b.date ? 1 : -1; });
+    render(); drTeamLoad();
+    showToast("Marked absent on "+drDateLabel(res.absence.date)+".");
+  }).catch(function(e){
+    ab.saving = false;
+    ab.errors = (e && e.data && e.data.fields) || {date:(e && e.message) || "Couldn’t save that."};
+    render();
+  });
+}
+function dailyAbsenceRemove(date){
+  var ab = state.dr.absence, d = state.dr.data; if(!d || !date || ab.removing[date]) return;
+  ab.removing[date] = true; render();
+  api.removeDailyAbsence(date).then(function(){
+    delete ab.removing[date];
+    d.absences = (d.absences||[]).filter(function(x){ return x.date!==date; });
+    render(); drTeamLoad();
+    showToast("Absence removed.");
+  }).catch(function(e){
+    delete ab.removing[date];
+    if(e && e.status===404) d.absences = (d.absences||[]).filter(function(x){ return x.date!==date; });
+    showToast((e && e.message) || "Couldn’t remove it.");
+    render();
+  });
+}
+
 // ---- Team reports table (under today's report): filters by date, name and a generic search ----
 function drPad(n){ return (n<10?"0":"")+n; }
 function drAddDays(ymd, n){
@@ -2153,7 +2212,16 @@ function drTeamCell(text, label){
   var t = String(text||"").trim();
   return '<td data-label="'+label+'"><div class="dr-clamp'+(t ? '' : ' is-none')+'">'+esc(t || "None")+'</div></td>';
 }
+function drTeamAbsenceRowHtml(r){
+  var busy = !!state.dr.absence.removing[r.reportDate];
+  return '<tr class="dr-trow is-absent'+(r.mine?" is-mine":"")+'">'+
+    '<td data-label="Date"><span class="dr-row-date">'+esc(drDateLabel(r.reportDate))+'</span></td>'+
+    '<td data-label="Name"><span class="dr-tname">'+esc(r.memberName)+'</span>'+(r.mine?' <span class="badge badge-me">You</span>':'')+'</td>'+
+    '<td colspan="3" data-label="Status"><span class="pill tone-neutral"><span class="pill-dot"></span>Absent</span>'+(r.note?' <span class="dr-abs-note">'+esc(r.note)+'</span>':'')+
+      (r.mine?' <button type="button" class="btn btn-sm dr-abs-remove" data-action="remove-daily-absence" data-date="'+escAttr(r.reportDate)+'"'+(busy?' disabled':'')+'>Remove</button>':'')+'</td></tr>';
+}
 function drTeamRowHtml(r){
+  if(r.kind==="absent") return drTeamAbsenceRowHtml(r);
   var t = state.dr.team, ed = state.dr.edit;
   // Today's own report is also the card above the table; while it's being
   // edited the form lives in that card only (one form, one set of field ids).
@@ -2210,7 +2278,7 @@ function renderDailyReport(){
   }
   var banner = d.slackConfigured ? "" :
     '<div class="dr-banner" role="status">Slack isn’t set up on the server yet, so reports are saved here but not posted. Once <code>SLACK_WEBHOOK_URL</code> is set, use <b>Retry Slack</b> to send them.</div>';
-  return head+banner+'<div class="dr-wrap">'+(d.today ? drTodayCardHtml(d) : drFormHtml(d))+drTeamHtml(d)+'</div>';
+  return head+banner+'<div class="dr-wrap">'+(d.today ? drTodayCardHtml(d) : drFormHtml(d))+drAbsenceHtml(d)+drTeamHtml(d)+'</div>';
 }
 // Puts a report the server just returned into the page's data (today + history).
 function drApply(rep){
@@ -3107,6 +3175,7 @@ function statsDailyCardsHtml(t){
   return '<div class="sv-kpis">'+
     card("pass","✓","Reports Filled", t.filled, "on working days")+
     card("block","○","Days Missed", t.missed, t.missed ? "working days with no report" : "no missed working days")+
+    card("tix","–","Days Absent", t.absent||0, "marked absent, not counted as missed")+
   '</div>';
 }
 function statsDailyBodyHtml(){
@@ -3118,7 +3187,7 @@ function statsDailyBodyHtml(){
     var counted = m.filled+m.missed;
     var mem = state.team && state.team[m.id];
     var avatar = mem && mem.photo ? '<img src="'+escAttr(mem.photo)+'" alt="">' : esc(initials(m.name));
-    var tip = m.name+"\n"+m.filled+" filled · "+m.missed+" missed\nof "+counted+" working "+pluralize(counted,"day")+(m.extra?"\n"+m.extra+" filed on a day off":"");
+    var tip = m.name+"\n"+m.filled+" filled · "+m.missed+" missed\nof "+counted+" working "+pluralize(counted,"day")+(m.absent?"\n"+m.absent+" absent":"")+(m.extra?"\n"+m.extra+" filed on a day off":"");
     var bar = counted
       ? '<div class="sv-m-bar" data-tip="'+escAttr(tip)+'" tabindex="0"><div class="sv-track"><div class="sv-bar" style="width:100%">'+
           (m.filled?'<span class="sv-seg sv-d-fill" style="flex-grow:'+m.filled+'"></span>':'')+(m.missed?'<span class="sv-seg sv-d-miss" style="flex-grow:'+m.missed+'"></span>':'')+
@@ -3127,6 +3196,7 @@ function statsDailyBodyHtml(){
     var counts = '<span class="sv-d-count"><span class="sv-g-pass" aria-hidden="true">✓</span> Filled <b>'+m.filled+'</b></span>'+
       '<span class="sv-d-count"><span class="sv-g-block" aria-hidden="true">○</span> Missed <b>'+m.missed+'</b></span>';
     var note = counted ? 'of '+counted+' working '+pluralize(counted,"day") : '';
+    if(m.absent) note += (note?' · ':'')+m.absent+' absent';
     if(m.pendingToday) note += (note?' · ':'')+'today still open';
     return '<div class="sv-member"><div class="sv-m-name"><span class="sv-avatar">'+avatar+'</span><span class="sv-m-label">'+esc(m.name)+'</span></div>'+
       '<div class="sv-m-cell" data-label="Working days">'+bar+'</div>'+
@@ -3134,15 +3204,16 @@ function statsDailyBodyHtml(){
       '<div class="sv-m-cell sv-m-tix" data-label="Days counted">'+(note ? esc(note) : '<span class="sv-m-none">—</span>')+'</div></div>';
   }).join("");
   var tableRows = d.members.map(function(m){
-    return '<tr><td>'+esc(m.name)+'</td>'+statsNumCell(m.filled)+statsNumCell(m.missed)+statsNumCell(m.filled+m.missed)+statsNumCell(m.extra)+
+    return '<tr><td>'+esc(m.name)+'</td>'+statsNumCell(m.filled)+statsNumCell(m.missed)+statsNumCell(m.filled+m.missed)+statsNumCell(m.absent||0)+statsNumCell(m.extra)+
       '<td>'+(m.lastReportDate ? esc(statsDailyLongDate(m.lastReportDate)) : '—')+'</td>'+
-      '<td>'+(m.missedDates.length ? esc(m.missedDates.map(statsDailyShortDate).join(", ")) : '—')+'</td></tr>';
+      '<td>'+(m.missedDates.length ? esc(m.missedDates.map(statsDailyShortDate).join(", ")) : '—')+'</td>'+
+      '<td>'+((m.absentDates||[]).length ? esc(m.absentDates.map(statsDailyShortDate).join(", ")) : '—')+'</td></tr>';
   }).join("");
   return '<div class="sv-members"><div class="sv-member sv-member-head" aria-hidden="true"><span>QA member</span><span>Working days</span><span>Filled / missed</span><span></span></div>'+rows+'</div>'+
     '<ul class="sv-legend"><li><span class="sv-key sv-d-fill" aria-hidden="true"></span><span class="sv-glyph sv-g-pass" aria-hidden="true">✓</span>Filled</li><li><span class="sv-key sv-d-miss" aria-hidden="true"></span><span class="sv-glyph sv-g-block" aria-hidden="true">○</span>Missed</li></ul>'+
     '<details class="sv-tables"><summary>View the numbers as a table</summary>'+
-      '<div class="sv-table-scroll">'+statsTable(["QA Member","Filled","Missed","Working days","Filed on a day off","Last report","Missed days"], tableRows)+'</div></details>'+
-    '<p class="stats-note">Period counted: '+esc(statsDailyLongDate(d.from))+' to '+esc(statsDailyLongDate(d.to))+'. Working days are Sunday to Thursday. Counting starts on the day the Daily QA Report was first used or the day the member joined Know the Team, whichever is later; today is not counted as missed until it is over. Public holidays and leave are not tracked, so they appear as missed days. A report filed on a Friday or Saturday is shown as “filed on a day off” and does not change the other numbers. Not filtered by release.</p>';
+      '<div class="sv-table-scroll">'+statsTable(["QA Member","Filled","Missed","Working days","Absent","Filed on a day off","Last report","Missed days","Absent days"], tableRows)+'</div></details>'+
+    '<p class="stats-note">Period counted: '+esc(statsDailyLongDate(d.from))+' to '+esc(statsDailyLongDate(d.to))+'. Working days are Sunday to Thursday. Counting starts on the day the Daily QA Report was first used or the day the member joined Know the Team, whichever is later; today is not counted as missed until it is over. A working day a member marked absent on the Daily QA Report page is shown as absent and is not counted as missed. Public holidays are not tracked unless the member marks them as absent. A report filed on a Friday or Saturday is shown as “filed on a day off” and does not change the other numbers. Not filtered by release.</p>';
 }
 function statsDailySectionHtml(){
   var d = state.dailyStats.data;
@@ -7063,6 +7134,7 @@ document.addEventListener("click", function(e){
     case "reload-daily-report": boot(); break;
     case "retry-daily-report-slack": dailyReportRetry(id); break;
     case "edit-daily-report": dailyReportEditStart(id); break;
+    case "remove-daily-absence": dailyAbsenceRemove(el2.getAttribute("data-date")); break;
     case "toggle-dr-row": if(state.dr.team.open[id]) delete state.dr.team.open[id]; else state.dr.team.open[id] = true; if(state.dr.edit && state.dr.edit.id===id) break; drTeamPaint(); break;
     case "clear-dr-team-filters": state.dr.team.f = {range:"30", from:"", to:"", member:"", q:""}; render(); drTeamLoad(); break;
     case "reload-dr-team": drTeamLoad(); break;
@@ -7433,6 +7505,7 @@ document.addEventListener("submit", function(e){
   if(e.target && e.target.id==="rp-settings-form"){ e.preventDefault(); rpSaveSettings(); }
   if(e.target && e.target.id==="rp-dep-form"){ e.preventDefault(); rpSaveDep(e.target); }
   if(e.target && e.target.id==="daily-report-form"){ e.preventDefault(); dailyReportSubmit(); }
+  if(e.target && e.target.id==="dr-absence-form"){ e.preventDefault(); dailyAbsenceAdd(); }
   if(e.target && e.target.id==="daily-report-edit-form"){ e.preventDefault(); dailyReportEditSave(); }
 });
 
@@ -7532,6 +7605,12 @@ document.addEventListener("click", function(e){
 
 var rpSearchTimer = null;
 document.addEventListener("input", function(e){
+  if(e.target && (e.target.id==="dr-abs-date" || e.target.id==="dr-abs-note")){
+    var abx = state.dr.absence;
+    if(e.target.id==="dr-abs-date") abx.date = e.target.value; else abx.note = e.target.value;
+    if(abx.errors.date || abx.errors.note){ abx.errors = {}; var abe = qs("#dr-abs-err"); if(abe) abe.remove(); }
+    return;
+  }
   if(e.target && e.target.id==="dr-team-search"){
     // Only the table repaints, so the box keeps focus while typing.
     state.dr.team.f.q = e.target.value;

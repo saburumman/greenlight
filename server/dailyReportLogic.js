@@ -182,6 +182,48 @@ function canResend(report) {
 function canPostUpdate(report) {
   return slackSync(report) === "edit_pending";
 }
+// ---------------------------------------------------------------------
+// Absences — a team member marks a working day as "absent" so it is not
+// counted as missed. One per member per date; the author only.
+// ---------------------------------------------------------------------
+const MAX_NOTE = 200;
+const ABSENCE_PAST_DAYS = 90;
+const ABSENCE_FUTURE_DAYS = 60;
+// -> { clean: {date, note}, errors: {field: message} }. `today` is the Amman date now.
+function validateAbsence(body, today) {
+  const b = body && typeof body === "object" ? body : {};
+  const date = cleanDate(b.date);
+  const note = String(b.note == null ? "" : b.note).replace(/[\u0000-\u001F\u007F]+/g, " ").replace(/\s+/g, " ").trim();
+  const errors = {};
+  if (!date) errors.date = "Pick the day you were absent.";
+  else if (!isWorkingDay(date)) errors.date = "Friday and Saturday aren’t working days, so there’s nothing to mark.";
+  else if (date < addDays(today, -ABSENCE_PAST_DAYS)) errors.date = "You can mark days from the last " + ABSENCE_PAST_DAYS + " days.";
+  else if (date > addDays(today, ABSENCE_FUTURE_DAYS)) errors.date = "You can mark days up to " + ABSENCE_FUTURE_DAYS + " days ahead.";
+  if (note.length > MAX_NOTE) errors.note = "Please keep the note under " + MAX_NOTE + " characters.";
+  return { clean: { date, note }, errors };
+}
+function buildAbsence({ id, member, clean, now }) {
+  const stamp = (now instanceof Date ? now : new Date(now || Date.now())).toISOString();
+  return { id, teamMemberId: member.id, memberName: member.name || "Unknown", absentDate: clean.date, note: clean.note, createdAt: stamp };
+}
+// A row in the team table, same shape family as teamReport() with kind "absent".
+function teamAbsence(a, viewerMemberId) {
+  if (!a) return null;
+  return {
+    kind: "absent", id: a.id, reportDate: a.absentDate, memberId: a.teamMemberId, memberName: a.memberName,
+    note: a.note || "", mine: a.teamMemberId === viewerMemberId, createdAt: a.createdAt,
+  };
+}
+function publicAbsence(a) {
+  return a ? { id: a.id, date: a.absentDate, note: a.note || "", createdAt: a.createdAt } : null;
+}
+function matchesAbsenceSearch(a, q) {
+  const words = String(q || "").toLowerCase().split(/\s+/).filter(Boolean);
+  if (!words.length) return true;
+  const hay = [a.memberName, a.absentDate, formatReportDate(a.absentDate), "absent", a.note].join("\n").toLowerCase();
+  return words.every((w) => hay.indexOf(w) !== -1);
+}
+
 // A row of the team table. Everyone sees the report text; only the author also
 // gets the Slack state (and with it the Edit / Retry / Post update controls).
 function teamReport(r, viewerMemberId) {
@@ -219,36 +261,40 @@ function cleanDate(v) {
 //   from/to  optional range ("" = open); today = Amman date now
 // Counting starts on the day the feature was first used (the earliest report
 // anywhere) or the day the member joined Know the Team, whichever is later, and
-// never reaches past today. Today is "filled" if there's a report, and is NOT
+// never reaches past today. A working day the member marked absent is counted
+// as `absent` — neither filled nor missed (a report filed that day wins and
+// counts as filled). Today is "filled" if there's a report, and is NOT
 // "missed" while it is still open. A report filed on Friday/Saturday counts as
 // filled-on-a-day-off (`extra`) and never changes the working-day numbers.
-function coverage({ reports, members, from, to, today }) {
+function coverage({ reports, members, from, to, today, absences }) {
   const list = (reports || []).filter((r) => r && DATE_RE.test(String(r.reportDate)));
-  if (!list.length) return { hasData: false, members: [], totals: { filled: 0, missed: 0, extra: 0 } };
+  if (!list.length) return { hasData: false, members: [], totals: { filled: 0, missed: 0, extra: 0, absent: 0 } };
   let launch = list[0].reportDate;
   for (const r of list) if (r.reportDate < launch) launch = r.reportDate;
   const start = from && from > launch ? from : launch;
   const end = to && to < today ? to : today;
   const out = [];
-  const totals = { filled: 0, missed: 0, extra: 0 };
+  const totals = { filled: 0, missed: 0, extra: 0, absent: 0 };
   for (const m of members || []) {
     const mine = new Set(list.filter((r) => r.teamMemberId === m.id).map((r) => r.reportDate));
+    const away = new Set((absences || []).filter((a) => a && a.teamMemberId === m.id).map((a) => a.absentDate));
     const joined = m.createdAt ? ammanParts(m.createdAt).date : launch;
     let first = joined;
     for (const d of mine) if (d < first) first = d;
     const mStart = first > start ? first : start;
-    const row = { id: m.id, name: m.name || "", filled: 0, missed: 0, extra: 0, missedDates: [], pendingToday: false, lastReportDate: null };
+    const row = { id: m.id, name: m.name || "", filled: 0, missed: 0, extra: 0, absent: 0, missedDates: [], absentDates: [], pendingToday: false, lastReportDate: null };
     for (const d of mine) if (!row.lastReportDate || d > row.lastReportDate) row.lastReportDate = d;
     if (mStart <= end) {
       for (let d = mStart, n = 0; d <= end && n < 3700; d = addDays(d, 1), n++) {
         const has = mine.has(d);
         if (!isWorkingDay(d)) { if (has) row.extra++; continue; }
         if (has) row.filled++;
+        else if (away.has(d)) { row.absent++; row.absentDates.push(d); }
         else if (d < today) { row.missed++; row.missedDates.push(d); }
         else row.pendingToday = true;
       }
     }
-    totals.filled += row.filled; totals.missed += row.missed; totals.extra += row.extra;
+    totals.filled += row.filled; totals.missed += row.missed; totals.extra += row.extra; totals.absent += row.absent;
     out.push(row);
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
@@ -369,6 +415,7 @@ module.exports = {
   normalizeText, validateSubmission, newSlackState, buildReport, publicReport, canRetrySlack,
   revisionOf, slackSync, applyEdit, canPostUpdate, canResend,
   teamReport, matchesSearch, cleanDate, coverage,
+  MAX_NOTE, ABSENCE_PAST_DAYS, ABSENCE_FUTURE_DAYS, validateAbsence, buildAbsence, teamAbsence, publicAbsence, matchesAbsenceSearch,
   escapeSlack, slackBody, buildReportMessage, buildReminderMessage, reportLink, DEFAULT_REPORT_LINK,
   reminderDue, memberHasRegressionFlag,
 };

@@ -346,6 +346,14 @@ create table if not exists daily_qa_reports (
   constraint daily_qa_reports_one_per_member_per_day unique (team_member_id, report_date)
 );
 create index if not exists idx_daily_qa_reports_member_date on daily_qa_reports (team_member_id, report_date desc);
+create table if not exists daily_qa_absences (
+  id uuid primary key,
+  team_member_id text not null,
+  absent_date text not null check (absent_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'),
+  data jsonb not null,
+  created_at timestamptz not null default now(),
+  constraint daily_qa_absences_one_per_member_per_day unique (team_member_id, absent_date)
+);
 create table if not exists daily_qa_reminders (
   report_date text primary key,
   claimed_at timestamptz not null default now()
@@ -415,6 +423,50 @@ const dailyReports = {
     return rows.map((r) => ({ teamMemberId: r.team_member_id, reportDate: r.report_date }));
   },
 };
+const dailyAbsences = {
+  async insertIfNew(record) {
+    await ensureDailyTables();
+    const { rows } = await pgPool.query(
+      `INSERT INTO daily_qa_absences (id, team_member_id, absent_date, data, created_at)
+       VALUES ($1, $2, $3, $4::jsonb, $5)
+       ON CONFLICT (team_member_id, absent_date) DO NOTHING RETURNING data`,
+      [record.id, record.teamMemberId, record.absentDate, JSON.stringify(record), isoOrNow(record.createdAt)]
+    );
+    if (rows.length) return { inserted: true, record: rows[0].data };
+    const found = await pgPool.query(`SELECT data FROM daily_qa_absences WHERE team_member_id = $1 AND absent_date = $2`, [record.teamMemberId, record.absentDate]);
+    return { inserted: false, existing: found.rows.length ? found.rows[0].data : null };
+  },
+  async remove(memberId, date) {
+    await ensureDailyTables();
+    const r = await pgPool.query(`DELETE FROM daily_qa_absences WHERE team_member_id = $1 AND absent_date = $2`, [memberId, date]);
+    return r.rowCount > 0;
+  },
+  async find(memberId, date) {
+    await ensureDailyTables();
+    const { rows } = await pgPool.query(`SELECT data FROM daily_qa_absences WHERE team_member_id = $1 AND absent_date = $2`, [memberId, date]);
+    return rows.length ? rows[0].data : null;
+  },
+  async listForMember(memberId, limit) {
+    await ensureDailyTables();
+    const { rows } = await pgPool.query(`SELECT data FROM daily_qa_absences WHERE team_member_id = $1 ORDER BY absent_date DESC LIMIT $2`, [memberId, limit || 30]);
+    return rows.map((r) => r.data);
+  },
+  async listRange(from, to) {
+    await ensureDailyTables();
+    const { rows } = await pgPool.query(
+      `SELECT data FROM daily_qa_absences
+        WHERE ($1::text IS NULL OR absent_date >= $1) AND ($2::text IS NULL OR absent_date <= $2)
+        ORDER BY absent_date DESC, data->>'memberName' ASC`,
+      [from || null, to || null]
+    );
+    return rows.map((r) => r.data);
+  },
+  async listAllDates() {
+    await ensureDailyTables();
+    const { rows } = await pgPool.query(`SELECT team_member_id, absent_date FROM daily_qa_absences`);
+    return rows.map((r) => ({ teamMemberId: r.team_member_id, absentDate: r.absent_date }));
+  },
+};
 const dailyReminders = {
   async claim(date) {
     await ensureDailyTables();
@@ -430,4 +482,4 @@ const dailyReminders = {
   },
 };
 
-module.exports = { releases, regressionModules, auditLog, testData, testAccountRelationships, dailyReports, dailyReminders, team, atlassianTokens };
+module.exports = { releases, regressionModules, auditLog, testData, testAccountRelationships, dailyReports, dailyAbsences, dailyReminders, team, atlassianTokens };

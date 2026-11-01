@@ -5,6 +5,8 @@
 //
 //   GET  /api/daily-reports/me            today's report (if any), recent reports, Slack status
 //   GET  /api/daily-reports/team          the team's reports, filtered (?from&to&member&q) — read-only for everyone but the author
+//   POST /api/daily-reports/absences      mark yourself absent on a working day (not counted as missed; never posted to Slack)
+//   DELETE /api/daily-reports/absences/:date   take that mark off again
 //   POST /api/daily-reports               save a report, then post it to Slack
 //   POST /api/daily-reports/:id/slack-retry   try the Slack post again for one of your reports
 //   PUT  /api/daily-reports/:id           edit one of your own reports (any date); saves only, never posts
@@ -70,7 +72,9 @@ router.get("/me", asyncHandler(async (req, res) => {
   const reportDate = logic.reportDateFor(new Date());
   const mine = await db.dailyReports.listForMember(member.id, HISTORY_LIMIT);
   const today = mine.find((r) => r.reportDate === reportDate) || null;
+  const away = await db.dailyAbsences.listForMember(member.id, 60);
   res.json({
+    absences: away.map(logic.publicAbsence),
     reportDate,
     reportDateLabel: logic.formatReportDate(reportDate),
     member: { id: member.id, name: member.name || "" },
@@ -91,17 +95,57 @@ router.get("/team", asyncHandler(async (req, res) => {
   const memberId = String(req.query.member || "").trim();
   const q = String(req.query.q || "").slice(0, 200);
   const all = await db.dailyReports.listRange(from || null, to || null);
-  const rows = all.filter((r) => (!memberId || r.teamMemberId === memberId) && logic.matchesSearch(r, q));
+  const away = await db.dailyAbsences.listRange(from || null, to || null);
+  const rows = all.filter((r) => (!memberId || r.teamMemberId === memberId) && logic.matchesSearch(r, q)).map((r) => logic.teamReport(r, me.id))
+    .concat(away.filter((a) => (!memberId || a.teamMemberId === memberId) && logic.matchesAbsenceSearch(a, q)).map((a) => logic.teamAbsence(a, me.id)));
+  // newest day first, then by name; a person's report and absence can't share a day
+  rows.sort((a, b) => String(b.reportDate).localeCompare(String(a.reportDate)) || String(a.memberName).localeCompare(String(b.memberName)));
   const people = Object.values(req.team || {}).filter((m) => m && logic.memberHasRegressionFlag(m))
     .map((m) => ({ id: m.id, name: m.name || "" }))
     .sort((a, b) => a.name.localeCompare(b.name));
   res.json({
-    reports: rows.slice(0, TEAM_LIMIT).map((r) => logic.teamReport(r, me.id)),
+    reports: rows.slice(0, TEAM_LIMIT),
     total: rows.length,
     truncated: rows.length > TEAM_LIMIT,
     members: people,
     today: logic.reportDateFor(new Date()),
   });
+}));
+
+// ---- absences (own only) ----
+router.post("/absences", asyncHandler(async (req, res) => {
+  const member = req.dailyMember;
+  const today = logic.reportDateFor(new Date());
+  const { clean, errors } = logic.validateAbsence(req.body, today);
+  if (Object.keys(errors).length) {
+    return res.status(400).json({ error: Object.values(errors)[0], fields: errors });
+  }
+  const mine = await db.dailyReports.listForMember(member.id, 400);
+  if (mine.some((r) => r.reportDate === clean.date)) {
+    return res.status(409).json({ error: "You already filed a report for " + logic.formatReportDate(clean.date) + " — it counts as filled, so there’s nothing to mark." });
+  }
+  const rec = logic.buildAbsence({ id: crypto.randomUUID(), member, clean, now: new Date() });
+  const saved = await db.dailyAbsences.insertIfNew(rec);
+  if (!saved.inserted) {
+    return res.status(409).json({ error: "You’re already marked absent on " + logic.formatReportDate(clean.date) + ".", absence: logic.publicAbsence(saved.existing) });
+  }
+  await recordEvents(db, resolveActor(req.authUser, req.team), [{
+    action: "DAILY_REPORT_ABSENCE_ADDED", entityType: "DailyReport", entityId: rec.id,
+    details: "Marked absent on " + clean.date, meta: { page: "dailyReport" },
+  }]);
+  res.status(201).json({ absence: logic.publicAbsence(rec) });
+}));
+router.delete("/absences/:date", asyncHandler(async (req, res) => {
+  const member = req.dailyMember;
+  const date = logic.cleanDate(req.params.date);
+  const existing = date ? await db.dailyAbsences.find(member.id, date) : null;
+  if (!existing) return res.status(404).json({ error: "No absence is marked on that day." });
+  await db.dailyAbsences.remove(member.id, date);
+  await recordEvents(db, resolveActor(req.authUser, req.team), [{
+    action: "DAILY_REPORT_ABSENCE_REMOVED", entityType: "DailyReport", entityId: existing.id,
+    details: "Removed the absence on " + date, meta: { page: "dailyReport" },
+  }]);
+  res.json({ ok: true });
 }));
 
 router.post("/", asyncHandler(async (req, res) => {
@@ -129,6 +173,8 @@ router.post("/", asyncHandler(async (req, res) => {
     });
   }
   const actor = resolveActor(req.authUser, req.team);
+  // A report for a day they had marked absent wins: the day is filled, not absent.
+  await db.dailyAbsences.remove(member.id, report.reportDate);
   await recordEvents(db, actor, [{
     action: "DAILY_REPORT_SUBMITTED", entityType: "DailyReport", entityId: report.id,
     details: "Daily QA report for " + report.reportDate, meta: { page: "dailyReport" },

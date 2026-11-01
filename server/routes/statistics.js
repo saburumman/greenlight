@@ -41,7 +41,8 @@ router.get("/daily-reports", asyncHandler(async (req, res) => {
   const members = team.filter((m) => !memberId || m.id === memberId)
     .map((m) => ({ id: m.id, name: m.name || "", createdAt: m.createdAt }));
   const reports = await db.dailyReports.listAllDates();
-  res.json(dailyLogic.coverage({ reports, members, from, to, today }));
+  const absences = await db.dailyAbsences.listAllDates();
+  res.json(dailyLogic.coverage({ reports, members, from, to, today, absences }));
 }));
 
 module.exports = router;
