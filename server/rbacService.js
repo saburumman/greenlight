@@ -225,7 +225,13 @@ function registerOrUpdateOnLogin(identity, opts) {
 // revoke applies from the very next request.
 async function loadAccess(identity, opts) {
   let user = await db.appUsers.getByAccountId(identity.accountId);
-  if (!user || (user.status !== "ACTIVE" && bootstrapIds().includes(user.accountId))) {
+  // Bootstrap candidates (SUPER_ADMIN_ACCOUNT_IDS) are re-checked on requests too — not only at sign-in — so someone who
+  // was already signed in (and was registered, or migrated, before the variable was set) is promoted by the next request
+  // once it is set, with no need to sign out and in. maybeBootstrap does nothing unless NO active Super Admin exists.
+  const isBootstrapId = !!user && bootstrapIds().includes(user.accountId);
+  const curRole = isBootstrapId ? await roleOf(user) : null;
+  const alreadySuper = isBootstrapId && user.status === "ACTIVE" && !!curRole && curRole.systemKey === "super_admin";
+  if (!user || (isBootstrapId && !alreadySuper)) {
     user = await registerOrUpdateOnLogin(identity, { login: !!(opts && opts.login) });
   }
   const role = await roleOf(user);
