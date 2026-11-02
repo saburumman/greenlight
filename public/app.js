@@ -102,6 +102,14 @@ function anyFieldFocused(){
    API LAYER
    ============================================================ */
 var API = "/api";
+// releaseId -> the release exactly as the server last returned it (never mutated by edits).
+var releaseBases = {};
+function rememberBase(r){
+  if(!r || !r._id) return;
+  var copy = JSON.parse(JSON.stringify(r));
+  delete copy.releaseNotes; delete copy.mobileReleaseNote; // large, saved through their own flows — last writer wins as before
+  releaseBases[r._id] = copy;
+}
 function apiCall(method, path, body){
   return fetch(API+path, {
     method: method,
@@ -159,7 +167,13 @@ var api = {
   listReleases: function(){ return apiCall("GET","/releases"); },
   getRelease: function(id){ return apiCall("GET","/releases/"+id); },
   createRelease: function(data){ return apiCall("POST","/releases", data); },
-  saveRelease: function(id, data){ return apiCall("PUT","/releases/"+id, data); },
+  // Sends the release as edited PLUS `_base`, the copy last received from the server, so the server
+  // applies only what this browser changed and never reverts another person's edits (server/mergeRelease.js).
+  saveRelease: function(id, data){
+    var body = data;
+    if(releaseBases[id]) body = Object.assign({}, data, {_base: releaseBases[id]});
+    return apiCall("PUT","/releases/"+id, body);
+  },
   deleteRelease: function(id){ return apiCall("DELETE","/releases/"+id); },
   duplicateRelease: function(id){ return apiCall("POST","/releases/"+id+"/duplicate"); },
   addTicket: function(id, data){ return apiCall("POST","/releases/"+id+"/tickets", data); },
@@ -1074,7 +1088,7 @@ function loadList(){
   return api.listReleases().then(function(list){
     state.releases = {};
     state.releaseOrder = [];
-    list.forEach(function(r){ state.releases[r._id] = r; state.releaseOrder.push(r._id); });
+    list.forEach(function(r){ state.releases[r._id] = r; rememberBase(r); state.releaseOrder.push(r._id); });
     state.listReady = true;
     state.loadError = null;
   }).catch(function(e){
@@ -1084,6 +1098,7 @@ function loadList(){
 function loadOne(id){
   return api.getRelease(id).then(function(r){
     state.releases[id] = r;
+    rememberBase(r);
     state.loadError = null;
   }).catch(function(e){
     state.loadError = e.message;
@@ -5523,6 +5538,7 @@ function persistIncidents(r, nextIncidents, onSaved){
   r.incidents = nextIncidents;
   return api.saveRelease(r._id, r).then(function(updated){
     state.releases[r._id] = updated;
+    rememberBase(updated);
     render();
     if(onSaved) onSaved();
   }).catch(function(e){
@@ -6070,6 +6086,7 @@ function openCreateReleaseModal(){
     api.createRelease({name:name, version:qs("#f-version").value.trim(), date:qs("#f-date").value, qaOwner:qs("#f-owner").value.trim()})
       .then(function(r){
         state.releases[r._id]=r;
+        rememberBase(r);
         closeModal();
         logAudit({action:"RELEASE_CREATED", entityType:"Release", entityId:r._id, details: releaseLabel(r)});
         goTo("#/r/"+r._id);
@@ -6110,6 +6127,7 @@ function openEditReleaseInfoModal(r){
 function persistRelease(r, onSuccess){
   return api.saveRelease(r._id, r).then(function(updated){
     state.releases[r._id]=updated;
+    rememberBase(updated);
     render();
     if(onSuccess) onSuccess();
   }).catch(function(e){ showToast(e.message); });
@@ -6152,6 +6170,7 @@ function openAddTicketModal(r){
         return;
       }
       state.releases[r._id] = result.release;
+      rememberBase(result.release);
       closeModal();
       if(result.lookupError){
         showToast("Added "+result.ticket.key+", but couldn’t fetch details from Jira — edit it to fill fields in manually.");
@@ -7042,6 +7061,7 @@ function handleSyncRegressionModules(r){
   if(btn){ btn.disabled = true; btn.innerHTML = iconRefresh()+' Syncing…'; }
   api.syncRegressionModules(r._id).then(function(result){
     state.releases[r._id] = result.release;
+    rememberBase(result.release);
     render();
     var added = [];
     if(result.addedEntities) added.push(result.addedEntities+" new entit"+(result.addedEntities===1?"y":"ies"));
@@ -7067,6 +7087,7 @@ function handleResyncJira(r){
   if(btn){ btn.disabled = true; btn.innerHTML = iconRefresh()+' Syncing…'; }
   api.jiraSync(r._id).then(function(result){
     state.releases[r._id] = result.release;
+    rememberBase(result.release);
     render();
     var parts = [];
     if(result.added) parts.push(result.added+" new ticket"+pluralize(result.added,"","s")+" added");
@@ -7764,6 +7785,7 @@ document.addEventListener("keydown", function(e){
 function duplicateRelease(r){
   api.duplicateRelease(r._id).then(function(clone){
     state.releases[clone._id] = clone;
+    rememberBase(clone);
     showToast("Release duplicated");
     goTo("#/r/"+clone._id);
   }).catch(function(e){ showToast(e.message); });

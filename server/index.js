@@ -49,7 +49,7 @@ const PORT = process.env.PORT || 3000;
 // deploy passes the build but the service never comes up healthy.
 const HOST = "0.0.0.0";
 
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "4mb" }));
 
 // Unauthenticated by nature — this is how sign-in itself happens (login,
 // callback, logout, and the frontend's own-session check).

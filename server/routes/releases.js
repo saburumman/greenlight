@@ -11,6 +11,7 @@ const assignmentLogic = require("../assignmentLogic"); // QA assignment by Know 
 const { recordEvents } = require("../auditWriter");
 const { asyncHandler } = require("../asyncHandler");
 const { requirePermission, requireAnyPermission } = require("../accessControl");
+const { mergeReleaseSave } = require("../mergeRelease");
 const { authorizeReleaseSave } = require("../releaseAccess"); // which parts of a release this caller may change (by permission)
 
 const router = express.Router();
@@ -130,13 +131,27 @@ router.get("/:id", requirePermission("releases.view"), asyncHandler(async (req, 
 // Full-document replace — the frontend mutates its local copy of a release
 // (adding a bug, editing a platform, etc.) and PUTs the whole thing back.
 // Kept deliberately simple and generic, matching every non-ticket section.
-router.put("/:id", requireAnyPermission("releases.edit", "releases.manage", "regression.edit", "regression.assign", "regression.create", "regression.delete", "regression.manage"), asyncHandler(async (req, res) => {
+// One save per release at a time (this process): read-merge-write must not interleave with another save of the same release.
+const saveChains = new Map();
+function serialized(id, fn) {
+  const prev = saveChains.get(id) || Promise.resolve();
+  const run = prev.catch(() => {}).then(fn);
+  const tail = run.catch(() => {});
+  saveChains.set(id, tail);
+  tail.then(() => { if (saveChains.get(id) === tail) saveChains.delete(id); });
+  return run;
+}
+
+router.put("/:id", requireAnyPermission("releases.edit", "releases.manage", "regression.edit", "regression.assign", "regression.create", "regression.delete", "regression.manage"), asyncHandler((req, res) => serialized(req.params.id, async () => {
   const existing = await getReleaseMigrated(req.params.id);
   if (!existing) return notFound(res);
   // What this caller is allowed to change, by permission (releaseAccess.js):
   // a part they may not change is kept exactly as stored. If they asked for
   // changes and none of them is allowed, refuse.
-  const authz = authorizeReleaseSave(existing, req.body || {}, req.access.permissions);
+  // Two people on one release: apply only what this browser changed since the copy
+  // it last received (`_base`), keep everything else as stored (mergeRelease.js).
+  const { _base, ...sent } = req.body || {};
+  const authz = authorizeReleaseSave(existing, mergeReleaseSave(_base, existing, sent), req.access.permissions);
   if (authz.denied.length && authz.applied === 0) {
     return res.status(403).json({ error: "You don’t have permission to make that change.", code: "FORBIDDEN", required: authz.denied });
   }
@@ -174,7 +189,7 @@ router.put("/:id", requireAnyPermission("releases.edit", "releases.manage", "reg
   await db.releases.set(req.params.id, merged);
   await recordEvents(db, actor, events, now);
   res.json(merged);
-}));
+})));
 
 router.delete("/:id", requirePermission("releases.delete"), asyncHandler(async (req, res) => {
   const existing = await getReleaseMigrated(req.params.id);

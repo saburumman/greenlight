@@ -105,7 +105,7 @@ Greenlight still signs people in with **Sign in with Atlassian** (no separate pa
 
 Nobody becomes an administrator by being the first to sign in, there are no hard-coded ids, and there is **no web endpoint** that can grant admin rights. There are two operator-only ways, both of which need control of the server:
 
-1. **`SUPER_ADMIN_ACCOUNT_IDS`** — set this environment variable (Render → Environment) to the Jira account id of the person who should be Super Admin (comma-separated for more than one). When one of those people signs in **and no active Super Admin exists**, they are made the Super Admin (audited). Once a Super Admin exists the variable does nothing, so it can't be used to take over later; remove it afterwards if you like. If you set it after someone has already signed in, just have them sign in again.
+1. **`SUPER_ADMIN_ACCOUNT_IDS`** — set this environment variable (Render → Environment) to the Jira account id of the person who should be Super Admin (comma-separated for more than one). When one of those people signs in **and no active Super Admin exists**, they are made the Super Admin (audited). Once a Super Admin exists the variable does nothing, so it can't be used to take over later; remove it afterwards if you like. It is also checked on every request for the listed people, so it works for someone who was already signed in (or was migrated into a normal role) before you set it — after the redeploy their next page load promotes them; no sign-out needed.
 2. **`npm run admin:bootstrap -- <jiraAccountId> [--name "Display Name"] [--force]`** — run from the server's shell with `DATABASE_URL` set. Same rule (refuses when an active Super Admin exists, unless `--force`).
 
 **Where to find a Jira account id:** it is shown on the "your access is pending" screen right after signing in; it is also the last part of the person's Atlassian profile address (`https://<site>.atlassian.net/jira/people/<accountId>`).
@@ -283,6 +283,10 @@ This isn't a screenshot of the release page — it's a separate, purpose-built r
 - **Release Notes** — whatever's currently saved in the release's Release Notes section.
 
 The browser's Save-as-PDF dialog also suggests the file's name for you, from the release's own name and version (e.g. "Checkout Revamp v2.4.1"), so you don't have to rename it after saving.
+
+## Saving a release when several people have it open
+
+A release is saved as one document, so a tab that was opened a while ago used to overwrite what teammates changed in the meantime (and the activity log blamed the person who saved). Now every save carries the copy the browser last received from the server (`_base`), and the server does a three-way merge against the current copy (`server/mergeRelease.js`): fields you did not touch keep the other person's latest value, rows (regression modules, tickets, incidents) are merged by id, and saves for the same release are processed one at a time. If two people change the *same* field at the same moment, the last save wins. Older tabs that do not send `_base` behave as before, so hard-refresh (Ctrl+Shift+R) after a deploy.
 
 ## Test Data
 
