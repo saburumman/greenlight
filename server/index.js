@@ -13,6 +13,11 @@ const statisticsRouter = require("./routes/statistics");
 const reportingRouter = require("./routes/reporting");
 const dailyReportsRouter = require("./routes/dailyReports");
 const authRouter = require("./routes/auth");
+const usersRouter = require("./routes/users");
+const rolesRouter = require("./routes/roles");
+const { attachAccess } = require("./accessControl");
+const { httpErrorMiddleware } = require("./httpError");
+const rbac = require("./rbacService");
 const oauth = require("./auth/atlassianOAuth");
 const { requireAuth } = require("./auth/middleware");
 const pgPool = require("./db/pgPool");
@@ -50,8 +55,13 @@ app.use(express.json({ limit: "2mb" }));
 // callback, logout, and the frontend's own-session check).
 app.use("/auth", authRouter);
 
-// Everything else under /api requires a signed-in session.
+// Everything else under /api requires a signed-in session (requireAuth) AND an
+// ACTIVE application user: attachAccess looks the person up by Jira accountId,
+// refuses Pending and Deactivated accounts for every route, and puts their
+// effective permissions on req.access. Each router below then guards its own
+// routes by permission.
 app.use("/api", requireAuth);
+app.use("/api", attachAccess);
 app.use("/api/releases", releasesRouter);
 app.use("/api/jira", jiraRouter);
 app.use("/api/regression-modules", regressionModulesRouter);
@@ -63,6 +73,9 @@ app.use("/api/daily-reports", dailyReportsRouter);
 // Restricted areas: every route inside is guarded by pageAccess.requirePageAccess.
 app.use("/api/statistics", statisticsRouter);
 app.use("/api/reporting", reportingRouter);
+// Administration: guarded per route by users.* / roles.* permissions.
+app.use("/api/users", usersRouter);
+app.use("/api/roles", rolesRouter);
 
 app.use(express.static(path.join(__dirname, "..", "public")));
 
@@ -72,6 +85,7 @@ app.get(/^\/(?!api\/).*/, (req, res) => {
   res.sendFile(path.join(__dirname, "..", "public", "index.html"));
 });
 
+app.use(httpErrorMiddleware);
 app.use((err, req, res, next) => {
   console.error(err);
   res.status(500).json({ error: "Something went wrong on the server." });
@@ -104,6 +118,18 @@ app.listen(PORT, HOST, () => {
       }])
     );
   }
+  // Built-in roles (Super Admin, Admin, QA Lead, QA Engineer, Viewer) are
+  // created on first start; later starts leave them (and any edits) alone.
+  // Non-fatal: they are also created on the first sign-in if this fails.
+  rbac.ensureSystemRoles()
+    .then(async () => {
+      if ((await rbac.countActiveSuperAdmins()) === 0) {
+        console.log("  Access control: no active Super Admin yet — set SUPER_ADMIN_ACCOUNT_IDS (or run `npm run admin:bootstrap -- <accountId>`) to create the first one. See README → Users, roles & permissions.\n");
+      } else {
+        console.log("  Access control: roles ready\n");
+      }
+    })
+    .catch((e) => console.error(`  Access control: roles could not be prepared yet (${e.message})\n`));
   // Daily QA Update reminder (3:45 PM Asia/Amman) — only when Slack is set up.
   if (slack.isConfigured("reminder")) {
     dailyReportReminder.start();

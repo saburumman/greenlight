@@ -12,7 +12,8 @@
     "start": "node server/index.js",
     "dev": "node server/index.js",
     "db:migrate": "node scripts/migrate-json-to-supabase.js",
-    "db:seed-defaults": "node scripts/seed-defaults.js"
+    "db:seed-defaults": "node scripts/seed-defaults.js",
+    "admin:bootstrap": "node scripts/bootstrap-super-admin.js"
   },
   "dependencies": {
     "@resvg/resvg-js": "^2.6.2",

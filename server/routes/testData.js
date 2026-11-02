@@ -21,6 +21,7 @@ const crypto = require("crypto");
 const ExcelJS = require("exceljs");
 const db = require("../db");
 const { asyncHandler } = require("../asyncHandler");
+const { requirePermission } = require("../accessControl");
 const { resolveActor } = require("../assignmentLogic");
 const { recordEvents } = require("../auditWriter");
 const rel = require("../testAccountRelationships");
@@ -77,11 +78,11 @@ async function findDuplicate(nationalId, excludeId) {
   return all.find((t) => t.nationalId === nationalId && t.id !== excludeId) || null;
 }
 
-router.get("/", asyncHandler(async (req, res) => {
+router.get("/", requirePermission("test_data.view"), asyncHandler(async (req, res) => {
   res.json(await db.testData.list());
 }));
 
-router.post("/", asyncHandler(async (req, res) => {
+router.post("/", requirePermission("test_data.create"), asyncHandler(async (req, res) => {
   const result = validateAndClean(req.body);
   if (result.error) return res.status(400).json({ error: result.error });
   const dup = await findDuplicate(result.clean.nationalId, null);
@@ -112,7 +113,7 @@ router.post("/", asyncHandler(async (req, res) => {
 // earlier in this same batch) is skipped rather than failing the whole
 // batch — the client already filters out IDs it knows about, but this is
 // the authoritative check, same duplicate rule as the single-record route.
-router.post("/bulk", asyncHandler(async (req, res) => {
+router.post("/bulk", requirePermission("test_data.create"), asyncHandler(async (req, res) => {
   const records = Array.isArray(req.body && req.body.records) ? req.body.records : [];
   if (!records.length) return res.status(400).json({ error: "No records to import." });
   if (records.length > 2000) return res.status(400).json({ error: "Too many records in one import (max 2000)." });
@@ -166,7 +167,7 @@ function matchesExportFilters(t, q, entQ, tagQ, relatedIds) {
 }
 
 // Placed before GET /:id so "export" is never swallowed as an :id.
-router.get("/export", asyncHandler(async (req, res) => {
+router.get("/export", requirePermission("test_data.view"), asyncHandler(async (req, res) => {
     const q = String(req.query.q || "").trim().toLowerCase();
     const entQ = String(req.query.entity || "").trim().toLowerCase();
     const tagQ = String(req.query.tag || "").trim().toLowerCase();
@@ -275,7 +276,7 @@ function relEvent(action, r, accountsById, extra) {
   };
 }
 
-router.get("/relationships", asyncHandler(async (req, res) => {
+router.get("/relationships", requirePermission("test_data.view"), asyncHandler(async (req, res) => {
   const { rels } = await loadRelationshipContext();
   res.json(rels);
 }));
@@ -284,7 +285,7 @@ router.get("/relationships", asyncHandler(async (req, res) => {
 // validated independently (self-link, missing account, duplicate…); the ones
 // that pass are saved and the rest are reported back, nothing is dropped
 // silently.
-router.post("/:id/relationships", asyncHandler(async (req, res) => {
+router.post("/:id/relationships", requirePermission("test_data.edit"), asyncHandler(async (req, res) => {
   const selfId = req.params.id;
   const links = Array.isArray(req.body && req.body.links) ? req.body.links : [];
   if (!links.length) return res.status(400).json({ error: "Choose at least one account to link." });
@@ -317,7 +318,7 @@ router.post("/:id/relationships", asyncHandler(async (req, res) => {
 // Edit one link from the point of view of `perspectiveId` (either account in
 // it): { perspectiveId, relationshipType, inverseRelationshipType } where
 // relationshipType = what the OTHER account is to the perspective account.
-router.put("/relationships/:relId", asyncHandler(async (req, res) => {
+router.put("/relationships/:relId", requirePermission("test_data.edit"), asyncHandler(async (req, res) => {
   const { rels, accountsById } = await loadRelationshipContext();
   const existing = rels.find((r) => r.id === req.params.relId);
   if (!existing) return res.status(404).json({ error: "Relationship not found." });
@@ -344,7 +345,7 @@ router.put("/relationships/:relId", asyncHandler(async (req, res) => {
 }));
 
 // Removes the link only — both accounts are left exactly as they were.
-router.delete("/relationships/:relId", asyncHandler(async (req, res) => {
+router.delete("/relationships/:relId", requirePermission("test_data.delete"), asyncHandler(async (req, res) => {
   const { rels, accountsById } = await loadRelationshipContext();
   const existing = rels.find((r) => r.id === req.params.relId);
   if (!existing) return res.status(404).json({ error: "Relationship not found." });
@@ -353,13 +354,13 @@ router.delete("/relationships/:relId", asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
-router.get("/:id", asyncHandler(async (req, res) => {
+router.get("/:id", requirePermission("test_data.view"), asyncHandler(async (req, res) => {
   const t = await db.testData.get(req.params.id);
   if (!t) return notFound(res);
   res.json(t);
 }));
 
-router.put("/:id", asyncHandler(async (req, res) => {
+router.put("/:id", requirePermission("test_data.edit"), asyncHandler(async (req, res) => {
   const existing = await db.testData.get(req.params.id);
   if (!existing) return notFound(res);
   const result = validateAndClean(req.body);
@@ -383,7 +384,7 @@ router.put("/:id", asyncHandler(async (req, res) => {
   res.json(merged);
 }));
 
-router.delete("/:id", asyncHandler(async (req, res) => {
+router.delete("/:id", requirePermission("test_data.delete"), asyncHandler(async (req, res) => {
   const existing = await db.testData.get(req.params.id);
   if (!existing) return notFound(res);
   // Links to this account go with it (each is audited) — the linked accounts

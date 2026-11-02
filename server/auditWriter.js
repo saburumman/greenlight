@@ -16,7 +16,12 @@ const META_KEYS = [
   "previousStatus", "newStatus", "byOther",
   "targetMemberId", "page",
   "accountAId", "accountBId", "relationshipType", "inverseRelationshipType",
+  // Users, roles & permissions (RBAC) events — see rbacService.js
+  "targetUserId", "targetRoleId", "permission", "previousValue", "newValue", "actorAccountId",
 ];
+// Previous/new values of an administrative change (a role name, a list of
+// permissions) are allowed to be a little longer than the other short fields.
+const LONG_META_KEYS = new Set(["previousValue", "newValue"]);
 
 function cleanMeta(meta) {
   if (!meta || typeof meta !== "object") return undefined;
@@ -26,7 +31,7 @@ function cleanMeta(meta) {
     const v = meta[k];
     if (v === null) out[k] = null;
     else if (typeof v === "boolean") out[k] = v;
-    else if (typeof v === "string") out[k] = v.slice(0, 200);
+    else if (typeof v === "string") out[k] = v.slice(0, LONG_META_KEYS.has(k) ? 1000 : 200);
     else if (Array.isArray(v) && (k === "assignedTo" || k === "previousAssignedTo")) {
       // a ticket can have several QA owners: a short list of member ids
       out[k] = v.filter((x) => typeof x === "string" && x).slice(0, 20).map((x) => x.slice(0, 200));

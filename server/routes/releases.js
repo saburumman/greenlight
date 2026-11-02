@@ -10,6 +10,8 @@ const incidentLogic = require("../incidentLogic"); // Incidents section — vali
 const assignmentLogic = require("../assignmentLogic"); // QA assignment by Know the Team member id — legacy-name migration + the save diff that produces assignment/status audit events
 const { recordEvents } = require("../auditWriter");
 const { asyncHandler } = require("../asyncHandler");
+const { requirePermission, requireAnyPermission } = require("../accessControl");
+const { authorizeReleaseSave } = require("../releaseAccess"); // which parts of a release this caller may change (by permission)
 
 const router = express.Router();
 
@@ -103,11 +105,11 @@ async function withAssignmentsMigrated(releases) {
   return releases;
 }
 
-router.get("/", asyncHandler(async (req, res) => {
+router.get("/", requirePermission("releases.view"), asyncHandler(async (req, res) => {
   res.json(await withAssignmentsMigrated(await db.releases.list()));
 }));
 
-router.post("/", asyncHandler(async (req, res) => {
+router.post("/", requirePermission("releases.create"), asyncHandler(async (req, res) => {
   const { name, version, date, qaOwner } = req.body || {};
   if (!name || !String(name).trim()) {
     return res.status(400).json({ error: "Release name is required." });
@@ -119,7 +121,7 @@ router.post("/", asyncHandler(async (req, res) => {
   res.status(201).json(doc);
 }));
 
-router.get("/:id", asyncHandler(async (req, res) => {
+router.get("/:id", requirePermission("releases.view"), asyncHandler(async (req, res) => {
   const r = await getReleaseMigrated(req.params.id);
   if (!r) return notFound(res);
   res.json(r);
@@ -128,10 +130,17 @@ router.get("/:id", asyncHandler(async (req, res) => {
 // Full-document replace — the frontend mutates its local copy of a release
 // (adding a bug, editing a platform, etc.) and PUTs the whole thing back.
 // Kept deliberately simple and generic, matching every non-ticket section.
-router.put("/:id", asyncHandler(async (req, res) => {
+router.put("/:id", requireAnyPermission("releases.edit", "releases.manage", "regression.edit", "regression.assign", "regression.create", "regression.delete", "regression.manage"), asyncHandler(async (req, res) => {
   const existing = await getReleaseMigrated(req.params.id);
   if (!existing) return notFound(res);
-  const incoming = req.body || {};
+  // What this caller is allowed to change, by permission (releaseAccess.js):
+  // a part they may not change is kept exactly as stored. If they asked for
+  // changes and none of them is allowed, refuse.
+  const authz = authorizeReleaseSave(existing, req.body || {}, req.access.permissions);
+  if (authz.denied.length && authz.applied === 0) {
+    return res.status(403).json({ error: "You don’t have permission to make that change.", code: "FORBIDDEN", required: authz.denied });
+  }
+  const incoming = authz.merged;
   // Incidents are the one section validated server-side on this otherwise
   // generic save: each must be well-formed, and a ticket-level incident may
   // only point at a ticket that belongs to this release. An older client that
@@ -146,7 +155,7 @@ router.put("/:id", asyncHandler(async (req, res) => {
     return res.status(e.status || 400).json({ error: e.message });
   }
   const now = new Date().toISOString();
-  const merged = { ...incoming, incidents, _id: req.params.id, updatedAt: now };
+  const merged = { ...incoming, incidents, _id: req.params.id, createdAt: existing.createdAt, updatedAt: now };
 
   // Assignments are Know the Team member ids. Bring BOTH copies to that
   // shape first (a stored release, or an old browser tab, may still carry
@@ -167,14 +176,14 @@ router.put("/:id", asyncHandler(async (req, res) => {
   res.json(merged);
 }));
 
-router.delete("/:id", asyncHandler(async (req, res) => {
+router.delete("/:id", requirePermission("releases.delete"), asyncHandler(async (req, res) => {
   const existing = await getReleaseMigrated(req.params.id);
   if (!existing) return notFound(res);
   await db.releases.delete(req.params.id);
   res.json({ ok: true });
 }));
 
-router.post("/:id/duplicate", asyncHandler(async (req, res) => {
+router.post("/:id/duplicate", requirePermission("releases.create"), asyncHandler(async (req, res) => {
   const existing = await getReleaseMigrated(req.params.id);
   if (!existing) return notFound(res);
   const id = crypto.randomUUID();
@@ -230,7 +239,7 @@ function upsertTicket(tickets, ticket, source) {
 // POST /api/releases/:id/tickets — add one ticket by Jira URL.
 // If Jira is connected, fields are auto-filled from a live lookup;
 // otherwise the caller supplies title/status/issueType/priority.
-router.post("/:id/tickets", asyncHandler(async (req, res) => {
+router.post("/:id/tickets", requirePermission("releases.edit"), asyncHandler(async (req, res) => {
   const release = await getReleaseMigrated(req.params.id);
   if (!release) return notFound(res);
 
@@ -284,7 +293,7 @@ function bucketFromManualStatus(status) {
   return "Open / To Do";
 }
 
-router.delete("/:id/tickets/:key", asyncHandler(async (req, res) => {
+router.delete("/:id/tickets/:key", requirePermission("releases.edit"), asyncHandler(async (req, res) => {
   const release = await getReleaseMigrated(req.params.id);
   if (!release) return notFound(res);
   release.tickets = (release.tickets || []).filter((t) => t.key !== req.params.key);
@@ -301,7 +310,7 @@ router.delete("/:id/tickets/:key", asyncHandler(async (req, res) => {
 // A ticket that's only ever been added manually, and has never itself been
 // matched by a Fix Version search, keeps source "Manual" (see upsertTicket)
 // and is never touched by this removal — only Jira-confirmed tickets are.
-router.post("/:id/jira-sync", asyncHandler(async (req, res) => {
+router.post("/:id/jira-sync", requirePermission("releases.edit"), asyncHandler(async (req, res) => {
   const release = await getReleaseMigrated(req.params.id);
   if (!release) return notFound(res);
 
@@ -372,7 +381,7 @@ router.post("/:id/jira-sync", asyncHandler(async (req, res) => {
 // fall back to the rule-based summarizer" pipeline, and aiService.js for
 // the one place provider config (a single API key) actually lives.
 
-router.post("/:id/release-notes/generate", asyncHandler(async (req, res) => {
+router.post("/:id/release-notes/generate", requirePermission("releases.edit"), asyncHandler(async (req, res) => {
   const release = await getReleaseMigrated(req.params.id);
   if (!release) return notFound(res);
 
@@ -489,7 +498,7 @@ router.post("/:id/release-notes/generate", asyncHandler(async (req, res) => {
 // this release happens through the existing generic PUT /:id, exactly like
 // every other section on a release (see handleSaveMobileNote in app.js).
 
-router.post("/:id/mobile-release-note/draft-en", asyncHandler(async (req, res) => {
+router.post("/:id/mobile-release-note/draft-en", requirePermission("releases.edit"), asyncHandler(async (req, res) => {
   const release = await getReleaseMigrated(req.params.id);
   if (!release) return notFound(res);
 
@@ -517,7 +526,7 @@ router.post("/:id/mobile-release-note/draft-en", asyncHandler(async (req, res) =
   });
 }));
 
-router.post("/:id/mobile-release-note/translate-ar", asyncHandler(async (req, res) => {
+router.post("/:id/mobile-release-note/translate-ar", requirePermission("releases.edit"), asyncHandler(async (req, res) => {
   const release = await getReleaseMigrated(req.params.id);
   if (!release) return notFound(res);
 
@@ -555,7 +564,7 @@ router.post("/:id/mobile-release-note/translate-ar", asyncHandler(async (req, re
 // left alone either way. This lets a release created before an entity/
 // service existed pick it up later, and a release tracking one that's
 // since been deleted drop it, both on demand rather than automatically.
-router.post("/:id/regression-sync", asyncHandler(async (req, res) => {
+router.post("/:id/regression-sync", requirePermission("regression.manage"), asyncHandler(async (req, res) => {
   const release = await getReleaseMigrated(req.params.id);
   if (!release) return notFound(res);
 

@@ -7,10 +7,11 @@ const express = require("express");
 const crypto = require("crypto");
 const db = require("../db");
 const { asyncHandler } = require("../asyncHandler");
+const { requirePermission } = require("../accessControl");
 
 const router = express.Router();
 
-router.get("/", asyncHandler(async (req, res) => {
+router.get("/", requirePermission("regression.view"), asyncHandler(async (req, res) => {
   res.json(await db.regressionModules.list());
 }));
 
@@ -18,7 +19,7 @@ router.get("/", asyncHandler(async (req, res) => {
 // Modules" modal, which lets the user add/rename/reorder/delete entities
 // and services freely and then saves once. Array order is display order,
 // both for entities and for each entity's services.
-router.put("/", asyncHandler(async (req, res) => {
+router.put("/", requirePermission("regression.manage"), asyncHandler(async (req, res) => {
   const incoming = req.body;
   if (!Array.isArray(incoming)) {
     return res.status(400).json({ error: "Expected a list of entities." });

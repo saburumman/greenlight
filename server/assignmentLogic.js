@@ -89,14 +89,17 @@ function cleanId(value) {
 }
 
 // The team member behind a signed-in Atlassian account: the Know the Team
-// entry the user pinned with "This is me" (member.linkedEmail). Returns
-// {id, name} — id is null when the user hasn't linked themselves yet (their
-// own Atlassian name is then only a display label, never an identity).
+// entry linked to their application user (by stable Team Member id — see
+// rbacService.js). Returns {id, name} — id is null when the user isn't linked
+// yet (their own Atlassian name is then only a display label, never an
+// identity).
 function resolveActor(authUser, team) {
-  const email = authUser && authUser.email ? String(authUser.email).trim().toLowerCase() : "";
   const fallbackName = (authUser && authUser.name) || "Unknown";
-  if (email) {
-    const m = (team || []).find((x) => x && x.linkedEmail && String(x.linkedEmail).trim().toLowerCase() === email);
+  // The Team Member this signed-in person is linked to — by the stable id on
+  // their application user (set by accessControl.attachAccess), not by email.
+  const id = authUser && authUser.teamMemberId;
+  if (id) {
+    const m = (team || []).find((x) => x && x.id === id);
     if (m) return { id: m.id, name: m.name || fallbackName };
   }
   return { id: null, name: fallbackName };

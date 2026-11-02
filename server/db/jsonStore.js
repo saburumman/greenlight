@@ -13,7 +13,9 @@
 //                   auditLog: [{id,teamMemberId,userName,action,entityType,entityId,details,meta?,createdAt}],
 //                   testData: { <id>: {...} }, testAccountRelationships: { <id>: {...} },
 //                   dailyReports: { <id>: {...} }, dailyReminders: { <YYYY-MM-DD>: {date,claimedAt} }, team: { <id>: {...} },
-//                   atlassianTokens: { <accountId>: {accountId,accessToken,refreshToken,expiresAt,scope,updatedAt} } }
+//                   atlassianTokens: { <accountId>: {accountId,accessToken,refreshToken,expiresAt,scope,updatedAt} },
+//                   appRoles: { <id>: {id,systemKey,name,description,isSystem,isActive,permissions[]} },
+//                   appUsers: { <id>: {id,accountId,displayName,email,roleId,status,teamMemberId,overrides{},lastLoginAt,...} } }
 //
 // testData is a reusable QA data library — see routes/testData.js. It is
 // deliberately its own top-level collection (same shape/pattern as
@@ -114,6 +116,8 @@ function ensureStore() {
           dailyReports: {},
           dailyAbsences: {},
           dailyReminders: {},
+          appRoles: {},
+          appUsers: {},
           team: buildDefaultTeam(),
           atlassianTokens: {},
         },
@@ -182,6 +186,14 @@ function readAll() {
       parsed.dailyReminders = {};
       dirty = true;
     }
+    // Additive: stores created before users/roles existed just get empty
+    // collections — nothing else about them changes.
+    for (const k of ["appRoles", "appUsers"]) {
+      if (!parsed[k] || typeof parsed[k] !== "object" || Array.isArray(parsed[k])) {
+        parsed[k] = {};
+        dirty = true;
+      }
+    }
     // Additive: Test Data records saved before Entity became a multi-value
     // field carry a single `entity` string — convert each to the new
     // `entities` array (dropping the old key) so every record has a
@@ -236,6 +248,8 @@ function readAll() {
       dailyReports: {},
       dailyAbsences: {},
       dailyReminders: {},
+      appRoles: {},
+      appUsers: {},
       team: buildDefaultTeam(),
       atlassianTokens: {},
     };
@@ -535,6 +549,82 @@ const team = {
   },
 };
 
+// ---- Users, roles & permissions (RBAC) --------------------------------
+// Same interface as the Postgres store (server/db/pgStore.js). A user is
+// keyed by its Jira accountId (unique — never email or name); a role's
+// permission list and a user's overrides are embedded in their documents here
+// (join tables in Postgres). Uniqueness rules the database enforces in
+// Postgres (accountId, role name, one user per Team Member) are enforced here
+// in the same synchronous read-modify-write, so both backends refuse the same
+// things.
+function rbacError(code, message) {
+  const e = new Error(message);
+  e.code = code;
+  return e;
+}
+const appRoles = {
+  async list() {
+    return Object.values(readAll().appRoles).map((r) => ({ ...r, permissions: (r.permissions || []).slice() }));
+  },
+  async get(id) {
+    const r = readAll().appRoles[id];
+    return r ? { ...r, permissions: (r.permissions || []).slice() } : null;
+  },
+  async save(role) {
+    const data = readAll();
+    const dupe = Object.values(data.appRoles).find((r) => r.id !== role.id && String(r.name).trim().toLowerCase() === String(role.name).trim().toLowerCase());
+    if (dupe) throw rbacError("DUPLICATE_ROLE_NAME", "A role with that name already exists.");
+    if (role.systemKey) {
+      const sk = Object.values(data.appRoles).find((r) => r.id !== role.id && r.systemKey === role.systemKey);
+      if (sk) throw rbacError("DUPLICATE_ROLE_NAME", "That built-in role already exists.");
+    }
+    data.appRoles[role.id] = { ...role, permissions: (role.permissions || []).slice() };
+    writeAll(data);
+    return role;
+  },
+  async delete(id) {
+    const data = readAll();
+    if (Object.values(data.appUsers).some((u) => u.roleId === id)) throw rbacError("ROLE_IN_USE", "That role is assigned to users.");
+    delete data.appRoles[id];
+    writeAll(data);
+  },
+};
+const appUsers = {
+  async list() {
+    return Object.values(readAll().appUsers).map((u) => JSON.parse(JSON.stringify(u)));
+  },
+  async get(id) {
+    const u = readAll().appUsers[id];
+    return u ? JSON.parse(JSON.stringify(u)) : null;
+  },
+  async getByAccountId(accountId) {
+    const u = Object.values(readAll().appUsers).find((x) => x.accountId === accountId);
+    return u ? JSON.parse(JSON.stringify(u)) : null;
+  },
+  // Race-safe create: if the accountId is already registered the existing
+  // record comes back and nothing is written (no duplicate users, ever).
+  async insertIfNew(user) {
+    const data = readAll();
+    const existing = Object.values(data.appUsers).find((x) => x.accountId === user.accountId);
+    if (existing) return { inserted: false, user: JSON.parse(JSON.stringify(existing)) };
+    data.appUsers[user.id] = JSON.parse(JSON.stringify(user));
+    writeAll(data);
+    return { inserted: true, user };
+  },
+  async save(user) {
+    const data = readAll();
+    if (user.teamMemberId && Object.values(data.appUsers).some((x) => x.id !== user.id && x.teamMemberId === user.teamMemberId)) {
+      throw rbacError("TEAM_MEMBER_TAKEN", "That Team Member is already linked to another user.");
+    }
+    if (Object.values(data.appUsers).some((x) => x.id !== user.id && x.accountId === user.accountId)) {
+      throw rbacError("DUPLICATE_ACCOUNT", "That Jira account is already registered.");
+    }
+    data.appUsers[user.id] = JSON.parse(JSON.stringify(user));
+    writeAll(data);
+    return user;
+  },
+};
+
 // Per-user Atlassian OAuth token storage — keyed by accountId, never email
 // (see server/auth/atlassianTokens.js, which is the only other module that
 // touches this collection). Same get/set/delete shape as the collections
@@ -566,6 +656,8 @@ module.exports = {
   dailyReports,
   dailyAbsences,
   dailyReminders,
+  appRoles,
+  appUsers,
   team,
   atlassianTokens,
   DEFAULT_REGRESSION_MODULES,

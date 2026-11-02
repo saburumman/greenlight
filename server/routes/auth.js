@@ -10,24 +10,38 @@ const session = require("../auth/session");
 const atlassianTokens = require("../auth/atlassianTokens");
 const { parseCookies, serializeCookie, appendSetCookie, clearCookie } = require("../auth/cookies");
 const { asyncHandler } = require("../asyncHandler");
+const rbac = require("../rbacService");
 
 const router = express.Router();
 const STATE_COOKIE = "rm_oauth_state";
 
 // GET /auth/me — tells the frontend whether OAuth login is enabled on this
-// deployment at all, and if so, whether the current visitor is signed in.
-router.get("/me", (req, res) => {
+// deployment at all, and if so, whether the current visitor is signed in and
+// what they're allowed to do. `access` is resolved on the server from the
+// person's Jira accountId (status, role, effective permissions, linked Team
+// Member id) — the browser only ever uses it to decide what to DRAW; every
+// API route re-checks permissions itself.
+router.get("/me", asyncHandler(async (req, res) => {
   const enabled = oauth.isConfigured();
   if (!enabled) return res.json({ oauthEnabled: false, authenticated: false, user: null });
   const cookies = parseCookies(req);
   const payload = session.verify(cookies[session.SESSION_COOKIE]);
   if (!payload) return res.json({ oauthEnabled: true, authenticated: false, user: null });
+  const a = await rbac.loadAccess(payload, { login: false });
   res.json({
     oauthEnabled: true,
     authenticated: true,
     user: { accountId: payload.accountId, name: payload.name, email: payload.email, avatarUrl: payload.avatarUrl },
+    access: {
+      status: a.status,
+      userId: a.user.id,
+      role: a.role ? { id: a.role.id, name: a.role.name, systemKey: a.role.systemKey || null } : null,
+      isSuperAdmin: a.isSuperAdmin,
+      permissions: Array.from(a.permissions).sort(),
+      teamMemberId: a.user.teamMemberId || null,
+    },
   });
-});
+}));
 
 router.get("/login", (req, res) => {
   if (!oauth.isConfigured()) {
@@ -72,6 +86,14 @@ router.get("/callback", async (req, res) => {
       );
     }
     const identity = await oauth.fetchJiraIdentity(accessToken, resource.id);
+    // Who is this, in Release Monitor? One user record per Jira accountId:
+    // the first sign-in registers them as PENDING (no permissions) and every
+    // later one just refreshes their profile and "last login". A deactivated
+    // account is turned away here — no session, and no Jira tokens stored.
+    const appUser = await rbac.registerOrUpdateOnLogin(identity, { login: true });
+    if (appUser.status === "INACTIVE") {
+      return res.redirect("/?authError=" + encodeURIComponent("Your account has been deactivated. Contact an administrator."));
+    }
     // Persist THIS user's own Jira OAuth tokens, server-side, keyed by their
     // stable Atlassian accountId — this is the only place Greenlight ever
     // gets Jira access, and every Jira API call this user's session makes

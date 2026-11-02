@@ -64,3 +64,11 @@ services:
         sync: false
       - key: SLACK_REMINDER_WEBHOOK_URL
         sync: false
+
+      # ---- Users, roles & permissions ------------------------------------
+      # Your own Jira account id (comma-separated for several). The first of
+      # these people to sign in — while no Super Admin exists — becomes Super
+      # Admin. Set it BEFORE the first sign-in after deploying. See README
+      # "Users, roles & permissions".
+      - key: SUPER_ADMIN_ACCOUNT_IDS
+        sync: false

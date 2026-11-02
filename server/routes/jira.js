@@ -9,6 +9,7 @@ const jiraClient = require("../jiraClient");
 const atlassianTokens = require("../auth/atlassianTokens");
 const { extractIssueKey } = require("../extractKey");
 const { asyncHandler } = require("../asyncHandler");
+const { requireAnyPermission } = require("../accessControl");
 
 const router = express.Router();
 
@@ -31,7 +32,7 @@ router.get("/status", asyncHandler(async (req, res) => {
 // POST /api/jira/lookup — { url } or { key }. Used by "Add Ticket" to
 // auto-fill fields from a pasted Jira URL, using this user's own Jira
 // authorization.
-router.post("/lookup", asyncHandler(async (req, res) => {
+router.post("/lookup", requireAnyPermission("releases.create", "releases.edit"), asyncHandler(async (req, res) => {
   const { url, key: rawKey } = req.body || {};
   const key = extractIssueKey(rawKey || url);
   if (!key) {

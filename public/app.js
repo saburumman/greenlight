@@ -117,6 +117,11 @@ function apiCall(method, path, body){
         location.href = data.loginUrl;
         return new Promise(function(){});
       }
+      if(res.status===403 && data && (data.code==="ACCESS_PENDING" || data.code==="ACCOUNT_INACTIVE") && state.access && state.access.status==="ACTIVE"){
+        // The account's status changed while this page was open (access
+        // withdrawn, or deactivated): re-read /auth/me and show the right screen.
+        refreshAccessAndGate();
+      }
       if(!res.ok){
         var err = new Error(data.error || ("Request failed ("+res.status+")"));
         err.status = res.status;
@@ -183,7 +188,6 @@ var api = {
   updateTeamMember: function(id, data){ return apiCall("PUT","/team/"+id, data); },
   deleteTeamMember: function(id){ return apiCall("DELETE","/team/"+id); },
   linkMeToTeamMember: function(id, linked){ return apiCall("PUT","/team/"+id+"/link-me", {linked: !!linked}); },
-  setPageAccess: function(id, page, enabled){ return apiCall("PUT","/team/"+id+"/access/"+page, {enabled: !!enabled}); },
   statsActivity: function(){ return apiCall("GET","/statistics/activity"); },
   dailyReportMe: function(){ return apiCall("GET","/daily-reports/me"); },
   submitDailyReport: function(data){ return apiCall("POST","/daily-reports", data); },
@@ -265,6 +269,7 @@ var state = {
   searchResults: [],
   searchActiveIndex: -1,
   auth: {authenticated:false, user:null}, // from /auth/me — see initAuthThenBoot()
+  access: null, // from /auth/me: {status, userId, role, isSuperAdmin, permissions[], teamMemberId} — what to DRAW; the server re-checks every request
   blockingModal: false, // true while the sign-in modal is open
   auditLog: [],
   auditReady: false,
@@ -775,19 +780,15 @@ function regressionTemplateLabel(status){
    Atlassian sign-in proves WHO the person is; Know the Team says which QA
    team member that is. A signed-in user pins "this entry is me" once (the
    team-card menu, the "Link to team" button in the top bar, or the one-click
-   suggestion on an empty "My Regression") and that link is stored
-   server-side on the member's own record (member.linkedEmail — see
-   server/routes/team.js PUT /:id/link-me), so it works from any browser.
+   suggestion on an empty "My Regression") — or an administrator links them
+   under Administration → Users — and that link is stored server-side on the
+   application user (see server/rbacService.js), so it works from any browser.
    Everything that needs "me" — My Regression, the changed-by-someone-else
    warning, assignments — compares TEAM MEMBER IDS, never display names. */
 function myLinkedTeamMemberId(){
-  var email = state.auth && state.auth.user && state.auth.user.email;
-  if(!email) return "";
-  email = String(email).trim().toLowerCase();
-  var found = allTeamMembers().find(function(m){
-    return m.linkedEmail && String(m.linkedEmail).trim().toLowerCase()===email;
-  });
-  return found ? found.id : "";
+  // The link lives on the application user (Jira accountId -> one stable
+  // Team Member id) and arrives with /auth/me; nothing is matched by email.
+  return (state.access && state.access.teamMemberId) || "";
 }
 function currentMemberId(){ return myLinkedTeamMemberId(); }
 function currentMember(){
@@ -821,6 +822,8 @@ function memberChoiceGroup(name, members, currentId, extras){
 // team" picker, and the one-click suggestion in the Regression section.
 function setMyLinkedTeamMember(id, linked){
   return api.linkMeToTeamMember(id, linked).then(function(){
+    return authApi.me().then(function(info){ if(info && info.access) state.access = info.access; });
+  }).then(function(){
     return loadTeam();
   }).then(function(){
     renderTopbarUser();
@@ -1052,6 +1055,8 @@ function parseHash(){
   if(h==="daily-report") return {view:"dailyReport"};
   if(h==="test-data") return {view:"testData"};
   if(h==="team") return {view:"team"};
+  if(h==="admin/users") return {view:"adminUsers"};
+  if(h==="admin/roles") return {view:"adminRoles"};
   var m = h.match(/^r\/([^\/]+)$/);
   if(m) return {view:"detail", id:m[1]};
   return {view:"home"};
@@ -1218,33 +1223,39 @@ function boot(){
   // when navigating to "team" — otherwise a release opened directly (or on
   // first load) sees an empty roster until the user happens to visit Know
   // the Team first. Small dataset, cheap GET — same as loadJiraStatus above.
-  var teamTask = loadTeam();
-  var tasks = [loadJiraStatus(), teamTask];
+  // Every load below is skipped when the person lacks the permission, so a
+  // restricted page never fires a request that the server would refuse (and
+  // the page itself shows a friendly "no permission" state instead).
+  var teamTask = can("team.view") ? loadTeam() : Promise.resolve(null);
+  var tasks = [can("releases.view") ? loadJiraStatus() : Promise.resolve(null), teamTask];
+  var needsReleases = can("releases.view");
   if(state.route.view==="detail"){
-    tasks.push(loadOne(state.route.id));
+    if(needsReleases) tasks.push(loadOne(state.route.id));
   } else if(state.route.view==="audit"){
-    tasks.push(loadAuditLog());
+    if(can("audit.view")) tasks.push(loadAuditLog());
+  } else if(state.route.view==="adminUsers" || state.route.view==="adminRoles"){
+    if(window.GreenlightAdmin) tasks.push(window.GreenlightAdmin.load(state.route.view));
   } else if(state.route.view==="statistics"){
     // Statistics reads every release plus the access-guarded activity feed
     // (audit events with their structured data) — read-only GETs, so simply
     // viewing it never writes an audit event. Without access, no request.
-    tasks.push(loadList());
+    if(can("releases.view")) tasks.push(loadList());
     tasks.push(teamTask.then(function(){ return canViewStatistics() ? Promise.all([loadStatsActivity(), loadDailyStats()]) : null; }));
   } else if(state.route.view==="reporting"){
     tasks.push(teamTask.then(function(){ return canViewReporting() ? loadReportingAccess() : null; }));
   } else if(state.route.view==="dailyReport"){
     tasks.push(teamTask.then(function(){ return canUseDailyReport() ? loadDailyReport() : null; }));
   } else if(state.route.view==="testData"){
-    tasks.push(loadTestData());
+    if(can("test_data.view")) tasks.push(loadTestData());
   } else if(state.route.view==="home"){
     // Landing page needs real release data (At a Glance / Recent Releases)
     // and the audit log (Recent Activity) — both read-only GETs, so simply
     // viewing the landing page never writes a new audit event.
-    tasks.push(loadList());
-    tasks.push(loadAuditLog());
+    if(needsReleases) tasks.push(loadList()); else state.listReady = true;
+    if(can("audit.view")) tasks.push(loadAuditLog());
   } else if(state.route.view!=="team"){
     // "team" needs nothing beyond the loadTeam() already queued above.
-    tasks.push(loadList());
+    if(needsReleases) tasks.push(loadList());
   }
   Promise.all(tasks).then(function(){
     if(myNav !== navToken) return; // a newer navigation took over; it will render
@@ -1268,6 +1279,15 @@ function render(){
     app.innerHTML = '<div class="empty-state"><h3>Can’t reach the server</h3><p>'+esc(state.loadError)+'</p><p class="helper-text" style="margin-top:8px;">Make sure the Greenlight server is running.</p></div>';
     return;
   }
+  if(state.access && state.access.status!=="ACTIVE"){
+    app.innerHTML = renderAccessGate();
+    return;
+  }
+  var gateNeed = viewPermission(state.route.view);
+  if(gateNeed && !can(gateNeed)){
+    app.innerHTML = renderNoPermission(state.route.view, gateNeed);
+    return;
+  }
   if(state.route.view==="detail"){
     var r = state.releases[state.route.id];
     if(!r){
@@ -1289,6 +1309,8 @@ function render(){
     app.innerHTML = renderTestData();
   } else if(state.route.view==="team"){
     app.innerHTML = renderTeam();
+  } else if(state.route.view==="adminUsers" || state.route.view==="adminRoles"){
+    app.innerHTML = window.GreenlightAdmin ? window.GreenlightAdmin.render(state.route.view) : "";
   } else if(state.route.view==="home"){
     app.innerHTML = renderHome();
   } else {
@@ -1309,48 +1331,39 @@ function render(){
    ============================================================ */
 var SIDENAV_ITEMS = [
   {icon:"🏠", label:"Landing Page", action:"nav-home", match:["home"]},
-  {icon:"🚀", label:"Release Monitor", action:"nav-list", match:["list","detail"]},
-  {icon:"🧪", label:"Test Data", action:"nav-test-data", match:["testData"]},
-  {icon:"📊", label:"Statistics", action:"nav-statistics", match:["statistics"], needs:"statistics"},
-  {icon:"📑", label:"Reporting", action:"nav-reporting", match:["reporting"], needs:"reporting"},
-  {icon:"📝", label:"Daily QA Report", action:"nav-daily-report", match:["dailyReport"], needs:"dailyReport"},
-  {icon:"📋", label:"Audit", action:"nav-audit", match:["audit"]},
-  {icon:"👥", label:"Know the Team", action:"nav-team", match:["team"]}
+  {icon:"🚀", label:"Release Monitor", action:"nav-list", match:["list","detail"], needs:["releases.view"]},
+  {icon:"🧪", label:"Test Data", action:"nav-test-data", match:["testData"], needs:["test_data.view"]},
+  {icon:"📊", label:"Statistics", action:"nav-statistics", match:["statistics"], needs:["statistics.view"]},
+  {icon:"📑", label:"Reporting", action:"nav-reporting", match:["reporting"], needs:["reporting.view"]},
+  {icon:"📝", label:"Daily QA Report", action:"nav-daily-report", match:["dailyReport"], needs:["daily_reports.view"]},
+  {icon:"📋", label:"Audit", action:"nav-audit", match:["audit"], needs:["audit.view"]},
+  {icon:"👥", label:"Know the Team", action:"nav-team", match:["team"], needs:["team.view"]},
+  {heading:"Administration", needsAny:["users.view","roles.view"]},
+  {icon:"🔑", label:"Users", action:"nav-admin-users", match:["adminUsers"], needs:["users.view"]},
+  {icon:"🛡️", label:"Roles & Permissions", action:"nav-admin-roles", match:["adminRoles"], needs:["roles.view"]}
 ];
-// Statistics is limited to the Know the Team members flagged "Statistics
-// access" — an opt-in flag (absent/false = no access) on the member the
-// signed-in user linked themselves to. This gates the UI (nav item, landing
-// card, the page itself); see README for what it does and doesn't protect.
-function canViewStatistics(){
-  var me = currentMember();
-  return !!(me && me.statisticsAccess===true);
+/* ---- What may this person do? ----
+   Permissions come from the server (/auth/me -> state.access.permissions),
+   worked out from the person's role and individual overrides. The browser
+   only uses them to decide what to SHOW — every API route checks them again,
+   so hiding a button is a courtesy, never the protection. */
+function can(perm){
+  var a = state.access;
+  return !!(a && a.status==="ACTIVE" && a.permissions && a.permissions.indexOf(perm)!==-1);
 }
-// Same pattern for the Reporting page (its own flag, its own page, its own
-// server guard — see server/pageAccess.js).
-function canViewReporting(){
-  var me = currentMember();
-  return !!(me && me.reportingAccess===true);
+function canAny(){
+  for(var i=0;i<arguments.length;i++) if(can(arguments[i])) return true;
+  return false;
 }
-var ACCESS_PAGES = [
-  {page:"statistics", field:"statisticsAccess", label:"Statistics"},
-  {page:"reporting", field:"reportingAccess", label:"Reporting"}
-];
-// Mirrors server/pageAccess.canChangePageAccess so the switch can be shown
-// disabled with a reason. The SERVER enforces it; this is only the UI.
-function accessChangeBlockedReason(target, ap, enable){
-  var me = currentMember();
-  if(!me) return "Link your sign-in to your Know the Team card first (“This is me”) to manage access.";
-  if((target[ap.field]===true)===!!enable) return "";
-  var holders = allTeamMembers().filter(function(m){ return m[ap.field]===true; });
-  if(!holders.length) return "";
-  if(me[ap.field]!==true) return "Only people who have "+ap.label+" access can change it for others.";
-  if(enable && me.id===target.id) return "You can’t give yourself "+ap.label+" access — ask someone who has it.";
-  return "";
-}
+function canViewStatistics(){ return can("statistics.view"); }
+function canViewReporting(){ return canAny("reporting.view"); }
 function sidenavHtml(){
+  if(!state.access || state.access.status!=="ACTIVE") return "";
   return SIDENAV_ITEMS.filter(function(it){
-    return !it.needs || (it.needs==="statistics" && canViewStatistics()) || (it.needs==="reporting" && canViewReporting()) || (it.needs==="dailyReport" && canUseDailyReport());
+    if(it.needsAny) return canAny.apply(null, it.needsAny);
+    return !it.needs || it.needs.every(can);
   }).map(function(it){
+    if(it.heading) return '<div class="sidenav-heading">'+esc(it.heading)+'</div>';
     var active = it.match.indexOf(state.route.view) > -1;
     return '<button type="button" class="sidenav-item'+(active?" active":"")+'" data-action="'+it.action+'">'+
       '<span class="sidenav-icon">'+it.icon+'</span><span class="sidenav-label">'+esc(it.label)+'</span></button>';
@@ -1447,7 +1460,8 @@ function renderHome(){
     {icon:"📋", title:"Audit", desc:"Track important changes and see who performed them.", btn:"View Audit →", action:"nav-audit"},
     {icon:"👥", title:"Know the Team", desc:"Meet the people behind the quality.", btn:"Meet the Team →", action:"nav-team"}
   ].filter(function(c){
-    return (c.action!=="nav-statistics" || canViewStatistics()) && (c.action!=="nav-reporting" || canViewReporting()) && (c.action!=="nav-daily-report" || canUseDailyReport());
+    var need = {"nav-list":"releases.view","nav-test-data":"test_data.view","nav-statistics":"statistics.view","nav-reporting":"reporting.view","nav-daily-report":"daily_reports.view","nav-audit":"audit.view","nav-team":"team.view"}[c.action];
+    return !need || can(need);
   });
   var cardsHtml = '<section class="home-section"><div class="feature-grid">'+
     cards.map(function(c){
@@ -1548,6 +1562,16 @@ function renderList(){
    when. Not tied to any one release; it's a record across all of them.
    ============================================================ */
 var AUDIT_ACTION_LABELS = {
+  USER_REGISTERED: "User Registered",
+  USER_ROLE_CHANGED: "Changed User Role",
+  USER_ACTIVATED: "Activated User",
+  USER_DEACTIVATED: "Deactivated User",
+  ROLE_CREATED: "Created Role",
+  ROLE_UPDATED: "Updated Role",
+  ROLE_DELETED: "Deleted Role",
+  ROLE_PERMISSIONS_UPDATED: "Changed Role Permissions",
+  USER_PERMISSION_OVERRIDE_ADDED: "Added Permission Override",
+  USER_PERMISSION_OVERRIDE_REMOVED: "Removed Permission Override",
   RELEASE_CREATED: "Created Release",
   RELEASE_UPDATED: "Updated Release Info",
   TICKET_ADDED: "Added Ticket",
@@ -1941,9 +1965,7 @@ function statsFiltersHtml(f){
 }
 function renderStatisticsNoAccess(){
   var me = currentMember();
-  var why = !me
-    ? 'Link your sign-in to your <b>Know the Team</b> entry first (top bar → Link to team), then ask a teammate who has access to turn on <b>Statistics access</b> for you.'
-    : 'Your Know the Team entry doesn’t have <b>Statistics access</b>. Ask a teammate who has it to switch it on for you in Know the Team.';
+  var why = 'Your role doesn’t include <b>Statistics</b>. Ask an administrator if you need it.';
   return '<div class="list-head"><div><h1>QA Statistics</h1></div></div>'+
     '<div class="empty-state"><h3>You don’t have access to Statistics</h3><p>'+why+'</p></div>';
 }
@@ -1967,8 +1989,9 @@ function renderStatisticsNoAccess(){
    tries again. Available to members with the regression flag on.
    ============================================================ */
 function canUseDailyReport(){
-  var me = currentMember();
-  return !!(me && me.regression!==false);
+  // Needs the permission AND a linked Team Member card (the report is filed
+  // under that card).
+  return can("daily_reports.view") && !!currentMember();
 }
 function loadDailyReport(){
   return api.dailyReportMe().then(function(d){
@@ -1982,9 +2005,11 @@ function loadDailyReport(){
 }
 function renderDailyReportNoAccess(){
   var me = currentMember();
-  var why = !me
-    ? 'Link your sign-in to your <b>Know the Team</b> entry first (top bar → Link to team) — your report is filed under that entry.'
-    : 'The Daily QA Report is for team members who are <b>available for regression assignment</b>. Ask a teammate to switch that on for you in Know the Team → Edit.';
+  var why = !can("daily_reports.view")
+    ? 'Your role doesn’t include the Daily QA Report. Ask an administrator if you need it.'
+    : (!me
+      ? 'Link your sign-in to your <b>Know the Team</b> entry first (top bar → Link to team) — your report is filed under that entry.'
+      : 'Something went wrong loading your report. Try again in a moment.');
   return '<div class="list-head"><div><h1>Daily QA Report</h1></div></div>'+
     '<div class="empty-state"><h3>You don’t have access to the Daily QA Report</h3><p>'+why+'</p></div>';
 }
@@ -2256,7 +2281,7 @@ function drTeamBodyHtml(){
     t.data.reports.map(drTeamRowHtml).join("")+'</tbody></table></div>';
 }
 function drTeamHtml(d){
-  return '<section class="card dr-card dr-team"><div class="dr-card-head"><div><h2>Team reports</h2><p class="helper-text" id="dr-team-count">'+esc(drTeamCountText())+'</p></div></div>'+
+  return '<section class="card dr-card dr-team"><div class="dr-card-head"><div><h2>'+(can("daily_reports.view_all")?"Team reports":"Your reports")+'</h2><p class="helper-text" id="dr-team-count">'+esc(drTeamCountText())+'</p></div></div>'+
     drTeamFiltersHtml()+'<div id="dr-team-container">'+drTeamBodyHtml()+'</div></section>';
 }
 var drSearchTimer = null;
@@ -2398,10 +2423,7 @@ function dailyReportPostUpdate(id){
 }
 
 function renderReportingNoAccess(){
-  var me = currentMember();
-  var why = !me
-    ? 'Link your sign-in to your <b>Know the Team</b> entry first (top bar → Link to team), then ask a teammate who has access to turn on <b>Reporting</b> for you.'
-    : 'Your Know the Team entry doesn’t have <b>Reporting access</b>. Ask a teammate who has it to switch it on for you in Know the Team.';
+  var why = 'Your role doesn’t include <b>Reporting</b>. Ask an administrator if you need it.';
   return '<div class="list-head"><div><h1>Reporting</h1></div></div>'+
     '<div class="empty-state"><h3>You don’t have access to Reporting</h3><p>'+why+'</p></div>';
 }
@@ -3300,26 +3322,6 @@ function allTeamMembers(){
   return state.teamOrder.map(function(id){ return state.team[id]; }).filter(Boolean);
 }
 var TEAM_UNASSIGNED_DEPARTMENT = "Unassigned";
-// Access to Statistics / Reporting is managed ONLY inside the Add / Edit team
-// member form (see teamAccessFieldHtml) and only shown to people who may change
-// it — it is deliberately not displayed on the cards.
-// Pages whose access the CURRENT user may change for `target` (a saved member,
-// or {} for a new one). Empty for everyone else, so the section simply isn't
-// there. The server re-checks every change.
-function editableAccessPages(target){
-  return ACCESS_PAGES.filter(function(ap){
-    return !accessChangeBlockedReason(target||{}, ap, !((target||{})[ap.field]===true));
-  });
-}
-function teamAccessFieldHtml(target){
-  var pages = editableAccessPages(target);
-  if(!pages.length) return "";
-  return '<div class="field team-access-field"><label>Page access <span class="hint">(only people who can manage access see this)</span></label>'+
-    pages.map(function(ap){
-      return '<div class="team-access-row"><span class="team-access-name">'+esc(ap.label)+'</span>'+
-        toggleSwitch("access-"+ap.page, (target||{})[ap.field]===true, "Let this person open the "+ap.label+" page")+'</div>';
-    }).join("")+'</div>';
-}
 function teamMemberCardHtml(m){
   var specialtiesHtml = (m.specialties||[]).map(function(s){return '<span class="chip">'+esc(s)+'</span>';}).join("");
   var toolsHtml = (m.tools||[]).map(function(t){return '<span class="chip chip-muted">'+esc(t)+'</span>';}).join("");
@@ -3331,21 +3333,20 @@ function teamMemberCardHtml(m){
   // their assignments, audit trail and statistics to this team member.
   var showMeOption = !!(state.auth && state.auth.authenticated);
   var isMe = showMeOption && myLinkedTeamMemberId()===m.id;
-  // A card another account already holds can't be taken over (access follows
-  // this link) — only its holder, or someone with restricted-page access, may
-  // remove that link.
-  var me0 = currentMember();
-  var heldByOther = !!(m.linkedEmail && !isMe);
-  var canMeBtn = showMeOption && (!heldByOther || ACCESS_PAGES.some(function(ap){ return me0 && me0[ap.field]===true; }));
+  // A card another account already holds can't be taken over; an
+  // administrator re-links people under Administration → Users.
+  var heldByOther = !!(m.linked && !isMe);
+  var canMeBtn = showMeOption && !heldByOther;
+  var canManage = can("team.manage");
+  var menuItems =
+    (canMeBtn ? '<button data-action="toggle-my-team-member" data-id="'+m.id+'">'+iconUser()+(isMe?' Remove "This is me"':' This is me')+'</button>' : '')+
+    (canManage ? '<button data-action="edit-team-member" data-id="'+m.id+'">'+iconEdit()+' Edit</button>'+
+      '<button class="danger" data-action="delete-team-member" data-id="'+m.id+'">'+iconTrash()+' Delete</button>' : '');
   return '<div class="team-card">'+
-    '<div class="dd team-card-menu">'+
+    (menuItems ? '<div class="dd team-card-menu">'+
       '<button class="btn btn-sm btn-icon" data-action="toggle-team-menu" data-id="'+m.id+'" aria-label="More actions">'+iconDots()+'</button>'+
-      '<div class="menu" id="team-menu-'+m.id+'">'+
-        (canMeBtn ? '<button data-action="toggle-my-team-member" data-id="'+m.id+'">'+iconUser()+(isMe?' Remove "This is me"':(heldByOther?' Remove link (held by another account)':' This is me'))+'</button>' : '')+
-        '<button data-action="edit-team-member" data-id="'+m.id+'">'+iconEdit()+' Edit</button>'+
-        '<button class="danger" data-action="delete-team-member" data-id="'+m.id+'">'+iconTrash()+' Delete</button>'+
-      '</div>'+
-    '</div>'+
+      '<div class="menu" id="team-menu-'+m.id+'">'+menuItems+'</div>'+
+    '</div>' : '')+
     '<div class="team-avatar'+(m.photo?" has-photo":"")+'">'+avatar+'</div>'+
     '<div class="team-card-name">'+esc(m.name)+(isMe?' <span class="badge badge-me" title="Regression assigned to you shows up in your My Regression view">'+iconUser()+' You</span>':'')+(m.seeded?' <span class="badge badge-manual">Example</span>':'')+'</div>'+
     '<div class="team-card-role">'+esc(m.role||"")+(m.regression===false?' <span class="hint">· not in Regression assign list</span>':'')+''+'</div>'+
@@ -3380,7 +3381,7 @@ function renderTeamGridHtml(){
   var all = allTeamMembers();
   if(!all.length){
     return '<div class="empty-state"><h3>No team members yet</h3><p>Add the people behind the quality.</p>'+
-      '<div style="margin-top:16px;"><button class="btn btn-primary" data-action="add-team-member">'+iconPlus()+' Add Team Member</button></div></div>';
+      (can("team.manage") ? '<div style="margin-top:16px;"><button class="btn btn-primary" data-action="add-team-member">'+iconPlus()+' Add Team Member</button></div>' : '')+'</div>';
   }
   var groups = groupTeamByDepartment(all);
   // Skip the group headings entirely when everyone lands in one bucket —
@@ -3397,7 +3398,7 @@ function renderTeamGridHtml(){
 }
 function renderTeam(){
   var head = '<div class="list-head"><div><h1>Know the Team</h1><p>Meet the people behind the quality — informational only.</p></div>'+
-    '<button class="btn btn-primary" data-action="add-team-member">'+iconPlus()+' Add Team Member</button></div>';
+    (can("team.manage") ? '<button class="btn btn-primary" data-action="add-team-member">'+iconPlus()+' Add Team Member</button>' : '')+'</div>';
   if(!state.teamReady) return head+'<div class="empty-state"><h3>Loading team…</h3></div>';
   return head + renderTeamGridHtml();
 }
@@ -3469,8 +3470,7 @@ function openTeamMemberModal(existing){
     '<div class="field">'+
       '<span class="regression-skip-toggle">Available for regression assignment'+toggleSwitch("team-regression", draft.regression, "Show this person in the Regression section's assignment dropdowns")+'</span>'+
       '<span class="hint" style="display:block;margin-top:4px;">Off = hidden from the Regression section\'s assign lists (still visible here in Know the Team).</span>'+
-    '</div>'+
-    teamAccessFieldHtml(existing);
+    '</div>';
   var foot = (isEdit? '<button type="button" class="btn btn-danger" id="del-team-member">'+iconTrash()+' Delete</button>' : '<span></span>')+
     '<span style="flex:1"></span><button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary">'+(isEdit?"Save changes":"Save")+'</button>';
 
@@ -3519,31 +3519,14 @@ function openTeamMemberModal(existing){
     };
     var submitBtn = qs('#modal-form button[type="submit"]');
     if(submitBtn) submitBtn.disabled = true;
-    var accessPages = editableAccessPages(existing);
     var req = isEdit ? api.updateTeamMember(existing.id, payload) : api.createTeamMember(payload);
     req.then(function(saved){
       state.team[saved.id] = saved;
       if(state.teamOrder.indexOf(saved.id)===-1) state.teamOrder.unshift(saved.id);
-      // Page access goes through its own endpoint (own rules + audit), one
-      // page at a time, only for switches that actually changed.
-      var changes = accessPages.map(function(ap){
-        var sw = qs("#toggle-access-"+ap.page);
-        return {ap:ap, want: !!(sw && sw.checked), was: !!(existing && existing[ap.field]===true)};
-      }).filter(function(c){ return c.want!==c.was; });
-      var accessError = null;
-      return changes.reduce(function(chain, c){
-        return chain.then(function(){
-          return api.setPageAccess(saved.id, c.ap.page, c.want).then(function(updated){
-            state.team[updated.id] = updated;
-          }).catch(function(err){ accessError = {label:c.ap.label, message:(err && err.message) || "not allowed"}; });
-        });
-      }, Promise.resolve()).then(function(){
-        closeModal();
-        renderSidenav();
-        if(state.route.view==="team" || state.route.view==="reporting" || state.route.view==="statistics") render();
-        logAudit({action: isEdit ? "TEAM_MEMBER_UPDATED" : "TEAM_MEMBER_ADDED", entityType:"TeamMember", entityId:saved.id, details:saved.name});
-        showToast(accessError ? "Saved, but couldn’t change "+accessError.label+" access: "+accessError.message : (isEdit? "✓ Team member updated" : "✓ Team member added"));
-      });
+      closeModal();
+      if(state.route.view==="team") render();
+      logAudit({action: isEdit ? "TEAM_MEMBER_UPDATED" : "TEAM_MEMBER_ADDED", entityType:"TeamMember", entityId:saved.id, details:saved.name});
+      showToast(isEdit? "✓ Team member updated" : "✓ Team member added");
     }).catch(function(err){
       if(submitBtn) submitBtn.disabled = false;
       showToast(err.message || "Couldn't save team member.");
@@ -6009,9 +5992,16 @@ function renderTopbarUser(){
   var me = currentMember();
   var avatarSrc = (me && me.photo) || u.avatarUrl;
   var avatar = avatarSrc ? '<img class="user-avatar" src="'+escAttr(avatarSrc)+'" alt="">' : iconUser();
+  var roleName = state.access && state.access.role ? state.access.role.name : "";
+  var roleBadge = roleName ? '<span class="role-badge" title="Your role">'+esc(roleName)+'</span>' : '';
+  if(state.access && state.access.status!=="ACTIVE"){
+    el.innerHTML = '<span class="user-badge" title="Signed in with Atlassian">'+avatar+' '+esc(u.name)+'</span>'+
+      '<button type="button" class="btn btn-ghost btn-sm" data-action="sign-out">Sign out</button>';
+    return;
+  }
   if(me){
     el.innerHTML =
-      '<span class="user-badge" title="Signed in with Atlassian as '+escAttr(u.name)+' · your Know the Team entry">'+avatar+' '+esc(me.name)+'</span>'+
+      '<span class="user-badge" title="Signed in with Atlassian as '+escAttr(u.name)+' · your Know the Team entry">'+avatar+' '+esc(me.name)+'</span>'+roleBadge+
       '<button type="button" class="btn btn-ghost btn-sm" data-action="sign-out">Sign out</button>';
     return;
   }
@@ -6019,7 +6009,7 @@ function renderTopbarUser(){
   // can't be tied to a team member until they are, so offer it right here
   // (non-blocking: everything else keeps working in the meantime).
   el.innerHTML =
-    '<span class="user-badge" title="Signed in with Atlassian">'+avatar+' '+esc(u.name)+'</span>'+
+    '<span class="user-badge" title="Signed in with Atlassian">'+avatar+' '+esc(u.name)+'</span>'+roleBadge+
     (state.teamReady && allTeamMembers().length
       ? '<button type="button" class="btn btn-sm" data-action="link-identity" title="Pick your Know the Team entry so your work is attributed to you">'+iconUser()+' Link to team</button>'
       : '')+
@@ -7103,6 +7093,7 @@ document.addEventListener("click", function(e){
   }
 
   var el2 = e.target.closest("[data-action]");
+  if(el2 && el2.getAttribute("data-perm-off")){ e.preventDefault(); return; } // control the person may not use (see applyPermissionUi)
   // Closes the release-detail "⋮" menu and every per-row Test Data "⋮" menu
   // (there's normally at most one open at a time) whenever the click wasn't
   // on one of their own toggle buttons.
@@ -7131,6 +7122,9 @@ document.addEventListener("click", function(e){
     case "nav-statistics": goTo("#/statistics"); break;
     case "nav-reporting": goTo("#/reporting"); break;
     case "nav-daily-report": goTo("#/daily-report"); break;
+    case "nav-admin-users": goTo("#/admin/users"); break;
+    case "nav-admin-roles": goTo("#/admin/roles"); break;
+    case "gate-recheck": refreshAccessAndGate(true); break;
     case "reload-daily-report": boot(); break;
     case "retry-daily-report-slack": dailyReportRetry(id); break;
     case "edit-daily-report": dailyReportEditStart(id); break;
@@ -7511,6 +7505,7 @@ document.addEventListener("submit", function(e){
 
 document.addEventListener("change", function(e){
   var elp = e.target;
+  if(elp && elp.getAttribute && elp.getAttribute("data-perm-off")){ e.stopImmediatePropagation(); return; }
   var drf = elp && elp.getAttribute && elp.getAttribute("data-dr-team");
   if(drf){
     var tf = state.dr.team.f;
@@ -7790,6 +7785,111 @@ function deleteRelease(id){
    is fetched (it would all 401 anyway) until they come back from a real
    sign-in redirect. Otherwise, boots exactly as before.
    ============================================================ */
+/* ---- Access gate (PENDING / INACTIVE) and "no permission" pages ----
+   A person who signed in with Jira but has no role yet (or was deactivated)
+   sees ONLY a friendly page: no menu, no data. The server refuses all /api
+   calls for them as well, so this is explanation, not protection. */
+function showAccessGate(){
+  document.body.classList.add("gate");
+  renderSidenav();
+  renderTopbarUser();
+  var app = qs("#app");
+  if(app) app.innerHTML = renderAccessGate();
+}
+function renderAccessGate(){
+  var u = (state.auth && state.auth.user) || {};
+  var inactive = state.access && state.access.status==="INACTIVE";
+  return '<div class="gate-card card">'+
+    '<div class="gate-icon">'+(inactive?'🔒':'⏳')+'</div>'+
+    '<h1>'+(inactive?'Your account has been deactivated':'Your access is pending')+'</h1>'+
+    '<p>'+(inactive
+      ? 'An administrator has turned off your access to Greenlight. If you think this is a mistake, please contact them.'
+      : 'You’re signed in with Jira, but an administrator hasn’t given you a role yet. Once they do, refresh this page and you’ll be in — there’s nothing else you need to do.')+'</p>'+
+    '<div class="gate-who"><div><span class="helper-text">Signed in as</span><br><b>'+esc(u.name||"")+'</b></div>'+
+      '<div><span class="helper-text">Your Jira account ID — send this to an administrator</span><br><code class="mono">'+esc(u.accountId||"")+'</code></div></div>'+
+    '<div class="gate-actions"><button type="button" class="btn btn-primary" data-action="gate-recheck">Check again</button>'+
+      '<button type="button" class="btn" data-action="sign-out">Sign out</button></div>'+
+  '</div>';
+}
+// Re-reads /auth/me. If the person now has access, leaves the gate and
+// boots; if their access was withdrawn, shows the gate.
+function refreshAccessAndGate(fromButton){
+  return authApi.me().then(function(info){
+    state.auth = info;
+    var before = state.access && state.access.status;
+    state.access = info.access || null;
+    var after = state.access && state.access.status;
+    if(!info.authenticated){ location.reload(); return; }
+    if(after!=="ACTIVE"){ showAccessGate(); return; }
+    document.body.classList.remove("gate");
+    if(before!=="ACTIVE" || fromButton){ state.route = parseHash(); boot(); }
+    else { renderSidenav(); renderTopbarUser(); }
+  }).catch(function(){ if(fromButton) showToast("Couldn’t check just now — try again in a moment."); });
+}
+// Which permission opens each page (pages with their own friendlier
+// no-access state — Statistics, Reporting, Daily QA Report — are not listed).
+function viewPermission(view){
+  return {list:"releases.view", detail:"releases.view", testData:"test_data.view", audit:"audit.view", team:"team.view", adminUsers:"users.view", adminRoles:"roles.view"}[view] || "";
+}
+function renderNoPermission(view, perm){
+  var names = {list:"Releases", detail:"Releases", testData:"Test Data", audit:"Audit", team:"Know the Team", adminUsers:"Users", adminRoles:"Roles & Permissions"};
+  return '<div class="list-head"><div><h1>'+esc(names[view]||"This page")+'</h1></div></div>'+
+    '<div class="empty-state"><h3>You don’t have permission to open this page</h3>'+
+    '<p>Your role doesn’t include it. If you need it, ask an administrator.</p>'+
+    '<div style="margin-top:16px;"><button class="btn" data-action="nav-home">Back to the landing page</button></div></div>';
+}
+
+/* ---- Hide / disable controls the person can't use ----
+   data-action -> the permission its button needs. Controls are hidden (or,
+   for status pickers that also DISPLAY a value, disabled). Purely cosmetic:
+   the server decides, field by field, what a release save may change. */
+var ACTION_PERMISSIONS = {
+  "create-release":"releases.create", "duplicate-release":"releases.create", "delete-release":"releases.delete", "publish-release":"releases.manage",
+  "add-ticket":"releases.edit", "edit-ticket":"releases.edit", "delete-ticket":"releases.edit", "resync-jira":"releases.edit",
+  "add-bug":"releases.edit", "edit-bug":"releases.edit", "delete-bug":"releases.edit",
+  "add-blocker":"releases.edit", "edit-blocker":"releases.edit", "delete-blocker":"releases.edit",
+  "add-incident":"releases.edit", "edit-incident":"releases.edit", "delete-incident":"releases.edit",
+  "edit-platform":"releases.edit", "edit-performance":"releases.edit", "toggle-performance":"releases.edit", "edit-security":"releases.edit", "toggle-security":"releases.edit",
+  "edit-release-info":"releases.edit", "generate-notes":"releases.edit", "save-notes":"releases.edit",
+  "draft-mobile-note-en":"releases.edit", "translate-mobile-note-ar":"releases.edit", "save-mobile-note":"releases.edit",
+  "set-regression-status":"regression.edit", "set-regression-entity-status":"regression.edit",
+  "edit-regression-notes":"regression.edit", "edit-regression-entity-notes":"regression.edit",
+  "edit-regression-owner":"regression.assign", "edit-regression-module-owner":"regression.assign", "open-assign-regression":"regression.assign", "edit-ticket-assignee":"releases.edit",
+  "toggle-regression-skip":"regression.manage", "sync-regression-modules":"regression.manage", "manage-regression-modules":"regression.manage",
+  "add-test-data":"test_data.create", "import-test-data":"test_data.create", "edit-test-data":"test_data.edit", "delete-test-data":"test_data.delete",
+  "td-rel-add":"test_data.edit", "td-rel-edit":"test_data.edit", "td-rel-remove":"test_data.delete",
+  "add-team-member":"team.manage", "edit-team-member":"team.manage", "delete-team-member":"team.manage",
+  "rp-sync":"reporting.manage", "rp-dep-add":"reporting.manage", "rp-dep-edit":"reporting.manage", "rp-dep-del":"reporting.manage", "rp-dep-link":"reporting.manage", "rp-dep-unlink":"reporting.manage"
+};
+var DISABLE_ONLY_ACTIONS = {"set-regression-status":1, "set-regression-entity-status":1, "toggle-performance":1, "toggle-security":1, "edit-regression-owner":1, "edit-regression-module-owner":1};
+var permUiQueued = false;
+function applyPermissionUi(){
+  permUiQueued = false;
+  if(!state.access || state.access.status!=="ACTIVE") return;
+  var nodes = document.querySelectorAll("#app [data-action]");
+  for(var i=0;i<nodes.length;i++){
+    var el = nodes[i];
+    var need = ACTION_PERMISSIONS[el.getAttribute("data-action")];
+    if(!need || can(need)){
+      if(el.getAttribute("data-perm-off")){ el.removeAttribute("data-perm-off"); el.hidden = false; el.removeAttribute("aria-disabled"); }
+      continue;
+    }
+    if(el.getAttribute("data-perm-off")) continue;
+    el.setAttribute("data-perm-off", "1");
+    el.setAttribute("title", "You don’t have permission to do this");
+    if(DISABLE_ONLY_ACTIONS[el.getAttribute("data-action")]){ el.setAttribute("aria-disabled", "true"); if("disabled" in el) el.disabled = true; el.classList.add("perm-disabled"); }
+    else el.hidden = true;
+  }
+}
+function queuePermissionUi(){
+  if(permUiQueued) return;
+  permUiQueued = true;
+  (window.requestAnimationFrame || setTimeout)(applyPermissionUi);
+}
+(function initPermissionUi(){
+  if(typeof MutationObserver==="undefined" || !document.body) return;
+  new MutationObserver(queuePermissionUi).observe(document.body, {childList:true, subtree:true});
+})();
 function surfaceAuthErrorFromUrl(){
   var params = new URLSearchParams(location.search);
   var authError = params.get("authError");
@@ -7805,6 +7905,7 @@ function initAuthThenBoot(){
   if(appEl0 && !appEl0.firstElementChild) appEl0.innerHTML = loadingPlaceholderHtml(); // visible while we check the sign-in
   authApi.me().then(function(info){
     state.auth = info;
+    state.access = info.access || null;
     renderTopbarUser();
     if(!info.authenticated){
       if(appEl0) appEl0.innerHTML = "";
@@ -7812,6 +7913,7 @@ function initAuthThenBoot(){
       return; // nothing else loads until they've actually signed in
     }
     state.route = parseHash();
+    if(state.access && state.access.status!=="ACTIVE"){ showAccessGate(); return; } // pending / deactivated: nothing else loads
     boot();
   }).catch(function(){
     // Couldn't even reach /auth/me — the server may be down or unreachable.
@@ -7866,6 +7968,17 @@ function setTheme(theme){
     if(mq.addEventListener) mq.addEventListener("change", onChange);
   }
 })();
+
+// Context for public/admin.js (Administration → Users / Roles & Permissions),
+// which is loaded after this file and reuses the same helpers and patterns.
+window.GreenlightCtx = {
+  state: state, esc: esc, escAttr: escAttr, qs: qs, qsa: qsa, apiCall: apiCall, showToast: showToast,
+  openModal: openModal, closeModal: closeModal, modalShell: modalShell, openConfirm: openConfirm,
+  render: render, can: can, pill: pill, fmtDateTime: fmtDateTime, fmtRelativeTime: fmtRelativeTime,
+  allTeamMembers: allTeamMembers, loadTeam: loadTeam, refreshAccess: refreshAccessAndGate,
+  currentRoute: function(){ return state.route.view; }
+};
+if(window.GreenlightAdmin && window.GreenlightAdmin.init) window.GreenlightAdmin.init(window.GreenlightCtx);
 
 initAuthThenBoot();
 

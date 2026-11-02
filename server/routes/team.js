@@ -1,11 +1,12 @@
 // "Know the Team" API — a small, editable roster, independent of releases
-// and independent of the auth system entirely: this is display-only data
-// (name, role, bio, specialties, tools, optional links/photo), never a
-// role or account. The one exception is the opt-in access flags
-// (`statisticsAccess`, `reportingAccess`) that decide who may open the
-// restricted Statistics / Reporting pages — see pageAccess.js. They are NEVER
-// read from a normal create/edit body: they change only through
-// PUT /:id/access/:page, which enforces who may change them and audits it.
+// and independent of the auth system: this is the QA team's identity (name,
+// role, bio, specialties, tools, optional links/photo) — assignments,
+// statistics, audit and reports all point at a member by its stable id. It is
+// never an account or a permission. An application USER (a Jira account with a
+// role) is linked to a member by that id — see rbacService.js; who may do what
+// is decided by permissions, not by anything on the card. (The old per-card
+// `statisticsAccess` / `reportingAccess` flags are kept in the data for
+// rollback but no longer control anything and are never sent to the browser.)
 // Mirrors routes/testData.js's
 // style — a plain top-level collection, simple REST verbs, no new patterns.
 //
@@ -17,9 +18,9 @@ const express = require("express");
 const crypto = require("crypto");
 const db = require("../db");
 const { asyncHandler } = require("../asyncHandler");
-const { resolveActor } = require("../assignmentLogic");
-const { recordEvents } = require("../auditWriter");
-const access = require("../pageAccess");
+const { requirePermission, can } = require("../accessControl");
+const rbac = require("../rbacService");
+const { HttpError } = require("../httpError");
 
 const router = express.Router();
 
@@ -89,37 +90,37 @@ function validateAndClean(body) {
   return { clean };
 }
 
-// Who has which restricted page is not for the whole team to see: people who
-// hold any restricted-page access get the flags (they manage them); everyone
-// else gets them stripped from other people's cards — only their own card
-// keeps its flags, because the page uses that to decide what to show them.
-function redactAccess(member, viewer, team) {
-  if (!member) return member;
-  if (access.holdsAnyAccess(viewer)) return member;
-  if (viewer && viewer.id === member.id) return member;
-  const out = { ...member };
-  for (const p of Object.keys(access.RESTRICTED_PAGES)) delete out[access.RESTRICTED_PAGES[p].field];
+// What the browser gets for a card: never the legacy access flags or the
+// legacy email link; instead whether the card is linked to an application user
+// and whether that user is the caller (so the page can offer "This is me").
+// Who the linked user is — their name — is only for people with users.view.
+function publicMember(m, linkedUser, req) {
+  if (!m) return m;
+  const { statisticsAccess, reportingAccess, linkedEmail, ...rest } = m;
+  const out = { ...rest, linked: !!linkedUser, linkedToMe: !!(linkedUser && req.access && linkedUser.id === req.access.user.id) };
+  if (linkedUser && can(req, "users.view")) { out.linkedUserId = linkedUser.id; out.linkedUserName = linkedUser.displayName || linkedUser.accountId; }
   return out;
 }
-async function viewerOf(req) {
-  const team = await db.team.list();
-  return { team, viewer: access.memberForUser(req.authUser, team) };
+async function decorate(members, req) {
+  const users = await db.appUsers.list();
+  const byMember = new Map(users.filter((u) => u.teamMemberId).map((u) => [u.teamMemberId, u]));
+  return members.map((m) => publicMember(m, byMember.get(m.id), req));
+}
+async function decorateOne(member, req) {
+  return (await decorate([member], req))[0];
 }
 
-router.get("/", asyncHandler(async (req, res) => {
-  const { team, viewer } = await viewerOf(req);
-  res.json(team.map((m) => redactAccess(m, viewer, team)));
+router.get("/", requirePermission("team.view"), asyncHandler(async (req, res) => {
+  res.json(await decorate(await db.team.list(), req));
 }));
 
-router.post("/", asyncHandler(async (req, res) => {
+router.post("/", requirePermission("team.manage"), asyncHandler(async (req, res) => {
   const result = validateAndClean(req.body);
   if (result.error) return res.status(400).json({ error: result.error });
   const now = new Date().toISOString();
   const id = crypto.randomUUID();
   const member = {
     id,
-    statisticsAccess: false,
-    reportingAccess: false,
     ...result.clean,
     seeded: false,
     createdBy: (req.authUser && req.authUser.name) || "Unknown",
@@ -127,109 +128,47 @@ router.post("/", asyncHandler(async (req, res) => {
     updatedAt: now,
   };
   await db.team.set(id, member);
-  const v1 = await viewerOf(req);
-  res.status(201).json(redactAccess(member, v1.viewer, v1.team));
+  res.status(201).json(await decorateOne(member, req));
 }));
 
-router.get("/:id", asyncHandler(async (req, res) => {
+router.get("/:id", requirePermission("team.view"), asyncHandler(async (req, res) => {
   const m = await db.team.get(req.params.id);
   if (!m) return notFound(res);
-  const v2 = await viewerOf(req);
-  res.json(redactAccess(m, v2.viewer, v2.team));
+  res.json(await decorateOne(m, req));
 }));
 
-// Links (or unlinks) the CALLING user's own signed-in account to a Know the
-// Team entry — this is the server-side "This is me" pointer the client uses
-// to resolve "My Regression" (see public/app.js#currentPreparerName /
-// myLinkedTeamMemberId), instead of hoping the caller's Atlassian display
-// name happens to be spelled identically to the free-text name someone
-// picked for them in Know the Team. Deliberately self-service only: the
-// linked identity always comes from req.authUser.email (the verified
-// session), never from the request body, so nobody can link an account to
-// someone else's entry. Setting a new link clears it from any other entry
-// previously linked to that same email first, so a person is only ever
-// linked to one entry at a time; this never touches any of the member's
-// other fields (name, role, bio, ...) or their `seeded`/`updatedAt`
-// bookkeeping, so it's safe to call from a one-click UI without disturbing
-// anything else about the record.
+// Links (or unlinks) the CALLING user's own application user to a Know the
+// Team entry — the self-service "This is me" pointer behind "My Regression",
+// the Daily QA Report and attribution in the audit log. The link is stored on
+// the USER (rbacService.linkSelf: a stable Team Member id, one user per
+// member, enforced by the database) — never derived from an email address, and
+// the caller can only ever link THEMSELVES: the identity comes from the
+// verified session, never from the request body. A card another user already
+// holds can't be taken over; an administrator unlinks or re-links people under
+// Administration → Users. Linking changes no permissions.
 router.put("/:id/link-me", asyncHandler(async (req, res) => {
-  if (!req.authUser || !req.authUser.email) {
-    return res.status(401).json({ error: "Sign in required." });
-  }
   const existing = await db.team.get(req.params.id);
   if (!existing) return notFound(res);
-  const email = String(req.authUser.email).trim().toLowerCase();
   const linked = !!(req.body && req.body.linked);
-
-  const all = await db.team.list();
-  const actor = resolveActor(req.authUser, all);
-  const heldBy = existing.linkedEmail ? String(existing.linkedEmail).trim().toLowerCase() : "";
-
-  // A card that another account already holds can't be taken over — access
-  // (Statistics, Reporting) follows this link, so re-pointing someone else's
-  // card at yourself would hand you their permissions. Its holder unlinks it
-  // first (or someone who has restricted-page access does, e.g. when the
-  // holder has left).
-  if (linked && heldBy && heldBy !== email) {
-    return res.status(409).json({ error: "This card is already linked to another account. They (or someone with Statistics or Reporting access) need to remove that link first." });
-  }
-  if (!linked && heldBy && heldBy !== email) {
-    const me = access.memberForUser(req.authUser, all);
-    if (!access.holdsAnyAccess(me)) {
-      return res.status(403).json({ error: "Only the person linked to this card, or someone with Statistics or Reporting access, can remove its link." });
+  if (linked) {
+    await rbac.linkSelf(req.access, existing.id);
+  } else {
+    if (req.access.user.teamMemberId !== existing.id) {
+      throw new HttpError(403, "Only the person linked to this card can remove its link here — an administrator can unlink people under Administration → Users.", "NOT_YOURS");
     }
+    await rbac.linkSelf(req.access, null);
   }
-
-  const events = [];
-  // Linking moves the caller's link here (a person is linked to ONE card);
-  // removing someone else's stale link must not touch the caller's own card.
-  for (const m of linked ? all : []) {
-    if (m.id !== existing.id && m.linkedEmail && String(m.linkedEmail).trim().toLowerCase() === email) {
-      await db.team.set(m.id, { ...m, linkedEmail: null });
-      events.push({ action: "TEAM_MEMBER_UNLINKED", entityType: "TeamMember", entityId: m.id, details: "Sign-in link removed from " + (m.name || "a team member") });
-    }
-  }
-
-  const updated = { ...existing, linkedEmail: linked ? email : null };
-  await db.team.set(existing.id, updated);
-  if (linked && heldBy !== email) events.push({ action: "TEAM_MEMBER_LINKED", entityType: "TeamMember", entityId: existing.id, details: "Sign-in linked to " + (existing.name || "a team member") });
-  if (!linked && heldBy) events.push({ action: "TEAM_MEMBER_UNLINKED", entityType: "TeamMember", entityId: existing.id, details: "Sign-in link removed from " + (existing.name || "a team member") });
-  if (events.length) await recordEvents(db, actor, events);
-  res.json(redactAccess(updated, access.memberForUser(req.authUser, all), all));
+  res.json(await decorateOne(existing, req));
 }));
 
-// Switch one restricted page on/off for one person. Dedicated endpoint (not
-// the profile edit) so access can never change by accident, and so the rules
-// in pageAccess.canChangePageAccess + the audit trail are always applied.
-router.put("/:id/access/:page", asyncHandler(async (req, res) => {
-  const cfg = access.pageConfig(req.params.page);
-  if (!cfg) return res.status(404).json({ error: "Unknown page." });
-  if (!req.body || typeof req.body.enabled !== "boolean") {
-    return res.status(400).json({ error: "enabled must be true or false." });
-  }
-  const enable = req.body.enabled;
-  const target = await db.team.get(req.params.id);
-  if (!target) return notFound(res);
-  const team = await db.team.list();
-  const actorMember = access.memberForUser(req.authUser, team);
-  const verdict = access.canChangePageAccess(actorMember, target, team, req.params.page, enable);
-  if (!verdict.ok) return res.status(verdict.status).json({ error: verdict.error });
-  if (verdict.noop) return res.json(target); // already in that state — nothing to save, nothing to audit
+// RETIRED: Statistics / Reporting access used to be a switch on the card. It
+// is now the statistics.view / reporting.view permission, given through a role
+// or a per-user override under Administration → Users.
+router.put("/:id/access/:page", (req, res) => {
+  res.status(410).json({ error: "Page access is now managed under Administration → Users (roles and permissions).", code: "MOVED" });
+});
 
-  const updated = { ...target, [cfg.field]: enable, updatedAt: new Date().toISOString() };
-  await db.team.set(target.id, updated);
-  const actor = resolveActor(req.authUser, team);
-  await recordEvents(db, actor, [{
-    action: cfg.label.toUpperCase() + (enable ? "_ACCESS_GRANTED" : "_ACCESS_REVOKED"),
-    entityType: "TeamMember",
-    entityId: target.id,
-    details: cfg.label + " access " + (enable ? "granted to " : "revoked from ") + (target.name || "a team member"),
-    meta: { targetMemberId: target.id, page: req.params.page },
-  }]);
-  res.json(updated);
-}));
-
-router.put("/:id", asyncHandler(async (req, res) => {
+router.put("/:id", requirePermission("team.manage"), asyncHandler(async (req, res) => {
   const existing = await db.team.get(req.params.id);
   if (!existing) return notFound(res);
   const result = validateAndClean(req.body);
@@ -246,13 +185,18 @@ router.put("/:id", asyncHandler(async (req, res) => {
     updatedAt: new Date().toISOString(),
   };
   await db.team.set(existing.id, merged);
-  const v3 = await viewerOf(req);
-  res.json(redactAccess(merged, v3.viewer, v3.team));
+  res.json(await decorateOne(merged, req));
 }));
 
-router.delete("/:id", asyncHandler(async (req, res) => {
+router.delete("/:id", requirePermission("team.manage"), asyncHandler(async (req, res) => {
   const existing = await db.team.get(req.params.id);
   if (!existing) return notFound(res);
+  // A card that is linked to an application user keeps that link (and the
+  // history that points at the card) — unlink it first, deliberately.
+  const holder = (await db.appUsers.list()).find((u) => u.teamMemberId === existing.id);
+  if (holder) {
+    return res.status(409).json({ error: "This card is linked to " + (holder.displayName || "an application user") + ". Unlink it first (Administration → Users), then remove the card.", code: "LINKED" });
+  }
   await db.team.delete(req.params.id);
   res.json({ ok: true });
 }));

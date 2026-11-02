@@ -28,6 +28,7 @@ const crypto = require("crypto");
 const db = require("../db");
 const { asyncHandler } = require("../asyncHandler");
 const { requireDailyReportAccess } = require("../pageAccess");
+const { requirePermission, can } = require("../accessControl");
 const { resolveActor } = require("../assignmentLogic");
 const { recordEvents } = require("../auditWriter");
 const slack = require("../slack");
@@ -85,14 +86,16 @@ router.get("/me", asyncHandler(async (req, res) => {
 }));
 
 const TEAM_LIMIT = 200;
-// The team table under today's report. Every member who can open this page can
-// read it (the reports already go to a shared Slack channel); only the author's
-// own rows carry Slack state and can be edited.
+// The team table under today's report. People with daily_reports.view_all see
+// everyone's reports (they already go to a shared Slack channel); anyone else
+// gets only their own rows. Only the author's own rows carry Slack state.
 router.get("/team", asyncHandler(async (req, res) => {
   const me = req.dailyMember;
   const from = logic.cleanDate(req.query.from);
   const to = logic.cleanDate(req.query.to);
-  const memberId = String(req.query.member || "").trim();
+  // Without daily_reports.view_all the table holds only the caller's own rows.
+  const seeAll = can(req, "daily_reports.view_all");
+  const memberId = seeAll ? String(req.query.member || "").trim() : me.id;
   const q = String(req.query.q || "").slice(0, 200);
   const all = await db.dailyReports.listRange(from || null, to || null);
   const away = await db.dailyAbsences.listRange(from || null, to || null);
@@ -100,7 +103,7 @@ router.get("/team", asyncHandler(async (req, res) => {
     .concat(away.filter((a) => (!memberId || a.teamMemberId === memberId) && logic.matchesAbsenceSearch(a, q)).map((a) => logic.teamAbsence(a, me.id)));
   // newest day first, then by name; a person's report and absence can't share a day
   rows.sort((a, b) => String(b.reportDate).localeCompare(String(a.reportDate)) || String(a.memberName).localeCompare(String(b.memberName)));
-  const people = Object.values(req.team || {}).filter((m) => m && logic.memberHasRegressionFlag(m))
+  const people = Object.values(req.team || {}).filter((m) => m && (seeAll ? logic.memberHasRegressionFlag(m) || m.id === me.id : m.id === me.id))
     .map((m) => ({ id: m.id, name: m.name || "" }))
     .sort((a, b) => a.name.localeCompare(b.name));
   res.json({
@@ -113,7 +116,7 @@ router.get("/team", asyncHandler(async (req, res) => {
 }));
 
 // ---- absences (own only) ----
-router.post("/absences", asyncHandler(async (req, res) => {
+router.post("/absences", requirePermission("daily_reports.create"), asyncHandler(async (req, res) => {
   const member = req.dailyMember;
   const today = logic.reportDateFor(new Date());
   const { clean, errors } = logic.validateAbsence(req.body, today);
@@ -135,7 +138,7 @@ router.post("/absences", asyncHandler(async (req, res) => {
   }]);
   res.status(201).json({ absence: logic.publicAbsence(rec) });
 }));
-router.delete("/absences/:date", asyncHandler(async (req, res) => {
+router.delete("/absences/:date", requirePermission("daily_reports.create"), asyncHandler(async (req, res) => {
   const member = req.dailyMember;
   const date = logic.cleanDate(req.params.date);
   const existing = date ? await db.dailyAbsences.find(member.id, date) : null;
@@ -148,7 +151,7 @@ router.delete("/absences/:date", asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
-router.post("/", asyncHandler(async (req, res) => {
+router.post("/", requirePermission("daily_reports.create"), asyncHandler(async (req, res) => {
   const member = req.dailyMember;
   const { clean, errors } = logic.validateSubmission(req.body);
   if (Object.keys(errors).length) {
@@ -190,7 +193,7 @@ router.post("/", asyncHandler(async (req, res) => {
   res.status(201).json({ report: logic.publicReport(report) });
 }));
 
-router.post("/:id/slack-retry", asyncHandler(async (req, res) => {
+router.post("/:id/slack-retry", requirePermission("daily_reports.edit_own"), asyncHandler(async (req, res) => {
   const member = req.dailyMember;
   const report = await db.dailyReports.get(req.params.id);
   // Someone else's report looks exactly like a missing one.
@@ -235,10 +238,15 @@ async function ownReport(req, res) {
   return report;
 }
 
+// Editing the text: your own report needs daily_reports.edit_own; someone
+// else's needs daily_reports.edit_all (without it, theirs looks missing).
 router.put("/:id", asyncHandler(async (req, res) => {
   await withReportLock(req.params.id, res, async () => {
-    const report = await ownReport(req, res);
-    if (!report) return;
+    const report = await db.dailyReports.get(req.params.id);
+    const mine = !!(report && report.teamMemberId === req.dailyMember.id);
+    if (!report || (mine ? !can(req, "daily_reports.edit_own") : !can(req, "daily_reports.edit_all"))) {
+      return res.status(mine ? 403 : 404).json({ error: mine ? "You don’t have permission to edit reports." : "Report not found." });
+    }
     const { clean, errors } = logic.validateSubmission(req.body);
     if (Object.keys(errors).length) {
       return res.status(400).json({ error: "Please fill in the highlighted fields.", fields: errors });
@@ -255,7 +263,7 @@ router.put("/:id", asyncHandler(async (req, res) => {
   });
 }));
 
-router.post("/:id/slack-resend", asyncHandler(async (req, res) => {
+router.post("/:id/slack-resend", requirePermission("daily_reports.edit_own"), asyncHandler(async (req, res) => {
   await withReportLock(req.params.id, res, async () => {
     const report = await ownReport(req, res);
     if (!report) return;
@@ -290,7 +298,7 @@ router.post("/:id/slack-resend", asyncHandler(async (req, res) => {
   });
 }));
 
-router.post("/:id/slack-update", asyncHandler(async (req, res) => {
+router.post("/:id/slack-update", requirePermission("daily_reports.edit_own"), asyncHandler(async (req, res) => {
   await withReportLock(req.params.id, res, async () => {
     const report = await ownReport(req, res);
     if (!report) return;

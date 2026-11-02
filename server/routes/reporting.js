@@ -13,6 +13,7 @@ const express = require("express");
 const db = require("../db");
 const { asyncHandler } = require("../asyncHandler");
 const { requirePageAccess } = require("../pageAccess");
+const { requirePermission } = require("../accessControl");
 const { resolveActor } = require("../assignmentLogic");
 const { recordEvents } = require("../auditWriter");
 const crypto = require("crypto");
@@ -72,6 +73,8 @@ function runView(r) {
   };
 }
 
+// Everything here needs reporting.view (router.use above). Writes need more: reporting.manage
+// (sync, dependencies) or settings.manage (sync settings).
 // GET /api/reporting/ping — proves the caller has access; the page calls it
 // on open so a revoked user is switched to the no-access state at once.
 router.get("/ping", (req, res) => {
@@ -85,7 +88,7 @@ router.get("/settings", needPostgres, asyncHandler(async (req, res) => {
 }));
 
 // PUT /api/reporting/settings — scope, mappings, blocked statuses, auto-sync.
-router.put("/settings", needPostgres, asyncHandler(async (req, res) => {
+router.put("/settings", requirePermission("settings.manage"), needPostgres, asyncHandler(async (req, res) => {
   await service.ready();
   const store = service.getStore();
   const current = await store.getSettings();
@@ -134,7 +137,7 @@ router.get("/sync/status", needPostgres, asyncHandler(async (req, res) => {
 
 // POST /api/reporting/sync {mode: "incremental"|"full"} — starts a background
 // sync under the CALLER's own Atlassian authorization and returns at once.
-router.post("/sync", needPostgres, asyncHandler(async (req, res) => {
+router.post("/sync", requirePermission("reporting.manage"), needPostgres, asyncHandler(async (req, res) => {
   const mode = req.body && req.body.mode === "full" ? "full" : "incremental";
   try {
     await service.preflight();
@@ -256,7 +259,7 @@ router.get("/dependencies", needPostgres, asyncHandler(async (req, res) => {
   res.json({ statuses: STATUSES, dependencies: await service.getStore().listDependencies() });
 }));
 
-router.post("/dependencies", needPostgres, asyncHandler(async (req, res) => {
+router.post("/dependencies", requirePermission("reporting.manage"), needPostgres, asyncHandler(async (req, res) => {
   await service.ready();
   const { clean, error } = validateDependency(req.body, false);
   if (error) return res.status(400).json({ error });
@@ -266,7 +269,7 @@ router.post("/dependencies", needPostgres, asyncHandler(async (req, res) => {
   res.status(201).json({ id });
 }));
 
-router.put("/dependencies/:id", needPostgres, asyncHandler(async (req, res) => {
+router.put("/dependencies/:id", requirePermission("reporting.manage"), needPostgres, asyncHandler(async (req, res) => {
   const id = depId(req, res); if (id === null) return;
   await service.ready();
   const { clean, error } = validateDependency(req.body, true);
@@ -278,7 +281,7 @@ router.put("/dependencies/:id", needPostgres, asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
-router.delete("/dependencies/:id", needPostgres, asyncHandler(async (req, res) => {
+router.delete("/dependencies/:id", requirePermission("reporting.manage"), needPostgres, asyncHandler(async (req, res) => {
   const id = depId(req, res); if (id === null) return;
   await service.ready();
   if (!(await service.getStore().deleteDependency(id))) return res.status(404).json({ error: "That dependency no longer exists." });
@@ -294,7 +297,7 @@ router.get("/issues/search", needPostgres, asyncHandler(async (req, res) => {
 }));
 
 // PUT /api/reporting/issues/:key/dependency {dependencyId|null} — link / unlink a ticket.
-router.put("/issues/:key/dependency", needPostgres, asyncHandler(async (req, res) => {
+router.put("/issues/:key/dependency", requirePermission("reporting.manage"), needPostgres, asyncHandler(async (req, res) => {
   const key = String(req.params.key || "");
   if (!KEY_RE.test(key)) return res.status(400).json({ error: "Invalid issue key." });
   await service.ready();

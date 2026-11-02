@@ -57,22 +57,79 @@ Nobody can use the app without signing in with an Atlassian account that has acc
 - Jira names: Jira's *QA Assigned* names are matched to members ignoring case/spacing/punctuation ("Al-irani" = "Alirani"). If Jira spells someone differently, add it as that member's **Jira name(s)** in Know the Team → Edit. Names are never guessed; an unmatched one stays visible as Jira gives it.
 - Ticket: a ticket can have **more than one QA owner** (Jira's *QA Assigned* is multi-person). `ticket.assignedTo` is a member id, an array of ids when there are several, or `null` (deliberately nobody). If the key is absent, the ticket follows Jira's *QA Assigned* names (matched to members at read time; a name that isn't in Know the Team is still shown exactly as Jira gives it). The Tickets section shows every owner on the ticket and, grouped by QA Assignee, files the ticket under each of them. Release-specific.
 - Regression: `entity.assignedTo` (the Entity owner) and an optional `service.assignedTo` per module. Hierarchy: module owner > Entity owner > unassigned. No key on a module = follows the Entity owner; an id = override; `null` = deliberately unassigned. Changing the Entity owner never overwrites a module's explicit assignment. Views: All / My Regression (by member id) / Unassigned.
-- Changing a regression status as someone other than the assignee is allowed; a compact "⚠ Status changed by <name>" note appears (plus a toast and an extra block in the Audit page) — shown only to people with **Statistics access** — and the audit event records `regressionModuleId`, `assignedTo`, `changedBy`, `previousStatus`, `newStatus`.
+- Changing a regression status as someone other than the assignee is allowed; a compact "⚠ Status changed by <name>" note appears (plus a toast and an extra block in the Audit page) — shown only to people with the `statistics.view` permission — and the audit event records `regressionModuleId`, `assignedTo`, `changedBy`, `previousStatus`, `newStatus`.
 
 **The Audit Log** (`data/store.json`, or the `audit_log` table on Postgres) is append-only, simple and chronological. Each entry is `{teamMemberId, userName, action, entityType, entityId, details, meta?, createdAt}`. Assignment and regression-status events are derived **server-side** from what actually changed in a save (so they can't be forged by the browser); opening pages, searching and filtering are never logged. On Postgres the two new columns (`team_member_id`, `meta`) are added automatically on first use; `supabase/migrations/0002_audit_team_member_identity.sql` does the same by hand. Older entries have no member id, so they keep showing the name they were written with and are left out of per-member statistics.
 
-**Statistics** (sidebar → Statistics) is a compact QA dashboard drawn with plain HTML/SVG (no chart library), filterable by Date Range (All time / Last 7 / Last 30 days / Custom), Release and QA Member: summary cards (Tickets Assigned, Regression Assigned, Completed with a progress meter, Passed, Failed, Blocked); *QA Activity Overview* (regression status changes over time — by day up to a month, then by week/month — stacked by the status changed to); *Regression Overview* (a donut + legend of Passed / Warning / Failed / Not Tested / Skipped); *QA Member Activity* (each member's assigned regression by status next to their status changes, listed alphabetically); *Release Overview* (status mix and tickets per release); and *Recent QA Activity* (a timeline of the latest status changes from the Audit Log). Hovering or focusing a bar/segment shows its exact numbers, every section shows "No data available for the selected filters." instead of an empty chart, and the underlying numbers stay available under *View the numbers as tables*. *Completed* = regression modules with a Passed, Warning or Failed result out of those not skipped. The *Assignment vs. activity* table credits each regression status change to the person it is **assigned to**: their own changes count as *Status Changes*, a change made by anyone else counts as *Changed By Others* for the assignee (and not as a status change of whoever made it). It covers the **QA team only** — Know the Team members who are "Available for regression assignment"; unassigned work, other assignees and release-level blockers aren't counted. Everything is computed from real release data and audit events; if nothing matches it says "No data available for the selected filters." It is workload visibility only: no ranking, scoring or productivity measures. **Who can open it:** only Know the Team members with the **Statistics** switch on (see *Restricted pages and access* below). It's opt-in — a member without it, and anyone who hasn't linked their sign-in to a card, doesn't see the nav item or landing card and gets a "no access" message at `#/statistics`. Items assigned before this version have no date and only appear under *All time*.
+**Statistics** (sidebar → Statistics) is a compact QA dashboard drawn with plain HTML/SVG (no chart library), filterable by Date Range (All time / Last 7 / Last 30 days / Custom), Release and QA Member: summary cards (Tickets Assigned, Regression Assigned, Completed with a progress meter, Passed, Failed, Blocked); *QA Activity Overview* (regression status changes over time — by day up to a month, then by week/month — stacked by the status changed to); *Regression Overview* (a donut + legend of Passed / Warning / Failed / Not Tested / Skipped); *QA Member Activity* (each member's assigned regression by status next to their status changes, listed alphabetically); *Release Overview* (status mix and tickets per release); and *Recent QA Activity* (a timeline of the latest status changes from the Audit Log). Hovering or focusing a bar/segment shows its exact numbers, every section shows "No data available for the selected filters." instead of an empty chart, and the underlying numbers stay available under *View the numbers as tables*. *Completed* = regression modules with a Passed, Warning or Failed result out of those not skipped. The *Assignment vs. activity* table credits each regression status change to the person it is **assigned to**: their own changes count as *Status Changes*, a change made by anyone else counts as *Changed By Others* for the assignee (and not as a status change of whoever made it). It covers the **QA team only** — Know the Team members who are "Available for regression assignment"; unassigned work, other assignees and release-level blockers aren't counted. Everything is computed from real release data and audit events; if nothing matches it says "No data available for the selected filters." It is workload visibility only: no ranking, scoring or productivity measures. **Who can open it:** people whose role (or an individual override) includes `statistics.view` — see *Users, roles & permissions*. Everyone else doesn't see the nav item or landing card and gets a "no access" message at `#/statistics`. Items assigned before this version have no date and only appear under *All time*.
 
-### Restricted pages and access (Statistics, Reporting)
+### Restricted pages (Statistics, Reporting) — now permissions
 
-Two pages are restricted: **Statistics** (`#/statistics`) and **Reporting** (`#/reporting`, the SANAD PMO Reporting Module — see `REPORTING_SPEC.md`; the page has three tabs: Reports, Dependencies and Data sync). Access is one explicit boolean per page on the existing Know the Team record (`statisticsAccess`, `reportingAccess`; missing = OFF) — no second user table. Access is managed **only inside the Add / Edit team member form** (a **Page access** section with a switch per page) — it is deliberately not shown on the cards. The section appears only for people who may change that page's access; everyone else never sees it. Saving the form saves the profile first, then sends each changed switch to `PUT /api/team/:id/access/:page`. Profile create/edit **cannot** change access by itself; new members start OFF.
+Statistics (`#/statistics`) and Reporting (`#/reporting`, the SANAD PMO Reporting Module — see `REPORTING_SPEC.md`) are opened with the `statistics.view` and `reporting.view` permissions. The old per-card switches (`statisticsAccess` / `reportingAccess`) and their `PUT /api/team/:id/access/:page` endpoint are retired (the endpoint answers `410`); existing holders keep their access through the migration described in **Users, roles & permissions → Upgrading an existing installation**. A missing permission shows the page's no-access state, and every `/api/statistics/*` and `/api/reporting/*` route is behind `requirePageAccess(page)` (`server/pageAccess.js`) which checks the permission on every request.
 
-- **Identity:** the signed-in Atlassian account, linked to a card once with "This is me" (`member.linkedEmail`). An account that isn't linked has no access.
-- **Server enforcement:** every `/api/reporting/*` route and `/api/statistics/*` route is behind `requirePageAccess(page)` (`server/pageAccess.js`), which reads the team on every request — revoking takes effect on the very next call, no restart. A 403 makes the page show its no-access state. `GET /api/team` leaves the access flags off other people's cards unless the caller holds some restricted-page access (a person always keeps the flags on their own card), `/api/audit` hides access-change events from people who hold no access and Reporting sync/settings events from people without Reporting access, and it returns entries **without** their structured `meta` to people lacking Statistics access; the Statistics page gets that data from the guarded `/api/statistics/activity`.
-- **Who can change access:** (1) someone who *has* a page's access can grant/revoke it for others; (2) nobody can grant it to themselves (revoking your own is fine); (3) **bootstrap:** while *nobody* has a page's access, any signed-in user linked to a card may grant it (including to themselves) so the first holder can exist; (4) an unlinked sign-in can't change access. There are no admin roles. If the last holder revokes their own access, the bootstrap rule applies again.
-- **"This is me" can't take over a card:** a card already linked to another account refuses a new link (409). Its holder — or someone with Statistics/Reporting access — removes the link first.
-- **Audit:** `STATISTICS_ACCESS_GRANTED/REVOKED`, `REPORTING_ACCESS_GRANTED/REVOKED` (who, whose access, when), plus `TEAM_MEMBER_LINKED/UNLINKED`. Written by the server only; re-sending an unchanged state writes nothing.
-- **Limitations:** release data (tickets, regression results, `lastChange` on regression modules) is still served to every signed-in user by the release API — Statistics access hides the analytics view and the audit-derived detail, it does not make release data confidential. Reporting data is served only through the guarded routes. Access follows the sign-in → card link, so anyone who can legitimately hold a card's link inherits its access.
+**Limitation (unchanged):** release data (tickets, regression results, `lastChange` on regression modules) is served to everyone who may view releases — Statistics access hides the analytics view and the audit-derived detail, it does not make release data confidential.
+
+## Users, roles & permissions
+
+Greenlight still signs people in with **Sign in with Atlassian** (no separate passwords). On top of that sits a small access-control layer that decides **what each signed-in person may do**.
+
+**Identity.** A person is identified by their **Jira `accountId`** — never by email or display name. The first time someone signs in they are registered automatically as **PENDING** with **no permissions**: they see a friendly "your access is pending" page (with their account id to send to an administrator), and every `/api` call is refused with `403 ACCESS_PENDING`. An administrator gives them a role (**Administration → Users**), which makes them **ACTIVE**. **INACTIVE** accounts are locked out the same way (`403 ACCOUNT_INACTIVE`) while their Team Member card, history and audit trail are kept. Jira tokens are never stored on the user record or sent to the browser.
+
+**Authorization is by permission, never by role name.** The server re-reads the person's status, role and individual overrides from the database on **every request** (nothing is cached and nothing comes from the browser), so a role change, override or deactivation takes effect on the very next call. The browser receives the resulting permission list from `/auth/me` only to decide what to *draw*.
+
+| Module | Permissions |
+|---|---|
+| Releases | `releases.view` `.create` `.edit` `.delete` `.manage` (`manage` = QA decisions such as publishing) |
+| Regression | `regression.view` `.create` `.edit` (status and notes) `.delete` `.assign` `.manage` (module list, skipping, sync) |
+| Test Data | `test_data.view` `.create` `.edit` `.delete` |
+| Daily QA Reports | `daily_reports.view` `.create` `.edit_own` `.edit_all` `.view_all` |
+| Statistics / Reporting / Audit | `statistics.view`, `reporting.view` `.manage`, `audit.view` |
+| Team | `team.view`, `team.manage` |
+| Users | `users.view` `.create` `.edit` `.deactivate` `.assign_roles` |
+| Roles | `roles.view` `.create` `.edit` `.delete` `.manage_permissions` |
+| Settings | `settings.view`, `settings.manage` (Reporting settings) |
+
+(`reporting.*` is the one addition to the permission catalogue: Reporting already existed as a restricted page and needed its own keys.)
+
+**Roles.** Five built-in roles — **Super Admin** (always everything, including permissions added later; can't be edited, so administration can't be locked out), **Admin** (everything except creating roles or changing what a role grants), **QA Lead**, **QA Engineer** and **Viewer** — plus any custom roles an administrator creates under **Administration → Roles & Permissions** (name, description, permissions grouped by module with select-all, user counts, activate/deactivate). Built-in roles keep their names and can be reset to defaults; a role that people hold can't be deleted or deactivated; role names are unique. An inactive role grants nothing.
+
+**Individual overrides.** On a user's details dialog an administrator can **Allow** an extra permission (optionally only until a date — temporary access) or **Deny** one the role grants. A Deny always beats the role; an Allow adds access; nothing is overridden by default; expired overrides are ignored automatically. Super Admins ignore overrides.
+
+**Team Members.** Exactly one Team Member card per person, stored as a stable id on the user (unique in the database). People link themselves with **"This is me"** (it changes no permissions); administrators can link or unlink anyone from the user's details. A card another person holds can't be taken over. Deactivating a user keeps their card and all history; a linked card can't be deleted until it is unlinked. Know the Team editing now needs `team.manage`.
+
+**Safeguards (enforced on the server, in `server/rbacService.js`).** Nobody can change their own role, status, link-as-admin or overrides; nobody can give a role or permission they don't hold themselves; nobody can modify a person who holds more than they do; the **last active Super Admin can't be demoted, deactivated or deleted** (race-safe); role and user changes run inside a lock/transaction so concurrent requests can't slip past these checks. Release saves are checked **field by field** (`server/releaseAccess.js`): someone who may only update regression results can't change ticket data, and a hand-crafted request can't write what its sender may not write.
+
+**Audit.** Every administrative change is written to the existing audit log with actor, target, action, previous and new value and time: `USER_REGISTERED`, `USER_ROLE_CHANGED`, `USER_ACTIVATED`, `USER_DEACTIVATED`, `ROLE_CREATED`, `ROLE_UPDATED`, `ROLE_DELETED`, `ROLE_PERMISSIONS_UPDATED`, `USER_PERMISSION_OVERRIDE_ADDED`, `USER_PERMISSION_OVERRIDE_REMOVED`, `TEAM_MEMBER_LINKED`, `TEAM_MEMBER_UNLINKED`. They are written by the server only (the browser can't post them) and are visible only to people with `users.view` or `roles.view`. The audit page itself now needs `audit.view`.
+
+### Creating the first Super Admin (bootstrap)
+
+Nobody becomes an administrator by being the first to sign in, there are no hard-coded ids, and there is **no web endpoint** that can grant admin rights. There are two operator-only ways, both of which need control of the server:
+
+1. **`SUPER_ADMIN_ACCOUNT_IDS`** — set this environment variable (Render → Environment) to the Jira account id of the person who should be Super Admin (comma-separated for more than one). When one of those people signs in **and no active Super Admin exists**, they are made the Super Admin (audited). Once a Super Admin exists the variable does nothing, so it can't be used to take over later; remove it afterwards if you like. If you set it after someone has already signed in, just have them sign in again.
+2. **`npm run admin:bootstrap -- <jiraAccountId> [--name "Display Name"] [--force]`** — run from the server's shell with `DATABASE_URL` set. Same rule (refuses when an active Super Admin exists, unless `--force`).
+
+**Where to find a Jira account id:** it is shown on the "your access is pending" screen right after signing in; it is also the last part of the person's Atlassian profile address (`https://<site>.atlassian.net/jira/people/<accountId>`).
+
+### Upgrading an existing installation (migration)
+
+* **Database:** `supabase/migrations/0008_users_roles_permissions.sql` is **additive** — it creates `app_roles`, `app_users`, `app_user_permission_overrides` and `app_role_permissions` (unique `account_id`, unique `team_member_id`, foreign keys with `ON DELETE SET NULL` for the card link, `RESTRICT` for roles in use) and changes nothing that exists. The app also creates the tables itself on first start, and `schema.sql` includes them for new databases. **Rollback:** `0008_users_roles_permissions_rollback.sql` drops just those four tables (it is never run automatically). The JSON-file store gets two new collections (`appRoles`, `appUsers`) added automatically.
+* **Existing people keep their access.** The first time a person who already used Greenlight signs in, if Jira shares their email and it matches a Team Member card's old "This is me" link, they are linked to that card once and placed in a custom role called **Existing Member (migrated)** (everything an ordinary signed-in person could do before, minus the three gated pages). Their old flags become explicit, audited overrides: *Statistics access* → `statistics.view` Allow, *Reporting access* → `reporting.view` Allow, *not available for regression* → Deny on the four Daily Report permissions. An administrator then moves people to the right role and deletes the migrated role when it is empty. Set `RBAC_ADOPT_LEGACY=off` to skip this and have everyone start pending. **If Jira doesn't share someone's email**, they arrive as pending and an administrator links and assigns them by hand.
+* **Do this first on Render:** set `SUPER_ADMIN_ACCOUNT_IDS` to your own account id *before* the first sign-in after deploying, so you become Super Admin rather than a migrated member.
+
+### Behaviour changes to be aware of
+
+* The Audit page needs `audit.view` (QA Lead and above have it; QA Engineer and Viewer don't).
+* QA Engineer doesn't have `daily_reports.view_all`, so the Daily Report team table shows them only their own reports ("Your reports"). QA Lead and above see everyone's.
+* Editing Know the Team (add / edit / delete) needs `team.manage` (Admin and Super Admin); everyone with `team.view` still sees it and can use "This is me".
+* Reporting settings need `settings.manage`; syncs and the dependency tracker need `reporting.manage`.
+* The Daily QA Report is available to people with `daily_reports.view` **and** a linked card (the old "available for regression assignment" flag no longer controls it — it still controls the assignment dropdowns).
+
+### Known limitations
+
+* The session cookie is stateless: the account's status and permissions are checked against the database on every request, but an individual cookie can't be revoked on its own (deactivate the user instead — that takes effect immediately and also deletes their stored Jira tokens).
+* Administrative actions are serialised with an **in-process** lock (plus database transactions/uniqueness on Postgres). Run a **single** app instance (as on Render today); the database constraints still prevent duplicate accounts and duplicate links if you scale out, but the "last Super Admin" check would then need a database-level lock.
+* `daily_reports.edit_all` is enforced by the API but has no screen yet. Assignment-restricted regression editing ("only my modules") is not enforced; `regression.edit` applies to all modules.
+* Release data confidentiality is unchanged (see above). A free Render instance sleeps — wake-ups and the 3:45 PM reminder are not affected by this feature.
 
 ### Reporting data sync (Phase 1)
 
@@ -310,7 +367,7 @@ The root URL (`/`) is now a landing page instead of the releases list (which mov
 
 ## Know the Team
 
-**Know the Team** (sidebar) introduces the people behind the QA work — name, role, a short bio, QA specialties, tools, and an optional LinkedIn/GitHub link. It is also the roster used for assignments, the Audit Log and Statistics — still no login roles or permissions. Team members live in one small array at the top of the "KNOW THE TEAM" section in `public/app.js` (`TEAM_MEMBERS`) — edit that array to add, update, or remove a person; a `placeholder: true` entry is shown with a "Placeholder" badge until it's replaced with a real profile.
+**Know the Team** (sidebar) introduces the people behind the QA work — name, role, a short bio, QA specialties, tools, and an optional LinkedIn/GitHub link. It is also the roster used for assignments, the Audit Log and Statistics. Editing it needs the `team.manage` permission; each person is linked to one card (see *Users, roles & permissions*). Team members live in one small array at the top of the "KNOW THE TEAM" section in `public/app.js` (`TEAM_MEMBERS`) — edit that array to add, update, or remove a person; a `placeholder: true` entry is shown with a "Placeholder" badge until it's replaced with a real profile.
 
 ## Running with Docker
 
@@ -361,7 +418,12 @@ greenlight-app/
     assignmentLogic.js       — team-member-id assignment model: legacy name→id migration, actor resolution, save-diff → audit events
     auditWriter.js           — builds/writes audit entries (teamMemberId + allow-listed meta)
     migrateAssignments.js    — startup pass that migrates stored releases to the id-based model
-    pageAccess.js            — restricted-page access rules + the requirePageAccess(page) guard (Statistics, Reporting) and the Daily QA Report guard
+    pageAccess.js            — maps Statistics / Reporting / Daily QA Report to permissions (requirePageAccess, requireDailyReportAccess)
+    permissions.js           — the permission catalogue, built-in roles, and the effective-permission engine (pure)
+    rbacService.js           — users, roles, overrides, bootstrap, last-Super-Admin and anti-escalation rules (+ audit events)
+    accessControl.js         — attachAccess (per-request status/role/permissions from the DB), requirePermission / requireAnyPermission
+    releaseAccess.js         — field-level authorization of a release save (pure)
+    httpError.js             — HttpError + the middleware that turns it into {error, code}
     dailyReportLogic.js      — Daily QA Report: validation, Amman dates, Slack message text, reminder timing, access rule (pure, no I/O)
     slack.js                 — posts to a Slack Incoming Webhook (built-in fetch, no dependency); the URL is never logged or exposed
     dailyReportReminder.js   — the 3:45 PM Asia/Amman reminder (claims the day in the database so it is sent once)
@@ -390,20 +452,24 @@ greenlight-app/
       audit.js                — audit log read/append endpoints (browser-postable events only; assignment events are server-derived)
       statistics.js              — guarded activity feed + Daily QA Report filled/missed counts behind the Statistics page
       reporting.js                — guarded Reporting API (settings, sync, report JSON, Excel/CSV downloads, dependencies, presets)
-      team.js                      — Know the Team CRUD, "This is me" link, per-page access switches
+      team.js                      — Know the Team CRUD (team.manage), "This is me" link; the old access-switch endpoint is retired
+      users.js                     — Administration → Users API (list, add, role, status, Team Member link, overrides, per-user audit)
+      roles.js                     — Administration → Roles & Permissions API
       testData.js               — the reusable Test Data library CRUD endpoints + Related Test Accounts (links between records)
-      dailyReports.js            — Daily QA Report API (save, then post to Slack; retry; edit; post update; team table, absences); guarded by the regression-flag rule
+      dailyReports.js            — Daily QA Report API (save, then post to Slack; retry; edit; post update; team table, absences); guarded by the daily_reports.* permissions
       auth.js                  — /auth/login, /auth/callback, /auth/logout, /auth/me
   public/
     index.html, styles.css, app.js  — the dashboard itself (no build step, no framework)
+    admin.js                        — Administration screens (Users, Roles & Permissions); loaded after app.js
     reportingCharts.js              — Reporting charts (SVG; shared by the page and the server-side Excel export)
   data/                    — created automatically when running on the JSON-file backend; your releases, audit log, and every signed-in user's own Jira OAuth tokens live here
   supabase/
-    migrations/             — incremental SQL (0002 adds audit_log.team_member_id / meta; 0003 adds the Reporting cache tables, 0004 the dependency tracker, 0005 the Related Test Accounts table, 0006 the Daily QA Report tables, 0007 the absences table; the app also creates all of these automatically)
+    migrations/             — incremental SQL (0002 adds audit_log.team_member_id / meta; 0003 adds the Reporting cache tables, 0004 the dependency tracker, 0005 the Related Test Accounts table, 0006 the Daily QA Report tables, 0007 the absences table, 0008 users / roles / permissions (with a rollback script); the app also creates all of these automatically)
     schema.sql              — the Postgres table definitions (run once against a new database — see "Deploying to Render + Supabase" below)
   scripts/
     migrate-json-to-supabase.js  — one-time (safely re-runnable) import of an existing data/store.json into Postgres
     seed-defaults.js               — seeds the starter regression modules / starter team into Postgres, only if those tables are still empty
+    bootstrap-super-admin.js       — operator tool (`npm run admin:bootstrap`): makes one Jira account the first Super Admin
   render.yaml               — optional Render Blueprint (build/start commands + the env var list) — see "Deploying to Render + Supabase"
   Dockerfile, docker-compose.yml, .dockerignore, .env.example  — see "Running with Docker" above
 ```
@@ -475,6 +541,8 @@ In the service's **Environment** tab:
 | `JIRA_SITE_URL` | Yes | Your Jira Cloud site — see "Authentication" above. |
 | `ATLASSIAN_CLIENT_ID` / `ATLASSIAN_CLIENT_SECRET` | Yes | From your Atlassian OAuth app — and update its callback URL registration to match the `APP_BASE_URL` above. |
 | `SESSION_SECRET` | Yes | Generate with `openssl rand -hex 32` (or let Render generate it — `render.yaml` does this for you). |
+| `SUPER_ADMIN_ACCOUNT_IDS` | Yes, for the first sign-in | Jira account id(s) (comma-separated) of the first Super Admin — see "Creating the first Super Admin". Without it nobody can administer users until you run `npm run admin:bootstrap`. |
+| `RBAC_ADOPT_LEGACY` | No | `off` = don't migrate existing people automatically; everyone starts pending. |
 | `GEMINI_API_KEY` / `GEMINI_MODEL` | No | Optional AI-assisted Release Notes — see "Release notes" above. |
 | `SLACK_WEBHOOK_URL` / `SLACK_REMINDER_WEBHOOK_URL` | No | Slack Incoming Webhook(s) for the Daily QA Report and its 3:45 PM Asia/Amman reminder — see "Daily QA Report" above. Without it reports are saved but not posted. |
 | `MYMEMORY_CONTACT_EMAIL` | No | Raises the free Arabic-translation fallback's daily quota (see "Mobile Release Note" above) — MyMemory's anonymous tier is capped low enough that routine testing can hit a `429` error; including a contact email in the request raises that cap. Set to any address you're fine with MyMemory seeing (used only for their own abuse contact, never shown to end users). |

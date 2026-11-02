@@ -10,7 +10,7 @@ const db = require("../db");
 const { asyncHandler } = require("../asyncHandler");
 const { resolveActor } = require("../assignmentLogic");
 const { buildEntry } = require("../auditWriter");
-const { hasPageAccess, memberForUser, memberHasAccess, holdsAnyAccess } = require("../pageAccess");
+const { requirePermission } = require("../accessControl");
 
 const router = express.Router();
 
@@ -71,6 +71,16 @@ const VALID_ACTIONS = new Set([
   "DAILY_REPORT_ABSENCE_ADDED",
   "DAILY_REPORT_ABSENCE_REMOVED",
   "DAILY_REPORT_SLACK_FAILED",
+  "USER_REGISTERED",
+  "USER_ROLE_CHANGED",
+  "USER_ACTIVATED",
+  "USER_DEACTIVATED",
+  "ROLE_CREATED",
+  "ROLE_UPDATED",
+  "ROLE_DELETED",
+  "ROLE_PERMISSIONS_UPDATED",
+  "USER_PERMISSION_OVERRIDE_ADDED",
+  "USER_PERMISSION_OVERRIDE_REMOVED",
 ]);
 
 // Assignment events and regression status changes are written by the SERVER
@@ -104,34 +114,48 @@ const SERVER_ONLY_ACTIONS = new Set([
   "DAILY_REPORT_ABSENCE_ADDED",
   "DAILY_REPORT_ABSENCE_REMOVED",
   "DAILY_REPORT_SLACK_FAILED",
+  "USER_REGISTERED",
+  "USER_ROLE_CHANGED",
+  "USER_ACTIVATED",
+  "USER_DEACTIVATED",
+  "ROLE_CREATED",
+  "ROLE_UPDATED",
+  "ROLE_DELETED",
+  "ROLE_PERMISSIONS_UPDATED",
+  "USER_PERMISSION_OVERRIDE_ADDED",
+  "USER_PERMISSION_OVERRIDE_REMOVED",
 ]);
 
-// Who changed whose access to a restricted page, and Reporting sync/settings
-// activity, is only for the people who hold that access — the rest of the team
-// doesn't see these events (or even that they exist).
-const ACCESS_CHANGE_ACTIONS = new Set([
+// Who changed whose access — user and role administration, plus the legacy
+// per-card Statistics/Reporting switches — is only for the people who manage
+// users or roles (or, for the legacy switches, hold the page); Reporting
+// sync/settings activity is only for people who can open Reporting. The rest
+// of the team doesn't see these events (or even that they exist).
+const ADMIN_ACTIONS = new Set([
+  "USER_REGISTERED", "USER_ROLE_CHANGED", "USER_ACTIVATED", "USER_DEACTIVATED",
+  "ROLE_CREATED", "ROLE_UPDATED", "ROLE_DELETED", "ROLE_PERMISSIONS_UPDATED",
+  "USER_PERMISSION_OVERRIDE_ADDED", "USER_PERMISSION_OVERRIDE_REMOVED",
   "STATISTICS_ACCESS_GRANTED", "STATISTICS_ACCESS_REVOKED",
   "REPORTING_ACCESS_GRANTED", "REPORTING_ACCESS_REVOKED",
 ]);
 const REPORTING_ACTIONS = new Set(["REPORT_SYNC_RUN", "REPORT_SETTINGS_UPDATED", "REPORT_EXPORTED", "REPORT_DEPENDENCY_CHANGED"]);
 
-// GET /api/audit — audit records visible to the caller, newest first.
-// The structured `meta` (who changed whose regression, previous/new status…)
-// is the raw material of the Statistics page, so it is only returned to people
-// with Statistics access; everyone else gets the plain entries.
-router.get("/", asyncHandler(async (req, res) => {
+// GET /api/audit — audit records visible to the caller (audit.view), newest
+// first. The structured `meta` (who changed whose regression, previous/new
+// status…) is the raw material of the Statistics page, so it is only returned
+// to people with statistics.view; everyone else gets the plain entries.
+router.get("/", requirePermission("audit.view"), asyncHandler(async (req, res) => {
+  const held = req.access.permissions;
   const all = await db.auditLog.list();
-  const team = await db.team.list();
-  const me = memberForUser(req.authUser, team);
-  const holdsAny = holdsAnyAccess(me);
-  const holdsReporting = memberHasAccess(me, "reporting");
+  const seeAdmin = held.has("users.view") || held.has("roles.view");
+  const seeReporting = held.has("reporting.view");
   const list = all.filter((e) => {
     if (!e) return false;
-    if (ACCESS_CHANGE_ACTIONS.has(e.action)) return holdsAny;
-    if (REPORTING_ACTIONS.has(e.action)) return holdsReporting;
+    if (ADMIN_ACTIONS.has(e.action)) return seeAdmin;
+    if (REPORTING_ACTIONS.has(e.action)) return seeReporting;
     return true;
   });
-  if (hasPageAccess(req.authUser, team, "statistics")) return res.json(list);
+  if (held.has("statistics.view")) return res.json(list);
   res.json(list.map((e) => {
     if (!e.meta) return e;
     const { meta, ...rest } = e;
