@@ -6,6 +6,8 @@
 //   SLACK_WEBHOOK_URL            the channel the daily reports (and, unless
 //                                overridden below, the reminder) are posted to
 //   SLACK_REMINDER_WEBHOOK_URL   optional: a different channel for the reminder
+//   SLACK_RELEASE_WEBHOOK_URL    optional: a different channel for "Release Published"
+//                                posts (otherwise SLACK_WEBHOOK_URL, the QA channel)
 
 const ALLOWED_HOSTS = new Set(["hooks.slack.com", "hooks.slack-gov.com"]);
 const TIMEOUT_MS = 8000;
@@ -15,7 +17,8 @@ let fetchImpl = (...args) => fetch(...args);
 function __setFetch(fn) { fetchImpl = fn || ((...args) => fetch(...args)); }
 
 function webhookUrl(kind) {
-  const own = kind === "reminder" ? process.env.SLACK_REMINDER_WEBHOOK_URL : "";
+  const own = kind === "reminder" ? process.env.SLACK_REMINDER_WEBHOOK_URL
+    : kind === "release" ? process.env.SLACK_RELEASE_WEBHOOK_URL : "";
   return String(own || process.env.SLACK_WEBHOOK_URL || "").trim();
 }
 function isValidWebhook(url) {

@@ -12,6 +12,8 @@ const { recordEvents } = require("../auditWriter");
 const { asyncHandler } = require("../asyncHandler");
 const { requirePermission, requireAnyPermission } = require("../accessControl");
 const { mergeReleaseSave } = require("../mergeRelease");
+const slack = require("../slack");
+const releaseSlack = require("../releaseSlack"); // the "Release Published" message for the QA channel
 const { authorizeReleaseSave } = require("../releaseAccess"); // which parts of a release this caller may change (by permission)
 
 const router = express.Router();
@@ -142,6 +144,31 @@ function serialized(id, fn) {
   return run;
 }
 
+// Posts "Release Published" to Slack AFTER the publish itself is saved, so a Slack
+// problem can never undo or block a publish. Records the outcome on the release
+// (published.slack) and, if the post failed, in the Audit Log. Never throws.
+async function announcePublish(release, before, actor) {
+  try {
+    const result = await slack.sendMessage(
+      releaseSlack.buildPublishMessage(release, { actorName: actor && actor.name, republished: !!(before && before.published && before.published.at) }),
+      { kind: "release" }
+    );
+    release.published.slack = result.ok
+      ? { status: "sent", at: new Date().toISOString(), error: null }
+      : { status: result.code === "not_configured" ? "not_configured" : "failed", at: new Date().toISOString(), error: result.error };
+    await db.releases.set(release._id, release);
+    if (!result.ok && result.code !== "not_configured") {
+      await recordEvents(db, actor, [{
+        action: "RELEASE_PUBLISH_SLACK_FAILED", entityType: "Release", entityId: release._id,
+        details: (release.name || "Release") + " was published but not posted to Slack — " + result.error,
+        meta: { releaseId: release._id },
+      }]);
+    }
+  } catch (e) {
+    console.error("release publish: Slack announcement failed:", e && e.message);
+  }
+}
+
 router.put("/:id", requireAnyPermission("releases.edit", "releases.manage", "regression.edit", "regression.assign", "regression.create", "regression.delete", "regression.manage"), asyncHandler((req, res) => serialized(req.params.id, async () => {
   const existing = await getReleaseMigrated(req.params.id);
   if (!existing) return notFound(res);
@@ -186,8 +213,19 @@ router.put("/:id", requireAnyPermission("releases.edit", "releases.manage", "reg
   const actor = assignmentLogic.resolveActor(req.authUser, team);
   const events = assignmentLogic.diffReleaseActivity(existing, merged, { actor, team, now });
 
+  // Publishing (a new or refreshed `published.at`) also tells the QA channel.
+  // The Slack outcome is recorded by the server on `published.slack`; whatever
+  // the browser sends there is ignored.
+  const publishing = releaseSlack.isNewPublish(existing, merged);
+  if (merged.published && typeof merged.published === "object") {
+    const prevSlack = existing.published && existing.published.slack;
+    if (prevSlack && !publishing) merged.published.slack = prevSlack;
+    else delete merged.published.slack;
+  }
+
   await db.releases.set(req.params.id, merged);
   await recordEvents(db, actor, events, now);
+  if (publishing) await announcePublish(merged, existing, actor);
   res.json(merged);
 })));
 

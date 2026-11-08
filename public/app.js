@@ -1640,7 +1640,8 @@ var AUDIT_ACTION_LABELS = {
   DAILY_REPORT_EDITED: "Edited Daily QA Report",
   DAILY_REPORT_ABSENCE_ADDED: "Marked Absent (Daily QA Report)",
   DAILY_REPORT_ABSENCE_REMOVED: "Removed Absence (Daily QA Report)",
-  DAILY_REPORT_SLACK_FAILED: "Daily QA Report Not Posted to Slack"
+  DAILY_REPORT_SLACK_FAILED: "Daily QA Report Not Posted to Slack",
+  RELEASE_PUBLISH_SLACK_FAILED: "Release Published, Not Posted to Slack"
 };
 function humanizeAuditAction(action){
   return AUDIT_ACTION_LABELS[action] || action;
@@ -5901,8 +5902,11 @@ function sectionPublish(r, assessment){
   var pub = r.published;
   var isPublished = !!(pub && pub.at);
   var body = isPublished
-    ? '<div class="modal-success" style="margin:0;">Published '+esc(fmtDateTime(pub.at))+' — recommendation at the time: <strong>'+esc(pub.recommendation)+'</strong>. Publishing again will update this record with the current recommendation.</div>'
-    : '<p class="helper-text">Once QA is happy with this release, publish it to record that it shipped. This snapshots the current AI recommendation for the record — it doesn’t lock the release, so you can keep editing afterward.</p>';
+    ? '<div class="modal-success" style="margin:0;">Published '+esc(fmtDateTime(pub.at))+' — recommendation at the time: <strong>'+esc(pub.recommendation)+'</strong>. Publishing again will update this record with the current recommendation.</div>'+
+      (pub.slack && pub.slack.status==="sent" ? '<p class="helper-text" style="margin-top:8px;">Posted to the QA channel on Slack.</p>' :
+       pub.slack && pub.slack.status==="failed" ? '<p class="helper-text" style="margin-top:8px;">Not posted to Slack — '+esc(pub.slack.error||"unknown error")+'</p>' :
+       pub.slack && pub.slack.status==="not_configured" ? '<p class="helper-text" style="margin-top:8px;">Slack isn’t set up on the server, so nothing was posted.</p>' : '')
+    : '<p class="helper-text">Once QA is happy with this release, publish it to record that it shipped. This snapshots the current AI recommendation for the record — it doesn’t lock the release, so you can keep editing afterward. A summary is also posted to the QA channel on Slack.</p>';
   return '<section class="card section-card" id="sec-publish">'+
     '<div class="section-head"><div class="section-title">🚀 Publish</div></div>'+
     '<div class="section-body">'+body+
@@ -7047,7 +7051,10 @@ function handlePublishRelease(r){
     (already ? "This updates the existing publish record with today’s date and recommendation." : "This records that "+esc(releaseLabel(r))+" shipped, with today’s recommendation for reference.");
   openConfirm(already ? "Re-publish this release?" : "Publish this release?", msg, already ? "Re-publish" : "Publish", function(){
     r.published = { at: new Date().toISOString(), recommendation: a.recommendation };
-    persistRelease(r).then(function(){ showToast("Release published"); });
+    persistRelease(r).then(function(){
+      var cur = state.releases[r._id], sl = cur && cur.published && cur.published.slack;
+      showToast(!sl || sl.status==="not_configured" ? "Release published" : sl.status==="sent" ? "Release published — posted to the QA channel" : "Release published, but it couldn’t be posted to Slack");
+    });
   }, false);
 }
 

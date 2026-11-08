@@ -10,7 +10,7 @@ A lightweight QA release-readiness dashboard. It runs happily on your own machin
 - Gives an AI-style **GO / CONDITIONAL GO / NO-GO** recommendation, built from simple rules over exactly what you've entered (it never invents data).
 - Tickets can be added manually by pasting a Jira URL, or synced automatically from Jira by Fix Version.
 - Generates editable release notes from your Jira tickets and QA data — see **Release notes** below.
-- **Publish Release** records that a release shipped, with a timestamped snapshot of the recommendation at the time — shown as a badge on the release both on its own page and in the main list. Publishing never locks the release from further edits.
+- **Publish Release** records that a release shipped, with a timestamped snapshot of the recommendation at the time — shown as a badge on the release both on its own page and in the main list. Publishing never locks the release from further edits. It also posts a short **Release Published** summary to the QA channel on Slack (see below).
 - Once a release is published, a **Download PDF** button appears — see [Download PDF](#download-pdf) below.
 - An instant search bar on the main page finds a release, ticket, bug, blocker, or regression entity/service as you type, and jumps straight to it.
 - The main list always shows newest-created releases first, and that order doesn't shuffle as you edit a release afterward.
@@ -288,6 +288,12 @@ The browser's Save-as-PDF dialog also suggests the file's name for you, from the
 
 A release is saved as one document, so a tab that was opened a while ago used to overwrite what teammates changed in the meantime (and the activity log blamed the person who saved). Now every save carries the copy the browser last received from the server (`_base`), and the server does a three-way merge against the current copy (`server/mergeRelease.js`): fields you did not touch keep the other person's latest value, rows (regression modules, tickets, incidents) are merged by id, and saves for the same release are processed one at a time. If two people change the *same* field at the same moment, the last save wins. Older tabs that do not send `_base` behave as before, so hard-refresh (Ctrl+Shift+R) after a deploy.
 
+## Release Published → Slack
+
+When a release is published (or re-published) the server posts one message to the QA channel — the same webhook as the Daily QA Report (`SLACK_WEBHOOK_URL`), or `SLACK_RELEASE_WEBHOOK_URL` if you want a different channel. It carries the release name and version, the recommendation, the release date, who published it, ticket count, regression totals (pass / warning / fail / not tested; skipped rows left out), open blockers, open bugs and a link to the release. Anything typed by a person is escaped, so a release called `<!channel>` can't ping everyone. A re-publish says "Re-published". Saving a release for any other reason never posts.
+
+The publish is saved first and Slack second, so a Slack problem never blocks or undoes it: the Publish section shows "Posted to the QA channel", "Not posted to Slack — <reason>" or "Slack isn't set up", and a failed post is noted in the Audit Log ("Release Published, Not Posted to Slack"; no webhook URL in it). The status is written by the server, never taken from the browser. Only people who may publish (`releases.manage`) trigger it. An already-published release isn't posted retroactively — publish it again to send it.
+
 ## Test Data
 
 **Test Data** is a reusable QA data library — click **🗂 Test Data** (top-right of every page). It is deliberately *not* a test-management system: no test cases, no executions, no relationship to releases. It's a flat, searchable list of records you build up once and reuse across any release, instead of re-typing the same National IDs every time you need "a divorced female head of family" or "an account with Electronic Payment enabled."
@@ -429,6 +435,7 @@ greenlight-app/
     releaseAccess.js         — field-level authorization of a release save (pure)
     httpError.js             — HttpError + the middleware that turns it into {error, code}
     dailyReportLogic.js      — Daily QA Report: validation, Amman dates, Slack message text, reminder timing, access rule (pure, no I/O)
+    releaseSlack.js          — the "Release Published" Slack message (pure) and the new-publish check
     slack.js                 — posts to a Slack Incoming Webhook (built-in fetch, no dependency); the URL is never logged or exposed
     dailyReportReminder.js   — the 3:45 PM Asia/Amman reminder (claims the day in the database so it is sent once)
     reportingLogic.js        — Reporting: Jira issue → cache rows + derived fields (hours, variance, lifecycle, blocked days); pure, no I/O
@@ -548,7 +555,7 @@ In the service's **Environment** tab:
 | `SUPER_ADMIN_ACCOUNT_IDS` | Yes, for the first sign-in | Jira account id(s) (comma-separated) of the first Super Admin — see "Creating the first Super Admin". Without it nobody can administer users until you run `npm run admin:bootstrap`. |
 | `RBAC_ADOPT_LEGACY` | No | `off` = don't migrate existing people automatically; everyone starts pending. |
 | `GEMINI_API_KEY` / `GEMINI_MODEL` | No | Optional AI-assisted Release Notes — see "Release notes" above. |
-| `SLACK_WEBHOOK_URL` / `SLACK_REMINDER_WEBHOOK_URL` | No | Slack Incoming Webhook(s) for the Daily QA Report and its 3:45 PM Asia/Amman reminder — see "Daily QA Report" above. Without it reports are saved but not posted. |
+| `SLACK_WEBHOOK_URL` / `SLACK_REMINDER_WEBHOOK_URL` / `SLACK_RELEASE_WEBHOOK_URL` | No | Slack Incoming Webhook(s) for the Daily QA Report, its 3:45 PM Asia/Amman reminder, and "Release Published" posts (the last two default to `SLACK_WEBHOOK_URL`) — see "Daily QA Report" and "Release Published → Slack". Without it nothing is posted (reports are still saved; a publish still succeeds). |
 | `MYMEMORY_CONTACT_EMAIL` | No | Raises the free Arabic-translation fallback's daily quota (see "Mobile Release Note" above) — MyMemory's anonymous tier is capped low enough that routine testing can hit a `429` error; including a contact email in the request raises that cap. Set to any address you're fine with MyMemory seeing (used only for their own abuse contact, never shown to end users). |
 
 `DATABASE_SSL` doesn't need to be set on Render — the app connects to Supabase over TLS by default.
