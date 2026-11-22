@@ -12,6 +12,7 @@ const teamRouter = require("./routes/team");
 const statisticsRouter = require("./routes/statistics");
 const reportingRouter = require("./routes/reporting");
 const dailyReportsRouter = require("./routes/dailyReports");
+const rcaRouter = require("./routes/rca");
 const authRouter = require("./routes/auth");
 const usersRouter = require("./routes/users");
 const rolesRouter = require("./routes/roles");
@@ -70,6 +71,8 @@ app.use("/api/test-data", testDataRouter);
 app.use("/api/team", teamRouter);
 // Daily QA Report: guarded by pageAccess.requireDailyReportAccess (regression flag).
 app.use("/api/daily-reports", dailyReportsRouter);
+// RCA (root cause analyses): guarded per route by rca.* permissions.
+app.use("/api/rca", rcaRouter);
 // Restricted areas: every route inside is guarded by pageAccess.requirePageAccess.
 app.use("/api/statistics", statisticsRouter);
 app.use("/api/reporting", reportingRouter);

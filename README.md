@@ -16,6 +16,7 @@ A lightweight QA release-readiness dashboard. It runs happily on your own machin
 - The main list always shows newest-created releases first, and that order doesn't shuffle as you edit a release afterward.
 - An **Audit Log** (sidebar → Audit) records who did what and when — releases created, tickets added/updated, Jira syncs, regression/bug/blocker/platform/performance/security updates, release notes generated or saved, Test Data added/updated/copied/deleted, and Test Data accounts linked/unlinked. See [Identity & the Audit Log](#identity--the-audit-log) for how "who" is determined.
 - **Test Data** (sidebar → Test Data) is a reusable QA data library, independent of any release — see [Test Data](#test-data) below.
+- **RCA** (sidebar → RCA) records a root cause analysis for a release — see [RCA](#rca) below.
 - **Know the Team** (sidebar → Know the Team) is a purely informational page introducing the people behind the QA work — see [Know the Team](#know-the-team) below.
 
 ## Requirements
@@ -83,13 +84,14 @@ Greenlight still signs people in with **Sign in with Atlassian** (no separate pa
 | Regression | `regression.view` `.create` `.edit` (status and notes) `.delete` `.assign` `.manage` (module list, skipping, sync) |
 | Test Data | `test_data.view` `.create` `.edit` `.delete` |
 | Daily QA Reports | `daily_reports.view` `.create` `.edit_own` `.edit_all` `.view_all` |
+| RCA | `rca.view` `.create` `.edit` `.delete` |
 | Statistics / Reporting / Audit | `statistics.view`, `reporting.view` `.manage`, `audit.view` |
 | Team | `team.view`, `team.manage` |
 | Users | `users.view` `.create` `.edit` `.deactivate` `.assign_roles` |
 | Roles | `roles.view` `.create` `.edit` `.delete` `.manage_permissions` |
 | Settings | `settings.view`, `settings.manage` (Reporting settings) |
 
-(`reporting.*` is the one addition to the permission catalogue: Reporting already existed as a restricted page and needed its own keys.)
+(`reporting.*` was added to the catalogue for Reporting, and `rca.*` for the RCA page — 42 permissions in all. `rca.*` reaches roles that already exist in a database once, at the first start after the upgrade: Admin, QA Lead and Existing Member (migrated) get all four, QA Engineer gets view / create / edit, Viewer gets view; Super Admin has everything automatically. After that it is just an ordinary permission an administrator can change — a restart never puts a removed one back.)
 
 **Roles.** Five built-in roles — **Super Admin** (always everything, including permissions added later; can't be edited, so administration can't be locked out), **Admin** (everything except creating roles or changing what a role grants), **QA Lead**, **QA Engineer** and **Viewer** — plus any custom roles an administrator creates under **Administration → Roles & Permissions** (name, description, permissions grouped by module with select-all, user counts, activate/deactivate). Built-in roles keep their names and can be reset to defaults; a role that people hold can't be deleted or deactivated; role names are unique. An inactive role grants nothing.
 
@@ -359,7 +361,7 @@ Blockers / help needed:
 
 - **Editing:** the author can edit any of their own reports at any time (the **Edit** button on today's report or on a row under "Your recent reports"; nobody else can). Saving an edit changes only the report in Greenlight — it **never posts to Slack by itself**. If Slack already has the earlier version, the report shows "Edited — Slack still shows the earlier version" with a **Post update to Slack** button. Posting sends one **new** message, the same template with "· ✏️ Updated" added to the title line; the earlier message stays in the channel (an Incoming Webhook can't change a message that is already posted). A failed update post keeps the button and shows the reason. If Slack never received the report at all, **Retry Slack** posts the current text as the original instead. Edits are recorded in the Audit log ("Edited Daily QA Report", no report text in it).
 - **Re-send to Slack:** on a report that is already in Slack and up to date, the author has a **Re-send to Slack** button (it asks "Post it to Slack again?" first). It posts the current text as a new message with "· 🔁 Re-sent" on the title line — useful if the message was deleted or went to the wrong place. It is not offered while the report is unsent (use Retry Slack) or edited since it was posted (use Post update to Slack). The page shows how many times it was re-sent and any failure.
-- **Team reports table:** under today's report there is a table of everyone's reports (Date · Name · Today · Tomorrow · Blockers), newest first. Every member who can open the page can read it — the reports already go to a shared Slack channel — but only the author can edit their own rows (click a row to open it in full). Filters: **Date** (Today / Last 7 days / Last 30 days / All time / Custom range), **Name** (QA members, alphabetical) and a **Search** box that looks through names, dates ("26 Oct", "Mon") and the report text; every word typed must match. The newest 200 matching reports are shown, with a note when there are more.
+- **Team reports table:** under today's report there is a table of everyone's reports (Date · Name · Today · Tomorrow · Blockers), newest first. Every member who can open the page can read it — the reports already go to a shared Slack channel — but only the author can edit their own rows (click a row to open it in full). Filters: **Date** (Today / Last 7 days / Last 30 days / All time / Custom range), **Name** (QA members, alphabetical) and a **Search** box that looks through names, dates ("26 Oct", "Mon") and the report text; every word typed must match. The table is **paged**: 10 rows per page by default (choose 10 / 25 / 50 under the table), with Prev / Next and numbered pages and a "Showing 11–20 of 57" line; changing a filter, the search or the page size goes back to page 1, and a new report you file jumps to page 1. The pager is hidden when everything fits on one page. (`GET /api/daily-reports/team?page=&pageSize=` — pageSize 1–100; a caller that sends no `pageSize`, such as an old browser tab, still gets the first 200 rows.)
 - **Marking yourself absent:** the **Mark myself absent** card (under today's report) lets a member mark a working day they were away — pick the day, add an optional one-line note (e.g. "sick leave"), press **Mark absent**. One day at a time, Sunday–Thursday only (Friday/Saturday are refused), from 90 days back up to 60 days ahead. **Nothing is posted to Slack.** Only the member can mark or remove their own absence; the team table shows it as an "Absent" row (with the note) and the search/date/name filters include it. A day already marked absent isn't counted as missed in Statistics. Rules: you can't mark a day you already filed a report for; if you file a report for a day you'd marked absent, the report wins and the absence is removed; **Remove** puts the day back to "missed" if no report exists. Marking and removing are recorded in the Audit log (no note text in it).
 - **The daily reminder** is a separate Slack message sent every working day — **Sunday to Thursday, never Friday or Saturday** — at **3:45 PM Asia/Amman** (if the server was down at that minute it still goes out up to two hours late, and never twice in a day — the day is claimed in the database first): "⏰ Daily QA Update Reminder — Please remember to submit your Daily QA Update for today. Fill using this link: https://greenlight-0foe.onrender.com/#/daily-report" (the link is built in, so it never depends on `APP_BASE_URL`; set the optional `DAILY_REPORT_LINK` only if the app moves). It never names anyone or implies a report was submitted. It runs inside the server (so it needs the service to be running — Render's `starter` plan or above, not a sleeping free instance).
 - **Setup:** create an [Incoming Webhook](https://api.slack.com/messaging/webhooks) for the channel and set `SLACK_WEBHOOK_URL` (a secret — environment only; it is never sent to the browser or logged, and only `hooks.slack.com` addresses are accepted). Optionally `SLACK_REMINDER_WEBHOOK_URL` sends the reminder to a different channel. Without `SLACK_WEBHOOK_URL` reports are still saved and a banner on the page says Slack isn't set up; no reminder is sent. On Postgres the three tables (`daily_qa_reports`, `daily_qa_reminders`, `daily_qa_absences`) are created automatically on first use; `supabase/migrations/0006_daily_qa_reports.sql` and `0007_daily_qa_absences.sql` do the same by hand.
@@ -370,10 +372,27 @@ Blockers / help needed:
 
 The root URL (`/`) is now a landing page instead of the releases list (which moved to its own explicit `/#/releases` route — every existing "back to releases" link and the sidebar's **Release Monitor** item still take you there). It's intentionally lightweight — an orientation and jumping-off point, not another full dashboard:
 
-- A short welcome section, quick-access cards straight to Release Monitor, Test Data, Statistics, Reporting, Daily QA Report, Audit, and Know the Team (Statistics, Reporting and Daily QA Report only for people who have access).
+- A short welcome section, quick-access cards straight to Release Monitor, Test Data, Statistics, Reporting, Daily QA Report, RCA, Audit, and Know the Team (each only for people who have access).
 - **At a Glance** — Active Releases, Open Blockers, Releases with GO, and Releases with NO-GO, computed live from your existing release data (the same `computeAssessment()` engine used everywhere else) — never invented or hardcoded numbers.
 - **Recent Releases** — the 5 most recently updated releases with their current status, linking straight to each release's page, plus a "View all releases" link.
 - **Recent Activity** — the 5 most recent Audit Log entries, shown only when the Audit Log already has data. Viewing the landing page itself never writes a new audit entry.
+
+## RCA
+
+**Sidebar → RCA** (`#/rca`) keeps root cause analyses. **Add RCA** opens a form with:
+
+- **The release that caused it** — a dropdown of every release in Release Monitor (newest first, with its date). It is read from the releases list each time the page loads, so a new release appears without any set-up.
+- **The issue**, **The cause**, **The corrective action** and **The preventive action** — four text boxes (up to 5,000 characters each).
+
+All five are required; the form tells you which one is missing. Each saved RCA is shown as a card — the release, the four sections, who added it and when (and who edited it last). **Edit** and **Delete** are on every card (Delete asks first).
+
+- **Finding them:** a **Release** filter, a **Search** box (every word you type must appear somewhere — the four texts, the release or the author), and paging (10 / 25 / 50 per page, Prev / Next and numbered pages). Changing a filter, the search or the page size goes back to page 1.
+- **If a release is deleted** its RCAs are kept: they show the release's saved name marked "(deleted)", stay reachable through the filter, and can still be edited. (A new RCA can only pick a release that exists.) If a release is renamed, its RCAs show the new name.
+- **Who:** the author and editor come from the signed-in account (shown under their Know the Team name when linked), never from the browser.
+- **Permissions:** `rca.view` (open the page — needed for everything), `rca.create`, `rca.edit`, `rca.delete`. Buttons a person can't use are hidden and the server checks them again. Defaults are in the table above.
+- **Audit Log:** "Added RCA", "Edited RCA" and "Deleted RCA", naming the release but never containing the RCA's text. Saving an RCA without changing anything records nothing.
+- **API:** `GET /api/rca?release=&q=&page=&pageSize=` (also returns the `releases` for the dropdown), `POST /api/rca`, `PUT /api/rca/:id`, `DELETE /api/rca/:id`.
+- **Database:** the `rcas` table (and a small `app_meta` table for one-time upgrade markers) is created automatically on first use; `supabase/migrations/0009_rca.sql` does the same by hand, and `0009_rca_rollback.sql` removes both (it deletes every RCA).
 
 ## Know the Team
 
@@ -428,6 +447,7 @@ greenlight-app/
     assignmentLogic.js       — team-member-id assignment model: legacy name→id migration, actor resolution, save-diff → audit events
     auditWriter.js           — builds/writes audit entries (teamMemberId + allow-listed meta)
     migrateAssignments.js    — startup pass that migrates stored releases to the id-based model
+    rcaLogic.js              — RCA: validation, record shape, release label, search (pure, no I/O)
     pageAccess.js            — maps Statistics / Reporting / Daily QA Report to permissions (requirePageAccess, requireDailyReportAccess)
     permissions.js           — the permission catalogue, built-in roles, and the effective-permission engine (pure)
     rbacService.js           — users, roles, overrides, bootstrap, last-Super-Admin and anti-escalation rules (+ audit events)
@@ -467,6 +487,7 @@ greenlight-app/
       users.js                     — Administration → Users API (list, add, role, status, Team Member link, overrides, per-user audit)
       roles.js                     — Administration → Roles & Permissions API
       testData.js               — the reusable Test Data library CRUD endpoints + Related Test Accounts (links between records)
+      rca.js                     — RCA API (list with the releases dropdown, add, edit, delete); guarded by the rca.* permissions
       dailyReports.js            — Daily QA Report API (save, then post to Slack; retry; edit; post update; team table, absences); guarded by the daily_reports.* permissions
       auth.js                  — /auth/login, /auth/callback, /auth/logout, /auth/me
   public/

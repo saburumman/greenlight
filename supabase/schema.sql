@@ -333,3 +333,24 @@ create table if not exists app_user_permission_overrides (
   primary key (user_id, permission)
 );
 comment on table app_user_permission_overrides is 'Per-user exceptions to the role: ALLOW adds a permission, DENY removes it (DENY always wins). Optional expiry for temporary access.';
+
+-- rcas — root-cause analyses (RCA page). `release_id` has no foreign key on
+-- purpose: deleting a release must keep its analyses (each carries a label
+-- snapshot of the release). See supabase/migrations/0009_rca.sql.
+create table if not exists rcas (
+  id uuid primary key,
+  release_id text,
+  data jsonb not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists idx_rcas_release on rcas (release_id);
+create index if not exists idx_rcas_created_at on rcas (created_at desc);
+comment on table rcas is 'Root-cause analyses: the issue, the cause, the corrective and preventive actions, and the release that caused it. Stored whole as JSONB like the other collections.';
+
+-- app_meta — one-time upgrade markers (e.g. which new permissions were already added to the built-in roles).
+create table if not exists app_meta (
+  key text primary key,
+  value jsonb not null,
+  updated_at timestamptz not null default now()
+);

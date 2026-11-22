@@ -73,8 +73,23 @@ function ensureSystemRoles() {
       }
       existing = await db.appRoles.list();
     }
+    await applyPermissionRollouts();
   })().catch((e) => { rolesReady = null; throw e; });
   return rolesReady;
+}
+// New permissions reach roles that already exist exactly once (see
+// permissions.js PERMISSION_ROLLOUTS): add what is missing, then remember it, so
+// an administrator who removes one later is never overridden on a restart.
+async function applyPermissionRollouts() {
+  for (const ro of P.PERMISSION_ROLLOUTS) {
+    const marker = "rollout:" + ro.id;
+    if (await db.meta.get(marker)) continue;
+    for (const role of await db.appRoles.list()) {
+      const add = (ro.grants[role.systemKey] || []).filter((k) => P.isValidPermission(k) && !role.permissions.includes(k));
+      if (add.length) await db.appRoles.save({ ...role, permissions: P.normalizePermissions(role.permissions.concat(add)).permissions, updatedAt: nowIso() });
+    }
+    await db.meta.set(marker, { appliedAt: nowIso() });
+  }
 }
 function _resetForTests() { rolesReady = null; chain = Promise.resolve(); }
 

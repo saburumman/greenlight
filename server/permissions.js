@@ -49,6 +49,12 @@ const GROUPS = [
     ["daily_reports.edit_all", "Edit other people's reports"],
     ["daily_reports.view_all", "See everyone's reports (team table)"],
   ] },
+  { key: "rca", label: "RCA (Root Cause Analysis)", permissions: [
+    ["rca.view", "Open the RCA page and read analyses"],
+    ["rca.create", "Add an RCA"],
+    ["rca.edit", "Edit RCAs"],
+    ["rca.delete", "Delete RCAs"],
+  ] },
   { key: "statistics", label: "Statistics", permissions: [
     ["statistics.view", "Open the Statistics page"],
   ] },
@@ -135,6 +141,7 @@ const SYSTEM_ROLES = [
       "regression.view", "regression.create", "regression.edit", "regression.delete", "regression.assign", "regression.manage",
       "test_data.view", "test_data.create", "test_data.edit", "test_data.delete",
       "daily_reports.view", "daily_reports.create", "daily_reports.edit_own", "daily_reports.view_all",
+      "rca.view", "rca.create", "rca.edit", "rca.delete",
       "statistics.view", "reporting.view", "audit.view",
       "team.view",
     ],
@@ -147,13 +154,14 @@ const SYSTEM_ROLES = [
       "regression.view", "regression.edit",
       "test_data.view", "test_data.create", "test_data.edit",
       "daily_reports.view", "daily_reports.create", "daily_reports.edit_own",
+      "rca.view", "rca.create", "rca.edit",
       "team.view",
     ],
   },
   {
     key: "viewer", name: "Viewer",
     description: "Read-only access to releases, regression, test data and the team. Cannot change anything.",
-    permissions: ["releases.view", "regression.view", "test_data.view", "team.view"],
+    permissions: ["releases.view", "regression.view", "test_data.view", "rca.view", "team.view"],
   },
 ];
 
@@ -170,9 +178,29 @@ const LEGACY_ROLE = {
     "regression.view", "regression.create", "regression.edit", "regression.delete", "regression.assign", "regression.manage",
     "test_data.view", "test_data.create", "test_data.edit", "test_data.delete",
     "daily_reports.view", "daily_reports.create", "daily_reports.edit_own", "daily_reports.view_all",
+    "rca.view", "rca.create", "rca.edit", "rca.delete",
     "audit.view", "team.view", "team.manage",
   ],
 };
+
+// One-time additions of NEW permissions to roles that already exist in a
+// database (roles are stored, so a permission added to the templates above only
+// reaches NEW installs). Each rollout runs once — rbacService.ensureSystemRoles
+// records `rollout:<id>` — and only ADDS the listed permissions to the roles with
+// that systemKey, so an administrator who later removes one is never overridden.
+// Super Admin needs no entry: it always holds the whole catalogue.
+const PERMISSION_ROLLOUTS = [
+  {
+    id: "rca-v1",
+    grants: {
+      admin: ["rca.view", "rca.create", "rca.edit", "rca.delete"],
+      qa_lead: ["rca.view", "rca.create", "rca.edit", "rca.delete"],
+      qa_engineer: ["rca.view", "rca.create", "rca.edit"],
+      viewer: ["rca.view"],
+      legacy_member: ["rca.view", "rca.create", "rca.edit", "rca.delete"],
+    },
+  },
+];
 
 // role:  { systemKey, permissions[], isActive } | null
 // overrides: { [permission]: { effect:"allow"|"deny", expiresAt? } }
@@ -218,7 +246,7 @@ function isSubset(needed, held) {
 }
 
 module.exports = {
-  GROUPS, ALL_PERMISSIONS, SYSTEM_ROLES, LEGACY_ROLE,
+  GROUPS, ALL_PERMISSIONS, SYSTEM_ROLES, LEGACY_ROLE, PERMISSION_ROLLOUTS,
   isValidPermission, normalizePermissions, catalogForClient,
   effectivePermissions, explainPermissions, isSubset,
 };

@@ -203,6 +203,10 @@ var api = {
   deleteTeamMember: function(id){ return apiCall("DELETE","/team/"+id); },
   linkMeToTeamMember: function(id, linked){ return apiCall("PUT","/team/"+id+"/link-me", {linked: !!linked}); },
   statsActivity: function(){ return apiCall("GET","/statistics/activity"); },
+  rcaList: function(qs){ return apiCall("GET","/rca"+(qs?"?"+qs:"")); },
+  rcaCreate: function(data){ return apiCall("POST","/rca", data); },
+  rcaUpdate: function(id, data){ return apiCall("PUT","/rca/"+encodeURIComponent(id), data); },
+  rcaDelete: function(id){ return apiCall("DELETE","/rca/"+encodeURIComponent(id)); },
   dailyReportMe: function(){ return apiCall("GET","/daily-reports/me"); },
   submitDailyReport: function(data){ return apiCall("POST","/daily-reports", data); },
   retryDailyReportSlack: function(id){ return apiCall("POST","/daily-reports/"+encodeURIComponent(id)+"/slack-retry"); },
@@ -293,7 +297,8 @@ var state = {
   statsDenied: false, // the server said 403 (no Statistics access)
   reportingReady: false,
   reportingDenied: false, // the server said 403 (no Reporting access)
-  dr: {ready:false, denied:false, data:null, error:"", form:{today:"",tomorrow:"",blockers:""}, errors:{}, submitting:false, retrying:{}, edit:null, posting:{}, resending:{}, resendConfirm:"", absence:{date:"", note:"", saving:false, errors:{}, removing:{}}, team:{f:{range:"30", from:"", to:"", member:"", q:""}, data:null, members:[], loading:false, error:"", open:{}, token:0}}, // Daily QA Report page; edit = {id, form, errors, saving}
+  rca: {data:null, loading:false, error:"", f:{release:"", q:""}, page:1, pageSize:10, token:0}, // RCA page: data = /api/rca response
+  dr: {ready:false, denied:false, data:null, error:"", form:{today:"",tomorrow:"",blockers:""}, errors:{}, submitting:false, retrying:{}, edit:null, posting:{}, resending:{}, resendConfirm:"", absence:{date:"", note:"", saving:false, errors:{}, removing:{}}, team:{f:{range:"30", from:"", to:"", member:"", q:""}, data:null, members:[], loading:false, error:"", open:{}, token:0, page:1, pageSize:10}}, // Daily QA Report page; edit = {id, form, errors, saving}
   rp: {dataLayer:false, needsPostgres:false, status:null, settings:null, error:null, saving:false, starting:false, pollTimer:null,
        tab:"reports", filters:null, options:null, presets:[], presetName:"", report:null, reportLoading:false, reportError:null, reportBooting:false, sheetId:"summary", chartTables:{}, exporting:false, deps:null, depsError:null, depStatuses:null},
   assessmentLoggedFor: {}, // releaseId -> true, so AI_ASSESSMENT_GENERATED logs once per viewing, not every re-render
@@ -1067,6 +1072,7 @@ function parseHash(){
   if(h==="statistics") return {view:"statistics"};
   if(h==="reporting") return {view:"reporting"};
   if(h==="daily-report") return {view:"dailyReport"};
+  if(h==="rca") return {view:"rca"};
   if(h==="test-data") return {view:"testData"};
   if(h==="team") return {view:"team"};
   if(h==="admin/users") return {view:"adminUsers"};
@@ -1260,6 +1266,8 @@ function boot(){
     tasks.push(teamTask.then(function(){ return canViewReporting() ? loadReportingAccess() : null; }));
   } else if(state.route.view==="dailyReport"){
     tasks.push(teamTask.then(function(){ return canUseDailyReport() ? loadDailyReport() : null; }));
+  } else if(state.route.view==="rca"){
+    if(can("rca.view")) tasks.push(rcaLoad());
   } else if(state.route.view==="testData"){
     if(can("test_data.view")) tasks.push(loadTestData());
   } else if(state.route.view==="home"){
@@ -1317,6 +1325,8 @@ function render(){
     app.innerHTML = renderStatistics();
   } else if(state.route.view==="dailyReport"){
     app.innerHTML = renderDailyReport();
+  } else if(state.route.view==="rca"){
+    app.innerHTML = renderRca();
   } else if(state.route.view==="reporting"){
     app.innerHTML = renderReporting();
     rpAfterRender();
@@ -1351,6 +1361,7 @@ var SIDENAV_ITEMS = [
   {icon:"📊", label:"Statistics", action:"nav-statistics", match:["statistics"], needs:["statistics.view"]},
   {icon:"📑", label:"Reporting", action:"nav-reporting", match:["reporting"], needs:["reporting.view"]},
   {icon:"📝", label:"Daily QA Report", action:"nav-daily-report", match:["dailyReport"], needs:["daily_reports.view"]},
+  {icon:"🔎", label:"RCA", action:"nav-rca", match:["rca"], needs:["rca.view"]},
   {icon:"📋", label:"Audit", action:"nav-audit", match:["audit"], needs:["audit.view"]},
   {icon:"👥", label:"Know the Team", action:"nav-team", match:["team"], needs:["team.view"]},
   {heading:"Administration", needsAny:["users.view","roles.view"]},
@@ -1472,10 +1483,11 @@ function renderHome(){
     {icon:"📊", title:"Statistics", desc:"See QA workload and activity by date, release and team member.", btn:"Open Statistics →", action:"nav-statistics"},
     {icon:"📑", title:"Reporting", desc:"PMO delivery and variance reporting from Jira, in hours.", btn:"Open Reporting →", action:"nav-reporting"},
     {icon:"📝", title:"Daily QA Report", desc:"Share today’s QA work, tomorrow’s plan and any blockers with the team.", btn:"Submit a Report →", action:"nav-daily-report"},
+    {icon:"🔎", title:"RCA", desc:"Record what went wrong in a release, why, and how it is fixed and prevented.", btn:"Open RCA →", action:"nav-rca"},
     {icon:"📋", title:"Audit", desc:"Track important changes and see who performed them.", btn:"View Audit →", action:"nav-audit"},
     {icon:"👥", title:"Know the Team", desc:"Meet the people behind the quality.", btn:"Meet the Team →", action:"nav-team"}
   ].filter(function(c){
-    var need = {"nav-list":"releases.view","nav-test-data":"test_data.view","nav-statistics":"statistics.view","nav-reporting":"reporting.view","nav-daily-report":"daily_reports.view","nav-audit":"audit.view","nav-team":"team.view"}[c.action];
+    var need = {"nav-list":"releases.view","nav-test-data":"test_data.view","nav-statistics":"statistics.view","nav-reporting":"reporting.view","nav-daily-report":"daily_reports.view","nav-rca":"rca.view","nav-audit":"audit.view","nav-team":"team.view"}[c.action];
     return !need || can(need);
   });
   var cardsHtml = '<section class="home-section"><div class="feature-grid">'+
@@ -1641,7 +1653,10 @@ var AUDIT_ACTION_LABELS = {
   DAILY_REPORT_ABSENCE_ADDED: "Marked Absent (Daily QA Report)",
   DAILY_REPORT_ABSENCE_REMOVED: "Removed Absence (Daily QA Report)",
   DAILY_REPORT_SLACK_FAILED: "Daily QA Report Not Posted to Slack",
-  RELEASE_PUBLISH_SLACK_FAILED: "Release Published, Not Posted to Slack"
+  RELEASE_PUBLISH_SLACK_FAILED: "Release Published, Not Posted to Slack",
+  RCA_CREATED: "Added RCA",
+  RCA_UPDATED: "Edited RCA",
+  RCA_DELETED: "Deleted RCA"
 };
 function humanizeAuditAction(action){
   return AUDIT_ACTION_LABELS[action] || action;
@@ -2197,6 +2212,7 @@ function drTeamQuery(){
   if(to) parts.push("to="+encodeURIComponent(to));
   if(f.member) parts.push("member="+encodeURIComponent(f.member));
   if(f.q.trim()) parts.push("q="+encodeURIComponent(f.q.trim()));
+  parts.push("page="+(state.dr.team.page||1), "pageSize="+(state.dr.team.pageSize||10));
   return parts.join("&");
 }
 function drTeamLoad(){
@@ -2208,6 +2224,7 @@ function drTeamLoad(){
     if(token!==t.token) return;
     var before = JSON.stringify(t.members);
     t.data = res; t.loading = false; t.members = res.members || t.members;
+    if(res.page) t.page = res.page; // the server moves an out-of-range page to the nearest one
     if(JSON.stringify(t.members)!==before){ var sel = qs('select[data-dr-team="member"]'); if(sel) sel.innerHTML = drMemberOptionsHtml(); }
     drTeamPaint();
   }).catch(function(e){
@@ -2225,9 +2242,35 @@ function drTeamCountText(){
   var t = state.dr.team;
   if(t.loading && !t.data) return "Loading…";
   if(!t.data) return "";
-  var n = t.data.reports.length;
-  if(t.data.truncated) return "Showing the newest "+n+" of "+t.data.total+" reports — narrow the filters to see the rest.";
+  var n = t.data.total;
+  if(t.data.truncated) return "Showing the newest "+t.data.reports.length+" of "+n+" reports — narrow the filters to see the rest.";
   return n+" report"+(n===1?"":"s")+(drTeamFiltersActive() ? " match these filters" : "");
+}
+// Page numbers to show: first, last, and a window around the current page, with "…" gaps.
+function drPageList(page, pages){
+  var out = [], last = 0;
+  for(var i=1;i<=pages;i++){
+    if(i===1 || i===pages || Math.abs(i-page)<=1){ if(last && i-last>1) out.push("…"); out.push(i); last = i; }
+  }
+  return out;
+}
+function drTeamPagerHtml(){
+  var t = state.dr.team, d = t.data;
+  if(!d || !d.total || d.total<=10 || !d.pages) return "";
+  var page = d.page||1, pages = d.pages, size = d.pageSize||t.pageSize;
+  var from = (page-1)*size+1, to = Math.min(d.total, (page-1)*size+d.reports.length);
+  return '<div class="dr-pager">'+
+    '<span class="helper-text">Showing '+from+'–'+to+' of '+d.total+'</span>'+
+    '<label class="dr-pager-size"><span class="helper-text">Per page</span><select data-dr-page-size="1" aria-label="Reports per page">'+
+      [10,25,50].map(function(n){ return '<option value="'+n+'"'+(n===t.pageSize?" selected":"")+'>'+n+'</option>'; }).join("")+'</select></label>'+
+    '<nav class="dr-pager-nav" aria-label="Report pages">'+
+      '<button type="button" class="btn btn-sm" data-action="dr-team-page" data-page="'+(page-1)+'"'+(page<=1?' disabled':'')+'>← Prev</button>'+
+      drPageList(page, pages).map(function(p){
+        return p==="…" ? '<span class="dr-pager-gap" aria-hidden="true">…</span>'
+          : '<button type="button" class="btn btn-sm dr-pager-num'+(p===page?' is-current':'')+'" data-action="dr-team-page" data-page="'+p+'"'+(p===page?' aria-current="page"':'')+'>'+p+'</button>';
+      }).join("")+
+      '<button type="button" class="btn btn-sm" data-action="dr-team-page" data-page="'+(page+1)+'"'+(page>=pages?' disabled':'')+'>Next →</button>'+
+    '</nav></div>';
 }
 function drMemberOptionsHtml(){
   var t = state.dr.team, me = state.dr.data && state.dr.data.member;
@@ -2294,7 +2337,7 @@ function drTeamBodyHtml(){
     return '<div class="dr-team-empty">No reports match these filters.'+(drTeamFiltersActive() ? ' <button type="button" class="btn btn-sm" data-action="clear-dr-team-filters">Clear filters</button>' : '')+'</div>';
   }
   return '<div class="dr-table-wrap'+(t.loading?" is-loading":"")+'"><table class="dr-table"><thead><tr><th>Date</th><th>Name</th><th>Today</th><th>Tomorrow</th><th>Blockers / help needed</th></tr></thead><tbody>'+
-    t.data.reports.map(drTeamRowHtml).join("")+'</tbody></table></div>';
+    t.data.reports.map(drTeamRowHtml).join("")+'</tbody></table></div>'+drTeamPagerHtml();
 }
 function drTeamHtml(d){
   return '<section class="card dr-card dr-team"><div class="dr-card-head"><div><h2>'+(can("daily_reports.view_all")?"Team reports":"Your reports")+'</h2><p class="helper-text" id="dr-team-count">'+esc(drTeamCountText())+'</p></div></div>'+
@@ -2352,6 +2395,7 @@ function dailyReportSubmit(){
   api.submitDailyReport({today:f.today, tomorrow:f.tomorrow, blockers:f.blockers}).then(function(res){
     dr.submitting = false; dr.errors = {}; dr.form = {today:"", tomorrow:"", blockers:""};
     drApply(res.report); render();
+    state.dr.team.page = 1; // the new report is the newest row
     drTeamLoad();
     showToast(drSlackToast(res.report));
   }).catch(function(e){
@@ -5915,6 +5959,193 @@ function sectionPublish(r, assessment){
 }
 
 /* ============================================================
+   RCA (Root Cause Analysis)
+   A list of analyses — the issue, the cause, the corrective and the preventive
+   action — each tied to the release that caused the issue. The release dropdown
+   is the list of releases in Release Monitor (sent by the server with the list, so
+   it is always current). Add / Edit happen in a modal; the list is filterable by
+   release and searchable, and paged (10 / 25 / 50). Permissions: rca.view /
+   rca.create / rca.edit / rca.delete — the server checks them again.
+   ============================================================ */
+function rcaQuery(){
+  var t = state.rca, parts = [];
+  if(t.f.release) parts.push("release="+encodeURIComponent(t.f.release));
+  if(t.f.q.trim()) parts.push("q="+encodeURIComponent(t.f.q.trim()));
+  parts.push("page="+(t.page||1), "pageSize="+(t.pageSize||10));
+  return parts.join("&");
+}
+function rcaFiltersActive(){ var f = state.rca.f; return !!(f.release || f.q.trim()); }
+// Loads (or reloads) the list. Returns the promise; repaints just the list when the page is already showing.
+function rcaLoad(){
+  var t = state.rca, token = ++t.token;
+  t.loading = true; t.error = "";
+  rcaPaint();
+  return api.rcaList(rcaQuery()).then(function(res){
+    if(token!==t.token) return;
+    t.data = res; t.loading = false;
+    if(res.page) t.page = res.page; // the server moves an out-of-range page to the nearest one
+    rcaPaint();
+  }).catch(function(e){
+    if(token!==t.token) return;
+    t.loading = false; t.error = (e && e.message) || "Couldn’t load the RCAs.";
+    rcaPaint();
+  });
+}
+function rcaPaint(){
+  var box = qs("#rca-list"); if(box) box.innerHTML = rcaListHtml();
+  var cnt = qs("#rca-count"); if(cnt) cnt.textContent = rcaCountText();
+  var sel = qs('select[data-rca-filter="release"]'); if(sel) sel.innerHTML = rcaFilterOptionsHtml();
+}
+function rcaCountText(){
+  var t = state.rca;
+  if(t.loading && !t.data) return "Loading…";
+  if(!t.data) return "";
+  var n = t.data.total;
+  return n+" RCA"+(n===1?"":"s")+(rcaFiltersActive() ? " match these filters" : "");
+}
+function rcaReleaseOptions(){ return (state.rca.data && state.rca.data.releases) || []; }
+function rcaFilterOptionsHtml(){
+  var t = state.rca, d = t.data || {};
+  var opts = '<option value="">All releases</option>'+
+    (d.releases||[]).concat(d.deletedReleases||[]).map(function(r){
+      return '<option value="'+escAttr(r.id)+'"'+(t.f.release===r.id?" selected":"")+'>'+esc(r.label)+'</option>';
+    }).join("");
+  return opts;
+}
+function rcaBlockHtml(title, text){
+  return '<div class="rca-block"><div class="rca-block-title">'+esc(title)+'</div><div class="rca-text">'+esc(text)+'</div></div>';
+}
+function rcaCardHtml(r){
+  var who = 'Added by <b>'+esc(r.createdBy||"Unknown")+'</b> · '+esc(fmtDateTime(r.createdAt)||"");
+  var edited = r.edited ? ' · Edited by <b>'+esc(r.updatedBy||"Unknown")+'</b> · '+esc(fmtDateTime(r.updatedAt)||"") : "";
+  return '<article class="card rca-card" data-rca-id="'+escAttr(r.id)+'">'+
+    '<div class="rca-card-head">'+
+      '<div class="rca-release"><span class="rca-release-label">Release</span> <span class="pill tone-'+(r.release.exists?"neutral":"warn")+'"><span class="pill-dot"></span>'+esc(r.release.label)+(r.release.exists?"":" (deleted)")+'</span>'+
+        (r.release.date ? ' <span class="helper-text">'+esc(fmtDate(r.release.date))+'</span>' : '')+'</div>'+
+      '<div class="rca-actions">'+
+        '<button type="button" class="btn btn-sm" data-action="edit-rca" data-id="'+escAttr(r.id)+'">'+iconEdit()+' Edit</button>'+
+        '<button type="button" class="btn btn-sm btn-danger" data-action="delete-rca" data-id="'+escAttr(r.id)+'">'+iconTrash()+' Delete</button>'+
+      '</div>'+
+    '</div>'+
+    '<div class="rca-grid">'+
+      rcaBlockHtml("The issue", r.issue)+rcaBlockHtml("The cause", r.cause)+
+      rcaBlockHtml("Corrective action", r.correctiveAction)+rcaBlockHtml("Preventive action", r.preventiveAction)+
+    '</div>'+
+    '<div class="rca-foot helper-text">'+who+edited+'</div>'+
+  '</article>';
+}
+function rcaPagerHtml(){
+  var d = state.rca.data, t = state.rca;
+  if(!d || !d.total || d.total<=10 || !d.pages) return "";
+  var page = d.page||1, pages = d.pages, size = d.pageSize||t.pageSize;
+  var from = (page-1)*size+1, to = Math.min(d.total, (page-1)*size+d.rcas.length);
+  return '<div class="dr-pager">'+
+    '<span class="helper-text">Showing '+from+'–'+to+' of '+d.total+'</span>'+
+    '<label class="dr-pager-size"><span class="helper-text">Per page</span><select data-rca-page-size="1" aria-label="RCAs per page">'+
+      [10,25,50].map(function(n){ return '<option value="'+n+'"'+(n===t.pageSize?" selected":"")+'>'+n+'</option>'; }).join("")+'</select></label>'+
+    '<nav class="dr-pager-nav" aria-label="RCA pages">'+
+      '<button type="button" class="btn btn-sm" data-action="rca-page" data-page="'+(page-1)+'"'+(page<=1?' disabled':'')+'>← Prev</button>'+
+      drPageList(page, pages).map(function(p){
+        return p==="…" ? '<span class="dr-pager-gap" aria-hidden="true">…</span>'
+          : '<button type="button" class="btn btn-sm dr-pager-num'+(p===page?' is-current':'')+'" data-action="rca-page" data-page="'+p+'"'+(p===page?' aria-current="page"':'')+'>'+p+'</button>';
+      }).join("")+
+      '<button type="button" class="btn btn-sm" data-action="rca-page" data-page="'+(page+1)+'"'+(page>=pages?' disabled':'')+'>Next →</button>'+
+    '</nav></div>';
+}
+function rcaListHtml(){
+  var t = state.rca;
+  if(t.error) return '<div class="empty-state"><h3>Can’t load the RCAs</h3><p>'+esc(t.error)+'</p><div style="margin-top:14px;"><button type="button" class="btn" data-action="reload-rca">'+iconRefresh()+' Try again</button></div></div>';
+  if(!t.data) return '<div class="dr-team-empty"><span class="spinner"></span> Loading RCAs…</div>';
+  if(!t.data.rcas.length){
+    if(rcaFiltersActive()) return '<div class="dr-team-empty">No RCAs match these filters. <button type="button" class="btn btn-sm" data-action="clear-rca-filters">Clear filters</button></div>';
+    return '<div class="empty-state"><h3>No RCAs yet</h3><p>When something goes wrong in a release, record what happened, why, and how it will be fixed and prevented.</p>'+
+      (can("rca.create") ? '<div style="margin-top:16px;"><button type="button" class="btn btn-primary" data-action="add-rca">'+iconPlus()+' Add RCA</button></div>' : '')+'</div>';
+  }
+  return '<div class="rca-cards'+(t.loading?" is-loading":"")+'">'+t.data.rcas.map(rcaCardHtml).join("")+'</div>'+rcaPagerHtml();
+}
+function renderRca(){
+  var t = state.rca;
+  var head = '<div class="list-head"><div><h1>RCA</h1><p>Root cause analysis — what went wrong, why, and how it is fixed and prevented.</p></div>'+
+    '<div class="list-head-actions">'+(can("rca.create") ? '<button type="button" class="btn btn-primary" data-action="add-rca">'+iconPlus()+' Add RCA</button>' : '')+'</div></div>';
+  return head+'<section class="card dr-card rca-wrap">'+
+    '<p class="helper-text" id="rca-count">'+esc(rcaCountText())+'</p>'+
+    '<div class="dr-team-filters">'+
+      '<label class="dr-fl"><span>Release</span><select data-rca-filter="release" aria-label="Filter by release">'+rcaFilterOptionsHtml()+'</select></label>'+
+      '<label class="dr-fl dr-fl-search dr-fl-grow"><span>Search</span><div class="dr-search"><span aria-hidden="true">🔍</span>'+
+        '<input id="rca-search" type="text" autocomplete="off" placeholder="Search the issue, cause, actions, release or author…" aria-label="Search RCAs" value="'+escAttr(t.f.q)+'"></div></label>'+
+      (rcaFiltersActive() ? '<button type="button" class="btn btn-sm dr-fl-clear" data-action="clear-rca-filters">Clear filters</button>' : '')+
+    '</div>'+
+    '<div id="rca-list">'+rcaListHtml()+'</div>'+
+  '</section>';
+}
+function rcaFindRecord(id){
+  return ((state.rca.data && state.rca.data.rcas) || []).filter(function(x){ return x.id===id; })[0] || null;
+}
+// Add / Edit modal. `existing` is a record from the list, or null.
+function openRcaModal(existing){
+  var rel = rcaReleaseOptions();
+  var chosen = existing ? existing.releaseId : "";
+  var releaseOpts = '<option value=""'+(chosen?"":" selected")+' disabled>Select the release…</option>'+
+    // an RCA whose release was deleted keeps showing it so saving other edits doesn't force a change
+    (existing && !existing.release.exists ? '<option value="'+escAttr(existing.releaseId)+'" selected>'+esc(existing.release.label)+' (deleted)</option>' : '')+
+    rel.map(function(r){
+      return '<option value="'+escAttr(r.id)+'"'+(chosen===r.id?" selected":"")+'>'+esc(r.label)+(r.date?" · "+esc(fmtDate(r.date)):"")+'</option>';
+    }).join("");
+  function area(id, label, key, ph){
+    return '<div class="field"><label for="'+id+'">'+label+' <span class="hint">(required)</span></label>'+
+      '<textarea id="'+id+'" rows="4" maxlength="5000" placeholder="'+escAttr(ph)+'">'+esc(existing ? existing[key] : "")+'</textarea>'+
+      '<div class="field-msg" id="'+id+'-err" role="alert"></div></div>';
+  }
+  var body =
+    '<div class="field"><label for="rca-release">The release that caused it <span class="hint">(required)</span></label>'+
+      '<select id="rca-release">'+releaseOpts+'</select><div class="field-msg" id="rca-release-err" role="alert"></div>'+
+      (rel.length ? '' : '<p class="helper-text">There are no releases yet — add one in Release Monitor first.</p>')+'</div>'+
+    area("rca-issue", "The issue", "issue", "What went wrong? What did users or the team see?")+
+    area("rca-cause", "The cause", "cause", "Why did it happen — the root cause.")+
+    area("rca-corrective", "The corrective action", "correctiveAction", "What was or will be done to fix it now?")+
+    area("rca-preventive", "The preventive action", "preventiveAction", "What will stop it happening again?")+
+    '<div id="rca-form-error"></div>';
+  var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary" id="rca-save">'+(existing?"Save changes":"Add RCA")+'</button>';
+  openModal(modalShell(existing ? "Edit RCA" : "Add RCA", body, foot), {wide:true});
+  var ids = {releaseId:"rca-release", issue:"rca-issue", cause:"rca-cause", correctiveAction:"rca-corrective", preventiveAction:"rca-preventive"};
+  function showErrors(fields){
+    Object.keys(ids).forEach(function(k){ var e = qs("#"+ids[k]+"-err"); if(e) e.textContent = (fields && fields[k]) || ""; });
+  }
+  qs("#modal-form").addEventListener("submit", function(e){
+    e.preventDefault();
+    var data = {
+      releaseId: qs("#rca-release").value,
+      issue: qs("#rca-issue").value.trim(), cause: qs("#rca-cause").value.trim(),
+      correctiveAction: qs("#rca-corrective").value.trim(), preventiveAction: qs("#rca-preventive").value.trim()
+    };
+    var labels = {releaseId:"Pick the release that caused it.", issue:"The issue is required.", cause:"The cause is required.", correctiveAction:"The corrective action is required.", preventiveAction:"The preventive action is required."};
+    var missing = {};
+    Object.keys(labels).forEach(function(k){ if(!data[k]) missing[k] = labels[k]; });
+    showErrors(missing); qs("#rca-form-error").innerHTML = "";
+    var firstBad = Object.keys(ids).filter(function(k){ return missing[k]; })[0];
+    if(firstBad){ qs("#"+ids[firstBad]).focus(); return; }
+    var btn = qs("#rca-save"); btn.disabled = true;
+    (existing ? api.rcaUpdate(existing.id, data) : api.rcaCreate(data)).then(function(){
+      closeModal();
+      showToast(existing ? "RCA updated." : "RCA added.");
+      if(!existing){ state.rca.page = 1; }
+      return rcaLoad();
+    }).catch(function(err){
+      btn.disabled = false;
+      var f = err && err.data && err.data.fields;
+      if(f){ showErrors(f); } else { qs("#rca-form-error").innerHTML = '<div class="modal-error">'+esc((err && err.message) || "Couldn’t save the RCA.")+'</div>'; }
+    });
+  });
+}
+function rcaAskDelete(id){
+  var r = rcaFindRecord(id); if(!r) return;
+  openConfirm("Delete this RCA?", "This permanently deletes the RCA for “"+esc(r.release.label)+"”. This can’t be undone.", "Delete", function(){
+    api.rcaDelete(id).then(function(){ showToast("RCA deleted."); return rcaLoad(); }).catch(function(e){ showToast(e.message); });
+  }, true);
+}
+var rcaSearchTimer = null;
+
+/* ============================================================
    ICONS / SMALL UI HELPERS
    ============================================================ */
 function pill(text, tone, extraClass){ return '<span class="pill '+(extraClass||"")+' tone-'+tone+'"><span class="pill-dot"></span>'+esc(text)+'</span>'; }
@@ -7150,6 +7381,13 @@ document.addEventListener("click", function(e){
     case "nav-statistics": goTo("#/statistics"); break;
     case "nav-reporting": goTo("#/reporting"); break;
     case "nav-daily-report": goTo("#/daily-report"); break;
+    case "nav-rca": goTo("#/rca"); break;
+    case "add-rca": openRcaModal(null); break;
+    case "edit-rca": var rcaRec = rcaFindRecord(id); if(rcaRec) openRcaModal(rcaRec); break;
+    case "delete-rca": rcaAskDelete(id); break;
+    case "reload-rca": rcaLoad(); break;
+    case "clear-rca-filters": state.rca.f = {release:"", q:""}; state.rca.page = 1; render(); rcaLoad(); break;
+    case "rca-page": var rcapn = parseInt(el2.getAttribute("data-page"),10); if(rcapn>=1){ state.rca.page = rcapn; rcaLoad(); var rcatc = qs("#rca-list"); if(rcatc && rcatc.scrollIntoView) rcatc.scrollIntoView({block:"nearest"}); } break;
     case "nav-admin-users": goTo("#/admin/users"); break;
     case "nav-admin-roles": goTo("#/admin/roles"); break;
     case "gate-recheck": refreshAccessAndGate(true); break;
@@ -7158,7 +7396,8 @@ document.addEventListener("click", function(e){
     case "edit-daily-report": dailyReportEditStart(id); break;
     case "remove-daily-absence": dailyAbsenceRemove(el2.getAttribute("data-date")); break;
     case "toggle-dr-row": if(state.dr.team.open[id]) delete state.dr.team.open[id]; else state.dr.team.open[id] = true; if(state.dr.edit && state.dr.edit.id===id) break; drTeamPaint(); break;
-    case "clear-dr-team-filters": state.dr.team.f = {range:"30", from:"", to:"", member:"", q:""}; render(); drTeamLoad(); break;
+    case "clear-dr-team-filters": state.dr.team.f = {range:"30", from:"", to:"", member:"", q:""}; state.dr.team.page = 1; render(); drTeamLoad(); break;
+    case "dr-team-page": var drpn = parseInt(el2.getAttribute("data-page"),10); if(drpn>=1){ state.dr.team.page = drpn; drTeamLoad(); var drtc = qs("#dr-team-container"); if(drtc && drtc.scrollIntoView) drtc.scrollIntoView({block:"nearest"}); } break;
     case "reload-dr-team": drTeamLoad(); break;
     case "cancel-edit-daily-report": state.dr.edit = null; render(); break;
     case "post-daily-report-update": dailyReportPostUpdate(id); break;
@@ -7535,8 +7774,18 @@ document.addEventListener("change", function(e){
   var elp = e.target;
   if(elp && elp.getAttribute && elp.getAttribute("data-perm-off")){ e.stopImmediatePropagation(); return; }
   var drf = elp && elp.getAttribute && elp.getAttribute("data-dr-team");
+  if(elp && elp.getAttribute && elp.getAttribute("data-rca-page-size")){
+    state.rca.pageSize = parseInt(elp.value,10) || 10; state.rca.page = 1; rcaLoad(); return;
+  }
+  if(elp && elp.getAttribute && elp.getAttribute("data-rca-filter")){
+    state.rca.f[elp.getAttribute("data-rca-filter")] = elp.value; state.rca.page = 1; render(); rcaLoad(); return;
+  }
+  if(elp && elp.getAttribute && elp.getAttribute("data-dr-page-size")){
+    state.dr.team.pageSize = parseInt(elp.value,10) || 10; state.dr.team.page = 1; drTeamLoad(); return;
+  }
   if(drf){
     var tf = state.dr.team.f;
+    state.dr.team.page = 1;
     tf[drf] = elp.value;
     if(drf==="range" && elp.value==="custom" && !tf.from && !tf.to && state.dr.data){ tf.to = state.dr.data.reportDate; tf.from = drAddDays(tf.to, -6); }
     render();
@@ -7634,9 +7883,16 @@ document.addEventListener("input", function(e){
     if(abx.errors.date || abx.errors.note){ abx.errors = {}; var abe = qs("#dr-abs-err"); if(abe) abe.remove(); }
     return;
   }
+  if(e.target && e.target.id==="rca-search"){
+    // Only the list repaints, so the box keeps focus while typing.
+    state.rca.f.q = e.target.value; state.rca.page = 1;
+    clearTimeout(rcaSearchTimer);
+    rcaSearchTimer = setTimeout(rcaLoad, 250);
+    return;
+  }
   if(e.target && e.target.id==="dr-team-search"){
     // Only the table repaints, so the box keeps focus while typing.
-    state.dr.team.f.q = e.target.value;
+    state.dr.team.f.q = e.target.value; state.dr.team.page = 1;
     clearTimeout(drSearchTimer);
     drSearchTimer = setTimeout(drTeamLoad, 250);
     return;
@@ -7858,10 +8114,10 @@ function refreshAccessAndGate(fromButton){
 // Which permission opens each page (pages with their own friendlier
 // no-access state — Statistics, Reporting, Daily QA Report — are not listed).
 function viewPermission(view){
-  return {list:"releases.view", detail:"releases.view", testData:"test_data.view", audit:"audit.view", team:"team.view", adminUsers:"users.view", adminRoles:"roles.view"}[view] || "";
+  return {list:"releases.view", detail:"releases.view", testData:"test_data.view", rca:"rca.view", audit:"audit.view", team:"team.view", adminUsers:"users.view", adminRoles:"roles.view"}[view] || "";
 }
 function renderNoPermission(view, perm){
-  var names = {list:"Releases", detail:"Releases", testData:"Test Data", audit:"Audit", team:"Know the Team", adminUsers:"Users", adminRoles:"Roles & Permissions"};
+  var names = {list:"Releases", detail:"Releases", testData:"Test Data", rca:"RCA", audit:"Audit", team:"Know the Team", adminUsers:"Users", adminRoles:"Roles & Permissions"};
   return '<div class="list-head"><div><h1>'+esc(names[view]||"This page")+'</h1></div></div>'+
     '<div class="empty-state"><h3>You don’t have permission to open this page</h3>'+
     '<p>Your role doesn’t include it. If you need it, ask an administrator.</p>'+
@@ -7887,6 +8143,7 @@ var ACTION_PERMISSIONS = {
   "toggle-regression-skip":"regression.manage", "sync-regression-modules":"regression.manage", "manage-regression-modules":"regression.manage",
   "add-test-data":"test_data.create", "import-test-data":"test_data.create", "edit-test-data":"test_data.edit", "delete-test-data":"test_data.delete",
   "td-rel-add":"test_data.edit", "td-rel-edit":"test_data.edit", "td-rel-remove":"test_data.delete",
+  "add-rca":"rca.create", "edit-rca":"rca.edit", "delete-rca":"rca.delete",
   "add-team-member":"team.manage", "edit-team-member":"team.manage", "delete-team-member":"team.manage",
   "rp-sync":"reporting.manage", "rp-dep-add":"reporting.manage", "rp-dep-edit":"reporting.manage", "rp-dep-del":"reporting.manage", "rp-dep-link":"reporting.manage", "rp-dep-unlink":"reporting.manage"
 };

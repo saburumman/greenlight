@@ -493,6 +493,81 @@ const dailyReminders = {
 // SET NULL — removing a card never deletes the user or any history).
 // Tables are created on first use (idempotent) — also available as
 // supabase/migrations/0008_users_roles_permissions.sql.
+// Root-cause analyses (RCA page) + a tiny key/value table for one-time upgrade
+// markers. Same JSONB-document style as the other collections; `release_id` is a
+// plain indexed column with NO foreign key on purpose — deleting a release must
+// not delete the analysis (the record carries a label snapshot of the release).
+// Created on first use (idempotent) — also available as
+// supabase/migrations/0009_rca.sql.
+const RCA_DDL = `
+create table if not exists rcas (
+  id uuid primary key,
+  release_id text,
+  data jsonb not null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists idx_rcas_release on rcas (release_id);
+create index if not exists idx_rcas_created_at on rcas (created_at desc);
+create table if not exists app_meta (
+  key text primary key,
+  value jsonb not null,
+  updated_at timestamptz not null default now()
+);
+`;
+let rcaTablePromise = null;
+function ensureRcaTables() {
+  if (!rcaTablePromise) {
+    rcaTablePromise = pgPool.query(RCA_DDL).catch((e) => {
+      rcaTablePromise = null;
+      throw e;
+    });
+  }
+  return rcaTablePromise;
+}
+const rcas = {
+  async list() {
+    await ensureRcaTables();
+    return docList("rcas");
+  },
+  async get(id) {
+    await ensureRcaTables();
+    return docGet("rcas", id);
+  },
+  async set(id, record) {
+    await ensureRcaTables();
+    const createdAt = isoOrNow(record && record.createdAt);
+    const updatedAt = isoOrNow(record && record.updatedAt);
+    await pgPool.query(
+      `INSERT INTO rcas (id, release_id, data, created_at, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4, $5)
+       ON CONFLICT (id) DO UPDATE SET release_id = EXCLUDED.release_id, data = EXCLUDED.data, updated_at = EXCLUDED.updated_at`,
+      [id, (record && record.releaseId) || null, JSON.stringify(record), createdAt, updatedAt]
+    );
+    return record;
+  },
+  async delete(id) {
+    await ensureRcaTables();
+    await docDelete("rcas", id);
+  },
+};
+const meta = {
+  async get(key) {
+    await ensureRcaTables();
+    const { rows } = await pgPool.query(`SELECT value FROM app_meta WHERE key = $1`, [key]);
+    return rows.length ? rows[0].value : null;
+  },
+  async set(key, value) {
+    await ensureRcaTables();
+    await pgPool.query(
+      `INSERT INTO app_meta (key, value, updated_at) VALUES ($1, $2::jsonb, now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [key, JSON.stringify(value)]
+    );
+    return value;
+  },
+};
+
 const RBAC_DDL = `
 create table if not exists app_roles (
   id uuid primary key,
@@ -721,4 +796,4 @@ const appUsers = {
   },
 };
 
-module.exports = { releases, regressionModules, auditLog, testData, testAccountRelationships, dailyReports, dailyAbsences, dailyReminders, appRoles, appUsers, team, atlassianTokens };
+module.exports = { releases, regressionModules, auditLog, testData, testAccountRelationships, dailyReports, dailyAbsences, dailyReminders, rcas, meta, appRoles, appUsers, team, atlassianTokens };

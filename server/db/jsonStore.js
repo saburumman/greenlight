@@ -12,6 +12,7 @@
 // Shape on disk: { releases: { <id>: {...} }, regressionModules: [{id,name,services:[{id,name}]}],
 //                   auditLog: [{id,teamMemberId,userName,action,entityType,entityId,details,meta?,createdAt}],
 //                   testData: { <id>: {...} }, testAccountRelationships: { <id>: {...} },
+//                   rcas: { <id>: {...} }, meta: { <key>: <json> },
 //                   dailyReports: { <id>: {...} }, dailyReminders: { <YYYY-MM-DD>: {date,claimedAt} }, team: { <id>: {...} },
 //                   atlassianTokens: { <accountId>: {accountId,accessToken,refreshToken,expiresAt,scope,updatedAt} },
 //                   appRoles: { <id>: {id,systemKey,name,description,isSystem,isActive,permissions[]} },
@@ -116,6 +117,8 @@ function ensureStore() {
           dailyReports: {},
           dailyAbsences: {},
           dailyReminders: {},
+          rcas: {},
+          meta: {},
           appRoles: {},
           appUsers: {},
           team: buildDefaultTeam(),
@@ -186,6 +189,16 @@ function readAll() {
       parsed.dailyReminders = {};
       dirty = true;
     }
+    // Additive: stores created before RCA / one-time migrations existed just
+    // get empty collections.
+    if (!parsed.rcas || typeof parsed.rcas !== "object" || Array.isArray(parsed.rcas)) {
+      parsed.rcas = {};
+      dirty = true;
+    }
+    if (!parsed.meta || typeof parsed.meta !== "object" || Array.isArray(parsed.meta)) {
+      parsed.meta = {};
+      dirty = true;
+    }
     // Additive: stores created before users/roles existed just get empty
     // collections — nothing else about them changes.
     for (const k of ["appRoles", "appUsers"]) {
@@ -248,6 +261,8 @@ function readAll() {
       dailyReports: {},
       dailyAbsences: {},
       dailyReminders: {},
+      rcas: {},
+      meta: {},
       appRoles: {},
       appUsers: {},
       team: buildDefaultTeam(),
@@ -647,6 +662,47 @@ const atlassianTokens = {
   },
 };
 
+// Root-cause analyses (see routes/rca.js) — a plain top-level collection like
+// testData. A record keeps the id and a label snapshot of the release it points
+// at, so deleting that release never deletes the analysis.
+const rcas = {
+  async list() {
+    const data = readAll();
+    return Object.values(data.rcas).sort((a, b) =>
+      String(b.createdAt || b.updatedAt || "").localeCompare(String(a.createdAt || a.updatedAt || ""))
+    );
+  },
+  async get(id) {
+    return readAll().rcas[id] || null;
+  },
+  async set(id, record) {
+    const data = readAll();
+    data.rcas[id] = record;
+    writeAll(data);
+    return record;
+  },
+  async delete(id) {
+    const data = readAll();
+    delete data.rcas[id];
+    writeAll(data);
+  },
+};
+
+// Tiny key/value store for one-time upgrade markers (e.g. "the RCA permissions
+// have been added to the built-in roles"). Keys are short strings.
+const meta = {
+  async get(key) {
+    const v = readAll().meta[key];
+    return v === undefined ? null : v;
+  },
+  async set(key, value) {
+    const data = readAll();
+    data.meta[key] = value;
+    writeAll(data);
+    return value;
+  },
+};
+
 module.exports = {
   releases,
   regressionModules,
@@ -656,6 +712,8 @@ module.exports = {
   dailyReports,
   dailyAbsences,
   dailyReminders,
+  rcas,
+  meta,
   appRoles,
   appUsers,
   team,
