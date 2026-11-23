@@ -297,7 +297,7 @@ var state = {
   statsDenied: false, // the server said 403 (no Statistics access)
   reportingReady: false,
   reportingDenied: false, // the server said 403 (no Reporting access)
-  rca: {data:null, loading:false, error:"", f:{release:"", q:""}, page:1, pageSize:10, token:0}, // RCA page: data = /api/rca response
+  rca: {data:null, loading:false, error:"", f:{release:"", status:"", q:"", sort:"newest"}, page:1, pageSize:10, token:0, drawerId:"", drawerWasOpen:"", reopen:""}, // RCA page: data = /api/rca response
   dr: {ready:false, denied:false, data:null, error:"", form:{today:"",tomorrow:"",blockers:""}, errors:{}, submitting:false, retrying:{}, edit:null, posting:{}, resending:{}, resendConfirm:"", absence:{date:"", note:"", saving:false, errors:{}, removing:{}}, team:{f:{range:"30", from:"", to:"", member:"", q:""}, data:null, members:[], loading:false, error:"", open:{}, token:0, page:1, pageSize:10}}, // Daily QA Report page; edit = {id, form, errors, saving}
   rp: {dataLayer:false, needsPostgres:false, status:null, settings:null, error:null, saving:false, starting:false, pollTimer:null,
        tab:"reports", filters:null, options:null, presets:[], presetName:"", report:null, reportLoading:false, reportError:null, reportBooting:false, sheetId:"summary", chartTables:{}, exporting:false, deps:null, depsError:null, depStatuses:null},
@@ -5960,22 +5960,29 @@ function sectionPublish(r, assessment){
 
 /* ============================================================
    RCA (Root Cause Analysis)
-   A list of analyses — the issue, the cause, the corrective and the preventive
-   action — each tied to the release that caused the issue. The release dropdown
+   A table of analyses — release, issue, cause, corrective action, author, date,
+   status — each tied to the release that caused the issue. The release dropdown
    is the list of releases in Release Monitor (sent by the server with the list, so
-   it is always current). Add / Edit happen in a modal; the list is filterable by
-   release and searchable, and paged (10 / 25 / 50). Permissions: rca.view /
+   it is always current). Clicking a row (or the eye) opens a side drawer with the
+   whole RCA; Edit / Delete live in the row's ⋮ menu and in the drawer. Add / Edit
+   happen in a modal. Filters: release, status, search, sort; paged (10 / 25 / 50).
+   Status is optional: "Open" unless someone sets it. Permissions: rca.view /
    rca.create / rca.edit / rca.delete — the server checks them again.
    ============================================================ */
+var RCA_STATUSES = ["Open","In Progress","Resolved"];
+function rcaStatusTone(s){ return s==="Resolved" ? "go" : s==="In Progress" ? "info" : "neutral"; }
+function rcaStatusPill(s){ return '<span class="pill tone-'+rcaStatusTone(s)+'"><span class="pill-dot"></span>'+esc(s||"Open")+'</span>'; }
 function rcaQuery(){
   var t = state.rca, parts = [];
   if(t.f.release) parts.push("release="+encodeURIComponent(t.f.release));
+  if(t.f.status) parts.push("status="+encodeURIComponent(t.f.status));
   if(t.f.q.trim()) parts.push("q="+encodeURIComponent(t.f.q.trim()));
+  if(t.f.sort==="oldest") parts.push("sort=oldest");
   parts.push("page="+(t.page||1), "pageSize="+(t.pageSize||10));
   return parts.join("&");
 }
-function rcaFiltersActive(){ var f = state.rca.f; return !!(f.release || f.q.trim()); }
-// Loads (or reloads) the list. Returns the promise; repaints just the list when the page is already showing.
+function rcaFiltersActive(){ var f = state.rca.f; return !!(f.release || f.status || f.q.trim()); }
+// Loads (or reloads) the list. Returns the promise; repaints just the table when the page is already showing.
 function rcaLoad(){
   var t = state.rca, token = ++t.token;
   t.loading = true; t.error = "";
@@ -5984,7 +5991,9 @@ function rcaLoad(){
     if(token!==t.token) return;
     t.data = res; t.loading = false;
     if(res.page) t.page = res.page; // the server moves an out-of-range page to the nearest one
+    if(t.drawerId && !rcaFindRecord(t.drawerId)) rcaCloseDrawer(true); // it's gone, or no longer on this page
     rcaPaint();
+    if(t.reopen){ var rid = t.reopen; t.reopen = ""; if(rcaFindRecord(rid)) rcaOpenDrawer(rid); }
   }).catch(function(e){
     if(token!==t.token) return;
     t.loading = false; t.error = (e && e.message) || "Couldn’t load the RCAs.";
@@ -5993,63 +6002,66 @@ function rcaLoad(){
 }
 function rcaPaint(){
   var box = qs("#rca-list"); if(box) box.innerHTML = rcaListHtml();
-  var cnt = qs("#rca-count"); if(cnt) cnt.textContent = rcaCountText();
   var sel = qs('select[data-rca-filter="release"]'); if(sel) sel.innerHTML = rcaFilterOptionsHtml();
-}
-function rcaCountText(){
-  var t = state.rca;
-  if(t.loading && !t.data) return "Loading…";
-  if(!t.data) return "";
-  var n = t.data.total;
-  return n+" RCA"+(n===1?"":"s")+(rcaFiltersActive() ? " match these filters" : "");
+  var clr = qs("#rca-clear-slot"); if(clr) clr.innerHTML = rcaClearHtml();
+  if(state.rca.drawerId) rcaDrawerPaint();
 }
 function rcaReleaseOptions(){ return (state.rca.data && state.rca.data.releases) || []; }
 function rcaFilterOptionsHtml(){
   var t = state.rca, d = t.data || {};
-  var opts = '<option value="">All releases</option>'+
+  return '<option value="">All releases</option>'+
     (d.releases||[]).concat(d.deletedReleases||[]).map(function(r){
       return '<option value="'+escAttr(r.id)+'"'+(t.f.release===r.id?" selected":"")+'>'+esc(r.label)+'</option>';
     }).join("");
-  return opts;
 }
-function rcaBlockHtml(title, text){
-  return '<div class="rca-block"><div class="rca-block-title">'+esc(title)+'</div><div class="rca-text">'+esc(text)+'</div></div>';
+function rcaClearHtml(){
+  return rcaFiltersActive() || state.rca.f.sort==="oldest" ? '<button type="button" class="btn btn-sm rca-clear" data-action="clear-rca-filters">Clear filters</button>' : '';
 }
-function rcaCardHtml(r){
-  var who = 'Added by <b>'+esc(r.createdBy||"Unknown")+'</b> · '+esc(fmtDateTime(r.createdAt)||"");
-  var edited = r.edited ? ' · Edited by <b>'+esc(r.updatedBy||"Unknown")+'</b> · '+esc(fmtDateTime(r.updatedAt)||"") : "";
-  return '<article class="card rca-card" data-rca-id="'+escAttr(r.id)+'">'+
-    '<div class="rca-card-head">'+
-      '<div class="rca-release"><span class="rca-release-label">Release</span> <span class="pill tone-'+(r.release.exists?"neutral":"warn")+'"><span class="pill-dot"></span>'+esc(r.release.label)+(r.release.exists?"":" (deleted)")+'</span>'+
-        (r.release.date ? ' <span class="helper-text">'+esc(fmtDate(r.release.date))+'</span>' : '')+'</div>'+
-      '<div class="rca-actions">'+
-        '<button type="button" class="btn btn-sm" data-action="edit-rca" data-id="'+escAttr(r.id)+'">'+iconEdit()+' Edit</button>'+
-        '<button type="button" class="btn btn-sm btn-danger" data-action="delete-rca" data-id="'+escAttr(r.id)+'">'+iconTrash()+' Delete</button>'+
-      '</div>'+
-    '</div>'+
-    '<div class="rca-grid">'+
-      rcaBlockHtml("The issue", r.issue)+rcaBlockHtml("The cause", r.cause)+
-      rcaBlockHtml("Corrective action", r.correctiveAction)+rcaBlockHtml("Preventive action", r.preventiveAction)+
-    '</div>'+
-    '<div class="rca-foot helper-text">'+who+edited+'</div>'+
-  '</article>';
+function rcaInitials(name){
+  var parts = String(name||"?").trim().split(/\s+/).filter(Boolean);
+  return ((parts[0]||"?").charAt(0)+(parts.length>1 ? parts[parts.length-1].charAt(0) : "")).toUpperCase();
 }
-function rcaPagerHtml(){
+function rcaDate(iso){
+  var d = new Date(iso); if(isNaN(d.getTime())) return "";
+  return ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getMonth()]+" "+(d.getDate()<10?"0":"")+d.getDate()+", "+d.getFullYear();
+}
+function rcaReleasePill(r){
+  return '<span class="pill rca-release-pill tone-'+(r.release.exists?"info":"warn")+'" title="'+escAttr(r.release.label+(r.release.exists?"":" (deleted)"))+'"><span class="pill-dot"></span>'+esc(r.release.label)+(r.release.exists?"":" (deleted)")+'</span>';
+}
+function iconEye(){ return '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>'; }
+function rcaRowHtml(r){
+  var canMore = can("rca.edit") || can("rca.delete");
+  return '<tr class="rca-row" data-action="view-rca" data-id="'+escAttr(r.id)+'" tabindex="0" aria-label="Open RCA for '+escAttr(r.release.label)+'">'+
+    '<td data-label="Release">'+rcaReleasePill(r)+'</td>'+
+    '<td data-label="Issue"><div class="rca-clamp">'+esc(r.issue)+'</div></td>'+
+    '<td data-label="Cause"><div class="rca-clamp">'+esc(r.cause)+'</div></td>'+
+    '<td data-label="Actions"><div class="rca-clamp">'+esc(r.correctiveAction)+'</div></td>'+
+    '<td data-label="Author"><span class="rca-author"><span class="rca-avatar" aria-hidden="true">'+esc(rcaInitials(r.createdBy))+'</span><span class="rca-author-name">'+esc(r.createdBy||"Unknown")+'</span></span></td>'+
+    '<td data-label="Date" class="rca-nowrap">'+esc(rcaDate(r.createdAt))+'</td>'+
+    '<td data-label="Status">'+rcaStatusPill(r.status)+'</td>'+
+    '<td class="rca-actions-cell"><span class="rca-row-actions">'+
+      '<button type="button" class="btn btn-sm btn-icon" data-action="view-rca" data-id="'+escAttr(r.id)+'" aria-label="View RCA" title="View">'+iconEye()+'</button>'+
+      (canMore ? '<button type="button" class="btn btn-sm btn-icon" data-action="rca-menu" data-id="'+escAttr(r.id)+'" aria-label="More actions" aria-haspopup="menu" title="More">'+iconDots()+'</button>' : '')+
+    '</span></td>'+
+  '</tr>';
+}
+function rcaFooterHtml(){
   var d = state.rca.data, t = state.rca;
-  if(!d || !d.total || d.total<=10 || !d.pages) return "";
-  var page = d.page||1, pages = d.pages, size = d.pageSize||t.pageSize;
+  if(!d || !d.total) return "";
+  var page = d.page||1, pages = d.pages||1, size = d.pageSize||t.pageSize;
   var from = (page-1)*size+1, to = Math.min(d.total, (page-1)*size+d.rcas.length);
-  return '<div class="dr-pager">'+
-    '<span class="helper-text">Showing '+from+'–'+to+' of '+d.total+'</span>'+
+  var info = '<span class="helper-text">Showing '+from+'–'+to+' of '+d.total+' RCA'+(d.total===1?"":"s")+(rcaFiltersActive()?" (filtered)":"")+'</span>';
+  if(d.total<=10) return '<div class="dr-pager">'+info+'</div>';
+  return '<div class="dr-pager">'+info+
     '<label class="dr-pager-size"><span class="helper-text">Per page</span><select data-rca-page-size="1" aria-label="RCAs per page">'+
       [10,25,50].map(function(n){ return '<option value="'+n+'"'+(n===t.pageSize?" selected":"")+'>'+n+'</option>'; }).join("")+'</select></label>'+
     '<nav class="dr-pager-nav" aria-label="RCA pages">'+
-      '<button type="button" class="btn btn-sm" data-action="rca-page" data-page="'+(page-1)+'"'+(page<=1?' disabled':'')+'>← Prev</button>'+
+      '<button type="button" class="btn btn-sm" data-action="rca-page" data-page="'+(page-1)+'"'+(page<=1?' disabled':'')+' aria-label="Previous page">‹</button>'+
       drPageList(page, pages).map(function(p){
         return p==="…" ? '<span class="dr-pager-gap" aria-hidden="true">…</span>'
           : '<button type="button" class="btn btn-sm dr-pager-num'+(p===page?' is-current':'')+'" data-action="rca-page" data-page="'+p+'"'+(p===page?' aria-current="page"':'')+'>'+p+'</button>';
       }).join("")+
-      '<button type="button" class="btn btn-sm" data-action="rca-page" data-page="'+(page+1)+'"'+(page>=pages?' disabled':'')+'>Next →</button>'+
+      '<button type="button" class="btn btn-sm" data-action="rca-page" data-page="'+(page+1)+'"'+(page>=pages?' disabled':'')+' aria-label="Next page">›</button>'+
     '</nav></div>';
 }
 function rcaListHtml(){
@@ -6061,27 +6073,106 @@ function rcaListHtml(){
     return '<div class="empty-state"><h3>No RCAs yet</h3><p>When something goes wrong in a release, record what happened, why, and how it will be fixed and prevented.</p>'+
       (can("rca.create") ? '<div style="margin-top:16px;"><button type="button" class="btn btn-primary" data-action="add-rca">'+iconPlus()+' Add RCA</button></div>' : '')+'</div>';
   }
-  return '<div class="rca-cards'+(t.loading?" is-loading":"")+'">'+t.data.rcas.map(rcaCardHtml).join("")+'</div>'+rcaPagerHtml();
+  return '<div class="rca-table-wrap'+(t.loading?" is-loading":"")+'"><table class="rca-table"><thead><tr>'+
+    '<th>Release</th><th>Issue</th><th>Cause</th><th>Actions</th><th>Author</th><th>Date</th><th>Status</th><th class="rca-th-actions"><span class="sr-only">Actions</span></th>'+
+    '</tr></thead><tbody>'+t.data.rcas.map(rcaRowHtml).join("")+'</tbody></table></div>'+rcaFooterHtml();
+}
+function iconRcaMark(){
+  return '<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/><path d="M8 13v-2.5M10.5 13V8M13 13v-1.5"/></svg>';
 }
 function renderRca(){
   var t = state.rca;
-  var head = '<div class="list-head"><div><h1>RCA</h1><p>Root cause analysis — what went wrong, why, and how it is fixed and prevented.</p></div>'+
-    '<div class="list-head-actions">'+(can("rca.create") ? '<button type="button" class="btn btn-primary" data-action="add-rca">'+iconPlus()+' Add RCA</button>' : '')+'</div></div>';
-  return head+'<section class="card dr-card rca-wrap">'+
-    '<p class="helper-text" id="rca-count">'+esc(rcaCountText())+'</p>'+
-    '<div class="dr-team-filters">'+
+  var head = '<div class="rca-head"><div class="rca-head-main"><div class="rca-head-icon">'+iconRcaMark()+'</div>'+
+    '<div><h1>RCA</h1><p>Root cause analysis — what went wrong, why, and how it is fixed and prevented.</p></div></div>'+
+    (can("rca.create") ? '<button type="button" class="btn btn-primary" data-action="add-rca">'+iconPlus()+' Add RCA</button>' : '')+'</div>';
+  var statusOpts = '<option value="">All statuses</option>'+RCA_STATUSES.map(function(s){ return '<option value="'+escAttr(s)+'"'+(t.f.status===s?" selected":"")+'>'+esc(s)+'</option>'; }).join("");
+  var toolbar = '<section class="card rca-toolbar"><div class="dr-team-filters rca-filters">'+
       '<label class="dr-fl"><span>Release</span><select data-rca-filter="release" aria-label="Filter by release">'+rcaFilterOptionsHtml()+'</select></label>'+
-      '<label class="dr-fl dr-fl-search dr-fl-grow"><span>Search</span><div class="dr-search"><span aria-hidden="true">🔍</span>'+
-        '<input id="rca-search" type="text" autocomplete="off" placeholder="Search the issue, cause, actions, release or author…" aria-label="Search RCAs" value="'+escAttr(t.f.q)+'"></div></label>'+
-      (rcaFiltersActive() ? '<button type="button" class="btn btn-sm dr-fl-clear" data-action="clear-rca-filters">Clear filters</button>' : '')+
-    '</div>'+
-    '<div id="rca-list">'+rcaListHtml()+'</div>'+
-  '</section>';
+      '<label class="dr-fl dr-fl-search rca-search-fl"><span>Search</span><div class="dr-search"><span aria-hidden="true">🔍</span>'+
+        '<input id="rca-search" type="text" autocomplete="off" placeholder="Search by issue, cause, action, release or author…" aria-label="Search RCAs" value="'+escAttr(t.f.q)+'"></div></label>'+
+      '<label class="dr-fl"><span>Status</span><select data-rca-filter="status" aria-label="Filter by status">'+statusOpts+'</select></label>'+
+      '<label class="dr-fl"><span>Sort</span><select data-rca-filter="sort" aria-label="Sort"><option value="newest"'+(t.f.sort!=="oldest"?" selected":"")+'>Newest first</option><option value="oldest"'+(t.f.sort==="oldest"?" selected":"")+'>Oldest first</option></select></label>'+
+      '<span id="rca-clear-slot">'+rcaClearHtml()+'</span>'+
+    '</div></section>';
+  return head+toolbar+'<section class="card rca-tablecard"><div id="rca-list">'+rcaListHtml()+'</div></section>';
 }
 function rcaFindRecord(id){
   return ((state.rca.data && state.rca.data.rcas) || []).filter(function(x){ return x.id===id; })[0] || null;
 }
-// Add / Edit modal. `existing` is a record from the list, or null.
+
+/* ---- side drawer: the whole RCA ---- */
+function rcaDrawerRoot(){
+  var el = qs("#rca-drawer-root");
+  if(!el){ el = document.createElement("div"); el.id = "rca-drawer-root"; document.body.appendChild(el); }
+  return el;
+}
+function rcaSectionHtml(title, text){
+  return '<section class="rca-d-sec"><h3>'+esc(title)+'</h3><div class="rca-d-text">'+esc(text)+'</div></section>';
+}
+function rcaDrawerHtml(r){
+  var foot = (can("rca.edit") ? '<button type="button" class="btn" data-rca-drawer="edit">'+iconEdit()+' Edit</button>' : '')+
+    (can("rca.delete") ? '<button type="button" class="btn btn-danger" data-rca-drawer="delete">'+iconTrash()+' Delete</button>' : '');
+  return '<div class="rca-drawer-backdrop" data-rca-drawer="close"></div>'+
+    '<aside class="rca-drawer" role="dialog" aria-modal="true" aria-labelledby="rca-d-title">'+
+      '<header class="rca-d-head"><div class="rca-d-headtop"><div class="rca-d-kicker" id="rca-d-title">RCA</div>'+
+        '<button type="button" class="btn btn-icon btn-ghost" data-rca-drawer="close" aria-label="Close">'+iconClose()+'</button></div>'+
+        '<div class="rca-d-pills">'+rcaReleasePill(r)+rcaStatusPill(r.status)+
+        (r.release.date ? '<span class="helper-text">Release date '+esc(fmtDate(r.release.date))+'</span>' : '')+'</div></header>'+
+      '<div class="rca-d-body">'+
+        rcaSectionHtml("The issue", r.issue)+rcaSectionHtml("The root cause", r.cause)+
+        rcaSectionHtml("Corrective action", r.correctiveAction)+rcaSectionHtml("Preventive action", r.preventiveAction)+
+        '<div class="rca-d-meta">'+
+          '<div><span class="rca-author"><span class="rca-avatar" aria-hidden="true">'+esc(rcaInitials(r.createdBy))+'</span><span>Created by <b>'+esc(r.createdBy||"Unknown")+'</b></span></span></div>'+
+          '<div class="helper-text">'+esc(fmtDateTime(r.createdAt)||"")+'</div>'+
+          (r.edited ? '<div class="helper-text">Last edited by <b>'+esc(r.updatedBy||"Unknown")+'</b> · '+esc(fmtDateTime(r.updatedAt)||"")+'</div>' : '')+
+        '</div>'+
+      '</div>'+
+      (foot ? '<footer class="rca-d-foot">'+foot+'</footer>' : '')+
+    '</aside>';
+}
+function rcaDrawerPaint(){
+  var r = rcaFindRecord(state.rca.drawerId), root = rcaDrawerRoot();
+  if(!r){ root.innerHTML = ""; return; }
+  var body = qs(".rca-d-body", root), top = body ? body.scrollTop : 0, hadOpen = !!body;
+  root.innerHTML = rcaDrawerHtml(r);
+  if(hadOpen){ var nb = qs(".rca-d-body", root); if(nb) nb.scrollTop = top; root.className = "is-static"; }
+}
+function rcaOpenDrawer(id){
+  if(!rcaFindRecord(id)) return;
+  rcaCloseMenu();
+  state.rca.drawerId = id; state.rca.drawerReturn = document.activeElement;
+  var root = rcaDrawerRoot(); root.className = ""; root.innerHTML = rcaDrawerHtml(rcaFindRecord(id));
+  document.body.classList.add("rca-drawer-open");
+  var c = qs('.rca-drawer [data-rca-drawer="close"]', root); if(c) c.focus();
+}
+function rcaCloseDrawer(silent){
+  if(!state.rca.drawerId) return;
+  state.rca.drawerId = "";
+  var root = rcaDrawerRoot(); root.innerHTML = "";
+  document.body.classList.remove("rca-drawer-open");
+  var back = state.rca.drawerReturn; state.rca.drawerReturn = null;
+  if(!silent && back && document.body.contains(back) && back.focus) back.focus();
+}
+
+/* ---- the ⋮ menu (a fixed popover, so the table never clips it) ---- */
+var rcaMenuOpenedAt = 0;
+function rcaCloseMenu(){ var m = qs("#rca-menu"); if(m) m.remove(); }
+function rcaOpenMenu(btn, id){
+  var had = qs("#rca-menu"); rcaCloseMenu();
+  if(had && had.getAttribute("data-id")===id) return; // second click on the same ⋮ closes it
+  var items = (can("rca.edit") ? '<button type="button" role="menuitem" data-rca-menu="edit">'+iconEdit()+' Edit</button>' : '')+
+    (can("rca.delete") ? '<button type="button" role="menuitem" class="danger" data-rca-menu="delete">'+iconTrash()+' Delete</button>' : '');
+  if(!items) return;
+  var m = document.createElement("div"); m.id = "rca-menu"; m.className = "rca-menu"; m.setAttribute("role","menu"); m.setAttribute("data-id", id); m.innerHTML = items;
+  document.body.appendChild(m);
+  var b = btn.getBoundingClientRect(), w = m.offsetWidth, h = m.offsetHeight;
+  var left = Math.max(8, Math.min(window.innerWidth-w-8, b.right-w));
+  var top = b.bottom+6; if(top+h > window.innerHeight-8) top = Math.max(8, b.top-h-6);
+  m.style.left = left+"px"; m.style.top = top+"px";
+  rcaMenuOpenedAt = Date.now();
+}
+
+/* ---- Add / Edit modal. `existing` is a record from the list, or null ---- */
 function openRcaModal(existing){
   var rel = rcaReleaseOptions();
   var chosen = existing ? existing.releaseId : "";
@@ -6091,15 +6182,21 @@ function openRcaModal(existing){
     rel.map(function(r){
       return '<option value="'+escAttr(r.id)+'"'+(chosen===r.id?" selected":"")+'>'+esc(r.label)+(r.date?" · "+esc(fmtDate(r.date)):"")+'</option>';
     }).join("");
+  var curStatus = existing ? existing.status : "Open";
+  var statusOpts = RCA_STATUSES.map(function(s){ return '<option value="'+escAttr(s)+'"'+(curStatus===s?" selected":"")+'>'+esc(s)+'</option>'; }).join("");
   function area(id, label, key, ph){
     return '<div class="field"><label for="'+id+'">'+label+' <span class="hint">(required)</span></label>'+
       '<textarea id="'+id+'" rows="4" maxlength="5000" placeholder="'+escAttr(ph)+'">'+esc(existing ? existing[key] : "")+'</textarea>'+
       '<div class="field-msg" id="'+id+'-err" role="alert"></div></div>';
   }
   var body =
-    '<div class="field"><label for="rca-release">The release that caused it <span class="hint">(required)</span></label>'+
-      '<select id="rca-release">'+releaseOpts+'</select><div class="field-msg" id="rca-release-err" role="alert"></div>'+
-      (rel.length ? '' : '<p class="helper-text">There are no releases yet — add one in Release Monitor first.</p>')+'</div>'+
+    '<div class="field-row rca-fr">'+
+      '<div class="field"><label for="rca-release">The release that caused it <span class="hint">(required)</span></label>'+
+        '<select id="rca-release">'+releaseOpts+'</select><div class="field-msg" id="rca-release-err" role="alert"></div></div>'+
+      '<div class="field"><label for="rca-status">Status <span class="hint">(optional)</span></label>'+
+        '<select id="rca-status">'+statusOpts+'</select><div class="field-msg" id="rca-status-err" role="alert"></div></div>'+
+    '</div>'+
+    (rel.length ? '' : '<p class="helper-text">There are no releases yet — add one in Release Monitor first.</p>')+
     area("rca-issue", "The issue", "issue", "What went wrong? What did users or the team see?")+
     area("rca-cause", "The cause", "cause", "Why did it happen — the root cause.")+
     area("rca-corrective", "The corrective action", "correctiveAction", "What was or will be done to fix it now?")+
@@ -6107,14 +6204,14 @@ function openRcaModal(existing){
     '<div id="rca-form-error"></div>';
   var foot = '<button type="button" class="btn" data-action="close-modal">Cancel</button><button type="submit" class="btn btn-primary" id="rca-save">'+(existing?"Save changes":"Add RCA")+'</button>';
   openModal(modalShell(existing ? "Edit RCA" : "Add RCA", body, foot), {wide:true});
-  var ids = {releaseId:"rca-release", issue:"rca-issue", cause:"rca-cause", correctiveAction:"rca-corrective", preventiveAction:"rca-preventive"};
+  var ids = {releaseId:"rca-release", status:"rca-status", issue:"rca-issue", cause:"rca-cause", correctiveAction:"rca-corrective", preventiveAction:"rca-preventive"};
   function showErrors(fields){
     Object.keys(ids).forEach(function(k){ var e = qs("#"+ids[k]+"-err"); if(e) e.textContent = (fields && fields[k]) || ""; });
   }
   qs("#modal-form").addEventListener("submit", function(e){
     e.preventDefault();
     var data = {
-      releaseId: qs("#rca-release").value,
+      releaseId: qs("#rca-release").value, status: qs("#rca-status").value,
       issue: qs("#rca-issue").value.trim(), cause: qs("#rca-cause").value.trim(),
       correctiveAction: qs("#rca-corrective").value.trim(), preventiveAction: qs("#rca-preventive").value.trim()
     };
@@ -6125,10 +6222,12 @@ function openRcaModal(existing){
     var firstBad = Object.keys(ids).filter(function(k){ return missing[k]; })[0];
     if(firstBad){ qs("#"+ids[firstBad]).focus(); return; }
     var btn = qs("#rca-save"); btn.disabled = true;
-    (existing ? api.rcaUpdate(existing.id, data) : api.rcaCreate(data)).then(function(){
+    (existing ? api.rcaUpdate(existing.id, data) : api.rcaCreate(data)).then(function(saved){
       closeModal();
       showToast(existing ? "RCA updated." : "RCA added.");
       if(!existing){ state.rca.page = 1; }
+      else if(state.rca.drawerWasOpen === existing.id) state.rca.reopen = existing.id; // came from the drawer: show it again
+      state.rca.drawerWasOpen = "";
       return rcaLoad();
     }).catch(function(err){
       btn.disabled = false;
@@ -6137,13 +6236,51 @@ function openRcaModal(existing){
     });
   });
 }
+function rcaStartEdit(id){
+  var r = rcaFindRecord(id); if(!r || !can("rca.edit")) return;
+  state.rca.drawerWasOpen = state.rca.drawerId===id ? id : "";
+  rcaCloseDrawer(true); openRcaModal(r);
+}
 function rcaAskDelete(id){
-  var r = rcaFindRecord(id); if(!r) return;
+  var r = rcaFindRecord(id); if(!r || !can("rca.delete")) return;
   openConfirm("Delete this RCA?", "This permanently deletes the RCA for “"+esc(r.release.label)+"”. This can’t be undone.", "Delete", function(){
-    api.rcaDelete(id).then(function(){ showToast("RCA deleted."); return rcaLoad(); }).catch(function(e){ showToast(e.message); });
+    api.rcaDelete(id).then(function(){ rcaCloseDrawer(true); showToast("RCA deleted."); return rcaLoad(); }).catch(function(e){ showToast(e.message); });
   }, true);
 }
 var rcaSearchTimer = null;
+// Drawer buttons, the ⋮ menu and Esc live outside #app, so they get their own listeners.
+document.addEventListener("click", function(e){
+  var d = e.target.closest && e.target.closest("[data-rca-drawer]");
+  if(d){
+    var what = d.getAttribute("data-rca-drawer"), id = state.rca.drawerId;
+    if(what==="close") rcaCloseDrawer();
+    else if(what==="edit") rcaStartEdit(id);
+    else if(what==="delete") rcaAskDelete(id);
+    return;
+  }
+  var m = e.target.closest && e.target.closest("[data-rca-menu]");
+  if(m){
+    var mid = qs("#rca-menu").getAttribute("data-id"), act = m.getAttribute("data-rca-menu");
+    rcaCloseMenu();
+    if(act==="edit") rcaStartEdit(mid); else if(act==="delete") rcaAskDelete(mid);
+    return;
+  }
+  if(qs("#rca-menu") && !(e.target.closest && e.target.closest('[data-action="rca-menu"]'))) rcaCloseMenu();
+});
+document.addEventListener("keydown", function(e){
+  if(e.key==="Escape"){
+    if(qs("#rca-menu")) { rcaCloseMenu(); return; }
+    if(state.rca.drawerId && !qs("#modal-backdrop")) rcaCloseDrawer();
+    return;
+  }
+  // a row opens with Enter / Space like a button
+  if((e.key==="Enter" || e.key===" ") && e.target && e.target.classList && e.target.classList.contains("rca-row")){
+    e.preventDefault(); rcaOpenDrawer(e.target.getAttribute("data-id"));
+  }
+});
+window.addEventListener("scroll", function(){ if(Date.now()-rcaMenuOpenedAt > 250) rcaCloseMenu(); }, true); // a scroll right after opening is just the browser settling
+window.addEventListener("hashchange", function(){ rcaCloseMenu(); if(state.rca.drawerId) rcaCloseDrawer(true); });
+
 
 /* ============================================================
    ICONS / SMALL UI HELPERS
@@ -7383,10 +7520,10 @@ document.addEventListener("click", function(e){
     case "nav-daily-report": goTo("#/daily-report"); break;
     case "nav-rca": goTo("#/rca"); break;
     case "add-rca": openRcaModal(null); break;
-    case "edit-rca": var rcaRec = rcaFindRecord(id); if(rcaRec) openRcaModal(rcaRec); break;
-    case "delete-rca": rcaAskDelete(id); break;
+    case "view-rca": if(e.target.closest(".rca-row-actions") && el2.classList.contains("rca-row")) break; rcaOpenDrawer(id); break;
+    case "rca-menu": rcaOpenMenu(el2, id); break;
     case "reload-rca": rcaLoad(); break;
-    case "clear-rca-filters": state.rca.f = {release:"", q:""}; state.rca.page = 1; render(); rcaLoad(); break;
+    case "clear-rca-filters": state.rca.f = {release:"", status:"", q:"", sort:"newest"}; state.rca.page = 1; render(); rcaLoad(); break;
     case "rca-page": var rcapn = parseInt(el2.getAttribute("data-page"),10); if(rcapn>=1){ state.rca.page = rcapn; rcaLoad(); var rcatc = qs("#rca-list"); if(rcatc && rcatc.scrollIntoView) rcatc.scrollIntoView({block:"nearest"}); } break;
     case "nav-admin-users": goTo("#/admin/users"); break;
     case "nav-admin-roles": goTo("#/admin/roles"); break;

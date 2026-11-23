@@ -85,7 +85,10 @@ router.get("/me", asyncHandler(async (req, res) => {
   });
 }));
 
-const TEAM_LIMIT = 200;
+// Paging: ?page=1&pageSize=10 (pageSize 1–100). A caller that sends no pageSize
+// (an old browser tab) gets the first LEGACY_LIMIT rows, as before.
+const LEGACY_LIMIT = 200;
+const MAX_PAGE_SIZE = 100;
 // The team table under today's report. People with daily_reports.view_all see
 // everyone's reports (they already go to a shared Slack channel); anyone else
 // gets only their own rows. Only the author's own rows carry Slack state.
@@ -106,10 +109,17 @@ router.get("/team", asyncHandler(async (req, res) => {
   const people = Object.values(req.team || {}).filter((m) => m && (seeAll ? logic.memberHasRegressionFlag(m) || m.id === me.id : m.id === me.id))
     .map((m) => ({ id: m.id, name: m.name || "" }))
     .sort((a, b) => a.name.localeCompare(b.name));
+  const paged = req.query.pageSize !== undefined;
+  const pageSize = paged ? Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(req.query.pageSize, 10) || 10)) : LEGACY_LIMIT;
+  const pages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const page = Math.min(pages, Math.max(1, parseInt(req.query.page, 10) || 1)); // out of range (e.g. after a removal) -> nearest page
   res.json({
-    reports: rows.slice(0, TEAM_LIMIT),
+    reports: rows.slice((page - 1) * pageSize, page * pageSize),
     total: rows.length,
-    truncated: rows.length > TEAM_LIMIT,
+    page,
+    pageSize,
+    pages,
+    truncated: !paged && rows.length > LEGACY_LIMIT,
     members: people,
     today: logic.reportDateFor(new Date()),
   });

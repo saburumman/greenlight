@@ -1,8 +1,8 @@
 // RCA (Root Cause Analysis) API.
 //
-//   GET    /api/rca            the analyses (?release=<id>&q=<words>&page=&pageSize=), newest first,
+//   GET    /api/rca            the analyses (?release=<id>&status=&q=<words>&sort=newest|oldest&page=&pageSize=),
 //                              plus `releases` — every release in Release Monitor, for the dropdown/filter
-//   POST   /api/rca            add one         { releaseId, issue, cause, correctiveAction, preventiveAction }
+//   POST   /api/rca            add one         { releaseId, issue, cause, correctiveAction, preventiveAction, status? }
 //   PUT    /api/rca/:id        edit one        (same body)
 //   DELETE /api/rca/:id        delete one
 //
@@ -38,10 +38,13 @@ router.get("/", requirePermission("rca.view"), asyncHandler(async (req, res) => 
   const teamById = new Map(team.map((m) => [m.id, m]));
   const releaseId = String(req.query.release || "").trim();
   const q = String(req.query.q || "").slice(0, 200);
-  const rows = all
+  const status = logic.STATUSES.includes(req.query.status) ? req.query.status : "";
+  const oldestFirst = req.query.sort === "oldest";
+  const rows = all // the store returns newest first
     .filter((r) => !releaseId || r.releaseId === releaseId)
     .map((r) => logic.publicRca(r, byId, teamById))
-    .filter((p) => logic.matchesSearch(p, q));
+    .filter((p) => (!status || p.status === status) && logic.matchesSearch(p, q));
+  if (oldestFirst) rows.reverse();
   const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(req.query.pageSize, 10) || 10));
   const pages = Math.max(1, Math.ceil(rows.length / pageSize));
   const page = Math.min(pages, Math.max(1, parseInt(req.query.page, 10) || 1)); // out of range -> nearest page
@@ -55,6 +58,7 @@ router.get("/", requirePermission("rca.view"), asyncHandler(async (req, res) => 
     page,
     pageSize,
     pages,
+    statuses: logic.STATUSES,
     releases: releases.map(logic.releaseOption),
     deletedReleases: Array.from(deleted.values()),
   });
@@ -96,7 +100,8 @@ router.put("/:id", requirePermission("rca.edit"), asyncHandler(async (req, res) 
   if (Object.keys(errors).length) return res.status(400).json({ error: Object.values(errors)[0], fields: errors });
   const team = await db.team.list();
   const teamById = new Map(team.map((m) => [m.id, m]));
-  const changed = logic.TEXT_FIELDS.some(([k]) => existing[k] !== clean[k]) || existing.releaseId !== clean.releaseId;
+  const newStatus = clean.status || existing.status || logic.DEFAULT_STATUS;
+  const changed = logic.TEXT_FIELDS.some(([k]) => existing[k] !== clean[k]) || existing.releaseId !== clean.releaseId || (existing.status || logic.DEFAULT_STATUS) !== newStatus;
   if (!changed) {
     const { byId } = await releaseIndex();
     return res.json(logic.publicRca(existing, byId, teamById));
@@ -108,6 +113,7 @@ router.put("/:id", requirePermission("rca.edit"), asyncHandler(async (req, res) 
     releaseId: clean.releaseId,
     releaseLabel: release ? logic.releaseLabel(release) : existing.releaseLabel,
     issue: clean.issue, cause: clean.cause, correctiveAction: clean.correctiveAction, preventiveAction: clean.preventiveAction,
+    status: newStatus,
     updatedBy: { id: actor.id || null, name: actor.name || "Unknown" },
     updatedAt: now,
   };

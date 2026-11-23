@@ -379,20 +379,25 @@ The root URL (`/`) is now a landing page instead of the releases list (which mov
 
 ## RCA
 
-**Sidebar → RCA** (`#/rca`) keeps root cause analyses. **Add RCA** opens a form with:
+**Sidebar → RCA** (`#/rca`) keeps root cause analyses as a compact table. **Add RCA** opens a form with:
 
 - **The release that caused it** — a dropdown of every release in Release Monitor (newest first, with its date). It is read from the releases list each time the page loads, so a new release appears without any set-up.
 - **The issue**, **The cause**, **The corrective action** and **The preventive action** — four text boxes (up to 5,000 characters each).
+- **Status** — Open, In Progress or Resolved. It is optional: left alone, a new RCA is **Open**, and editing without touching it keeps the current value. RCAs saved before Status existed read as Open.
 
-All five are required; the form tells you which one is missing. Each saved RCA is shown as a card — the release, the four sections, who added it and when (and who edited it last). **Edit** and **Delete** are on every card (Delete asks first).
+The release and the four texts are required; the form tells you which one is missing.
 
-- **Finding them:** a **Release** filter, a **Search** box (every word you type must appear somewhere — the four texts, the release or the author), and paging (10 / 25 / 50 per page, Prev / Next and numbered pages). Changing a filter, the search or the page size goes back to page 1.
+**The table** has one row per RCA: Release (badge), Issue, Cause, Actions (the corrective action), Author (avatar and name), Date and Status, plus a **View** (eye) button and a **⋮** menu with **Edit** and **Delete** (Delete asks first). Long texts are clipped to two lines so rows stay compact.
+
+**Clicking a row (or View)** opens a side drawer with the full RCA: the release, status and release date, **The issue**, **The root cause**, **The corrective action**, **The preventive action**, who created it and when (and who edited it last), and **Edit** / **Delete**. Esc, the × or a click outside closes it; editing from the drawer brings you back to it afterwards. On phones the table turns into stacked labelled cards.
+
+- **Finding them:** a toolbar with **Release** and **Status** filters, a **Search** box (every word you type must appear somewhere — the four texts, the release, the status or the author) and **Sort** (Newest first / Oldest first). A footer shows "Showing 1–10 of N RCAs"; with more than 10, a per-page selector (10 / 25 / 50) and numbered pages appear. Changing a filter, the search, the sort or the page size goes back to page 1; **Clear filters** appears when any is set.
 - **If a release is deleted** its RCAs are kept: they show the release's saved name marked "(deleted)", stay reachable through the filter, and can still be edited. (A new RCA can only pick a release that exists.) If a release is renamed, its RCAs show the new name.
 - **Who:** the author and editor come from the signed-in account (shown under their Know the Team name when linked), never from the browser.
-- **Permissions:** `rca.view` (open the page — needed for everything), `rca.create`, `rca.edit`, `rca.delete`. Buttons a person can't use are hidden and the server checks them again. Defaults are in the table above.
+- **Permissions:** `rca.view` (open the page — needed for everything), `rca.create`, `rca.edit`, `rca.delete`. Buttons a person can't use are hidden (including inside the drawer and the ⋮ menu) and the server checks them again. Defaults are in the table above.
 - **Audit Log:** "Added RCA", "Edited RCA" and "Deleted RCA", naming the release but never containing the RCA's text. Saving an RCA without changing anything records nothing.
-- **API:** `GET /api/rca?release=&q=&page=&pageSize=` (also returns the `releases` for the dropdown), `POST /api/rca`, `PUT /api/rca/:id`, `DELETE /api/rca/:id`.
-- **Database:** the `rcas` table (and a small `app_meta` table for one-time upgrade markers) is created automatically on first use; `supabase/migrations/0009_rca.sql` does the same by hand, and `0009_rca_rollback.sql` removes both (it deletes every RCA).
+- **API:** `GET /api/rca?release=&status=&q=&sort=newest|oldest&page=&pageSize=` (also returns the `releases` for the dropdown and the list of `statuses`), `POST /api/rca`, `PUT /api/rca/:id`, `DELETE /api/rca/:id`. `status` is optional on POST/PUT.
+- **Database:** the `rcas` table (and a small `app_meta` table for one-time upgrade markers) is created automatically on first use; `supabase/migrations/0009_rca.sql` does the same by hand, and `0009_rca_rollback.sql` removes both (it deletes every RCA). Status is stored inside the record, so no new migration is needed.
 
 ## Know the Team
 

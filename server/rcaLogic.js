@@ -8,12 +8,16 @@
 //                                     // ("Name Version") kept so the RCA still reads well if the
 //                                     // release is later deleted or renamed
 //     issue, cause, correctiveAction, preventiveAction,   // the four text fields
+//     status,                         // "Open" | "In Progress" | "Resolved" — optional, defaults to "Open"
+//                                     // (records saved before it existed read as "Open")
 //     createdBy: { id, name },        // the signed-in person (Know the Team id when linked) — never from the browser
 //     createdAt,
 //     updatedBy: { id, name } | null, updatedAt,
 //   }
 
 const MAX_TEXT = 5000;
+const STATUSES = ["Open", "In Progress", "Resolved"];
+const DEFAULT_STATUS = "Open";
 
 const TEXT_FIELDS = [
   ["issue", "The issue"],
@@ -41,6 +45,10 @@ function validateInput(body) {
     else if (v.length > MAX_TEXT) errors[key] = label + " is too long (" + MAX_TEXT + " characters at most).";
     clean[key] = v;
   }
+  // Status is optional: left out it means "Open" on a new RCA and "unchanged" on an edit.
+  if (b.status === undefined || b.status === null || b.status === "") clean.status = null;
+  else if (STATUSES.includes(b.status)) clean.status = b.status;
+  else errors.status = "Status must be Open, In Progress or Resolved.";
   return { clean, errors };
 }
 
@@ -59,6 +67,7 @@ function buildRecord({ id, clean, release, actor, now }) {
     cause: clean.cause,
     correctiveAction: clean.correctiveAction,
     preventiveAction: clean.preventiveAction,
+    status: clean.status || DEFAULT_STATUS,
     createdBy: { id: (actor && actor.id) || null, name: (actor && actor.name) || "Unknown" },
     createdAt: now,
     updatedBy: null,
@@ -86,6 +95,7 @@ function publicRca(rec, releasesById, teamById) {
     cause: rec.cause,
     correctiveAction: rec.correctiveAction,
     preventiveAction: rec.preventiveAction,
+    status: STATUSES.includes(rec.status) ? rec.status : DEFAULT_STATUS,
     createdBy: nameOf(rec.createdBy),
     createdAt: rec.createdAt,
     updatedBy: nameOf(rec.updatedBy),
@@ -99,8 +109,8 @@ function publicRca(rec, releasesById, teamById) {
 function matchesSearch(pub, q) {
   const words = String(q || "").toLowerCase().split(/\s+/).filter(Boolean);
   if (!words.length) return true;
-  const hay = [pub.issue, pub.cause, pub.correctiveAction, pub.preventiveAction, pub.release.label, pub.createdBy, pub.updatedBy || ""].join("\n").toLowerCase();
+  const hay = [pub.issue, pub.cause, pub.correctiveAction, pub.preventiveAction, pub.release.label, pub.status, pub.createdBy, pub.updatedBy || ""].join("\n").toLowerCase();
   return words.every((w) => hay.includes(w));
 }
 
-module.exports = { MAX_TEXT, TEXT_FIELDS, releaseLabel, releaseOption, validateInput, buildRecord, publicRca, matchesSearch };
+module.exports = { MAX_TEXT, STATUSES, DEFAULT_STATUS, TEXT_FIELDS, releaseLabel, releaseOption, validateInput, buildRecord, publicRca, matchesSearch };
