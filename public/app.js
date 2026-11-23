@@ -6026,16 +6026,17 @@ function rcaDate(iso){
   return ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][d.getMonth()]+" "+(d.getDate()<10?"0":"")+d.getDate()+", "+d.getFullYear();
 }
 function rcaReleasePill(r){
-  return '<span class="pill rca-release-pill tone-'+(r.release.exists?"info":"warn")+'" title="'+escAttr(r.release.label+(r.release.exists?"":" (deleted)"))+'"><span class="pill-dot"></span>'+esc(r.release.label)+(r.release.exists?"":" (deleted)")+'</span>';
+  return '<span class="pill rca-release-pill tone-'+(r.release.exists?"info":"warn")+'" title="'+escAttr(r.release.label+(r.release.exists?"":" (deleted)"))+'"><span class="pill-dot"></span>'+esc(r.release.name||r.release.label)+(r.release.exists?"":" (deleted)")+'</span>';
 }
 function iconEye(){ return '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12Z"/><circle cx="12" cy="12" r="3"/></svg>'; }
 function rcaRowHtml(r){
   var canMore = can("rca.edit") || can("rca.delete");
   return '<tr class="rca-row" data-action="view-rca" data-id="'+escAttr(r.id)+'" tabindex="0" aria-label="Open RCA for '+escAttr(r.release.label)+'">'+
     '<td data-label="Release">'+rcaReleasePill(r)+'</td>'+
-    '<td data-label="Issue"><div class="rca-clamp">'+esc(r.issue)+'</div></td>'+
-    '<td data-label="Cause"><div class="rca-clamp">'+esc(r.cause)+'</div></td>'+
-    '<td data-label="Actions"><div class="rca-clamp">'+esc(r.correctiveAction)+'</div></td>'+
+    '<td data-label="Version" class="rca-version">'+(r.release.version ? esc(r.release.version) : '<span class="helper-text">—</span>')+'</td>'+
+    '<td data-label="Issue"><div class="rca-text">'+esc(r.issue)+'</div></td>'+
+    '<td data-label="Cause"><div class="rca-text">'+esc(r.cause)+'</div></td>'+
+    '<td data-label="Actions"><div class="rca-text">'+esc(r.correctiveAction)+'</div></td>'+
     '<td data-label="Author"><span class="rca-author"><span class="rca-avatar" aria-hidden="true">'+esc(rcaInitials(r.createdBy))+'</span><span class="rca-author-name">'+esc(r.createdBy||"Unknown")+'</span></span></td>'+
     '<td data-label="Date" class="rca-nowrap">'+esc(rcaDate(r.createdAt))+'</td>'+
     '<td data-label="Status">'+rcaStatusPill(r.status)+'</td>'+
@@ -6074,7 +6075,7 @@ function rcaListHtml(){
       (can("rca.create") ? '<div style="margin-top:16px;"><button type="button" class="btn btn-primary" data-action="add-rca">'+iconPlus()+' Add RCA</button></div>' : '')+'</div>';
   }
   return '<div class="rca-table-wrap'+(t.loading?" is-loading":"")+'"><table class="rca-table"><thead><tr>'+
-    '<th>Release</th><th>Issue</th><th>Cause</th><th>Actions</th><th>Author</th><th>Date</th><th>Status</th><th class="rca-th-actions"><span class="sr-only">Actions</span></th>'+
+    '<th>Release</th><th>Version</th><th>Issue</th><th>Cause</th><th>Actions</th><th>Author</th><th>Date</th><th>Status</th><th class="rca-th-actions"><span class="sr-only">Actions</span></th>'+
     '</tr></thead><tbody>'+t.data.rcas.map(rcaRowHtml).join("")+'</tbody></table></div>'+rcaFooterHtml();
 }
 function iconRcaMark(){
@@ -6117,7 +6118,7 @@ function rcaDrawerHtml(r){
       '<header class="rca-d-head"><div class="rca-d-headtop"><div class="rca-d-kicker" id="rca-d-title">RCA</div>'+
         '<button type="button" class="btn btn-icon btn-ghost" data-rca-drawer="close" aria-label="Close">'+iconClose()+'</button></div>'+
         '<div class="rca-d-pills">'+rcaReleasePill(r)+rcaStatusPill(r.status)+
-        (r.release.date ? '<span class="helper-text">Release date '+esc(fmtDate(r.release.date))+'</span>' : '')+'</div></header>'+
+        (r.release.version ? '<span class="helper-text">Version '+esc(r.release.version)+'</span>' : '')+(r.release.date ? '<span class="helper-text">Release date '+esc(fmtDate(r.release.date))+'</span>' : '')+'</div></header>'+
       '<div class="rca-d-body">'+
         rcaSectionHtml("The issue", r.issue)+rcaSectionHtml("The root cause", r.cause)+
         rcaSectionHtml("Corrective action", r.correctiveAction)+rcaSectionHtml("Preventive action", r.preventiveAction)+

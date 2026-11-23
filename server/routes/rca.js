@@ -112,6 +112,8 @@ router.put("/:id", requirePermission("rca.edit"), asyncHandler(async (req, res) 
     ...existing,
     releaseId: clean.releaseId,
     releaseLabel: release ? logic.releaseLabel(release) : existing.releaseLabel,
+    releaseName: release ? String(release.name || "").trim() : existing.releaseName,
+    releaseVersion: release ? String(release.version || "").trim() : existing.releaseVersion,
     issue: clean.issue, cause: clean.cause, correctiveAction: clean.correctiveAction, preventiveAction: clean.preventiveAction,
     status: newStatus,
     updatedBy: { id: actor.id || null, name: actor.name || "Unknown" },

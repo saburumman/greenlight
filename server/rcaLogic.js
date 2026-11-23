@@ -4,7 +4,7 @@
 // One RCA record:
 //   {
 //     id,
-//     releaseId, releaseLabel,        // the release that caused the issue; the label is a snapshot
+//     releaseId, releaseLabel,        // (also releaseName / releaseVersion snapshots) the release that caused the issue; the label is a snapshot
 //                                     // ("Name Version") kept so the RCA still reads well if the
 //                                     // release is later deleted or renamed
 //     issue, cause, correctiveAction, preventiveAction,   // the four text fields
@@ -63,6 +63,8 @@ function buildRecord({ id, clean, release, actor, now }) {
     id,
     releaseId: clean.releaseId,
     releaseLabel: releaseLabel(release),
+    releaseName: release && release.name ? String(release.name).trim() : "",
+    releaseVersion: release && release.version ? String(release.version).trim() : "",
     issue: clean.issue,
     cause: clean.cause,
     correctiveAction: clean.correctiveAction,
@@ -89,8 +91,8 @@ function publicRca(rec, releasesById, teamById) {
     id: rec.id,
     releaseId: rec.releaseId,
     release: rel
-      ? { exists: true, label: releaseLabel(rel), date: rel.date || "" }
-      : { exists: false, label: rec.releaseLabel || "Deleted release", date: "" },
+      ? { exists: true, label: releaseLabel(rel), name: String(rel.name || "").trim() || releaseLabel(rel), version: String(rel.version || "").trim(), date: rel.date || "" }
+      : { exists: false, label: rec.releaseLabel || "Deleted release", name: rec.releaseName || rec.releaseLabel || "Deleted release", version: rec.releaseVersion || "", date: "" },
     issue: rec.issue,
     cause: rec.cause,
     correctiveAction: rec.correctiveAction,
